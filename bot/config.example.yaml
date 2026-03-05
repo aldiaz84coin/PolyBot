@@ -1,0 +1,34 @@
+# ──────────────────────────────────────────────────────────────
+#  Polymarket BTC Bot — Configuración
+#  Copia a config.yaml y rellena tus valores reales
+# ──────────────────────────────────────────────────────────────
+
+strategy:
+  t20_umbral_usd: 500     # umbral ventana T-20min
+  t15_umbral_usd: 300     # umbral ventana T-15min
+  t10_umbral_usd: 200     # umbral ventana T-10min
+  t5_umbral_usd:  150     # umbral ventana T-5min
+  stop_loss_pct:  0.50    # stop loss: salir si pierde el 50%
+  monitor_intervalo_s: 5  # frecuencia del loop (segundos)
+
+capital:
+  stake_usdc:        50   # USDC por operación
+  max_operaciones_dia: 24
+
+polymarket:
+  private_key:    "0x..."       # ⚠ nunca compartir
+  funder:         "0x..."       # dirección proxy de Polymarket
+  signature_type: 2             # 2 = MetaMask
+  chain_id:       137           # Polygon mainnet
+
+telegram:
+  bot_token:          "..."
+  chat_id:            "..."
+  notificar_entrada:  true
+  notificar_salida:   true
+  notificar_stop_loss: true
+
+logging:
+  nivel:          "INFO"
+  archivo:        "logs/bot.log"
+  historial_csv:  "logs/operaciones.csv"
