@@ -1,14 +1,79 @@
 // app/api/market/route.js
-// Busca el mercado "Bitcoin Up or Down" que cierra al final de la hora UTC actual
-// Tiempo restante SIEMPRE <= 60 minutos (apuestas horarias)
+// Busca el mercado "Bitcoin Up or Down" que cierra al final de la hora ET actual
+// Formato real de Polymarket: bitcoin-up-or-down-march-5-3pm-et
 
 export const runtime = "edge";
 export const revalidate = 0;
 
 const GAMMA = "https://gamma-api.polymarket.com";
 
-// La hora de cierre es SIEMPRE el próximo :00 UTC
-// Ej: son las 17:23 UTC → cierra a las 18:00 UTC → 37 min restantes
+// ── Conversión UTC → ET (con DST automático) ─────────────────────────────────
+
+function getDSTStart(year) {
+  // 2º domingo de marzo a las 2:00 ET = 07:00 UTC (EST) o 06:00 UTC (EDT)
+  const march1 = new Date(Date.UTC(year, 2, 1));
+  const day = march1.getUTCDay(); // 0 = domingo
+  const daysToFirstSunday = (7 - day) % 7;
+  const firstSunday = new Date(march1.getTime() + daysToFirstSunday * 86400000);
+  const secondSunday = new Date(firstSunday.getTime() + 7 * 86400000);
+  // 2:00 AM EST = 07:00 UTC
+  secondSunday.setUTCHours(7, 0, 0, 0);
+  return secondSunday;
+}
+
+function getDSTEnd(year) {
+  // 1er domingo de noviembre a las 2:00 ET = 06:00 UTC (EDT)
+  const nov1 = new Date(Date.UTC(year, 10, 1));
+  const day = nov1.getUTCDay();
+  const daysToFirstSunday = (7 - day) % 7;
+  const firstSunday = new Date(nov1.getTime() + daysToFirstSunday * 86400000);
+  // 2:00 AM EDT = 06:00 UTC
+  firstSunday.setUTCHours(6, 0, 0, 0);
+  return firstSunday;
+}
+
+function isEDT(dateUTC) {
+  const year = dateUTC.getUTCFullYear();
+  return dateUTC >= getDSTStart(year) && dateUTC < getDSTEnd(year);
+}
+
+// Convierte un Date UTC a un objeto con los campos de hora ET
+function toET(dateUTC) {
+  const offsetHours = isEDT(dateUTC) ? -4 : -5;
+  const et = new Date(dateUTC.getTime() + offsetHours * 3600000);
+  return {
+    year:    et.getUTCFullYear(),
+    month:   et.getUTCMonth(),      // 0-indexed
+    day:     et.getUTCDate(),       // sin cero
+    hours:   et.getUTCHours(),      // 0-23
+    minutes: et.getUTCMinutes(),
+  };
+}
+
+// ── Generador de slug ET (formato real de Polymarket) ────────────────────────
+
+const MONTHS_EN = [
+  "january","february","march","april","may","june",
+  "july","august","september","october","november","december",
+];
+
+/**
+ * Genera el slug canónico que usa Polymarket.
+ * Ejemplo: bitcoin-up-or-down-march-5-3pm-et
+ *
+ * @param {Date} closingUTC  - Momento de cierre en UTC (siempre :00 de alguna hora)
+ */
+function buildETSlug(closingUTC) {
+  const et    = toET(closingUTC);
+  const month = MONTHS_EN[et.month];
+  const day   = et.day;                       // sin cero: 5, no 05
+  const h12   = et.hours % 12 || 12;          // 0 → 12, 13 → 1, etc.
+  const ampm  = et.hours < 12 ? "am" : "pm";
+  return `bitcoin-up-or-down-${month}-${day}-${h12}${ampm}-et`;
+}
+
+// ── Hora de cierre UTC ────────────────────────────────────────────────────────
+
 function getClosingHourUTC() {
   const now = new Date();
   const closing = new Date(now);
@@ -17,7 +82,9 @@ function getClosingHourUTC() {
   return closing;
 }
 
-function buildSlugsForClosing(closing) {
+// ── Slugs legacy (formatos ISO anteriores, por si acaso) ─────────────────────
+
+function buildLegacySlugs(closing) {
   const y  = closing.getUTCFullYear();
   const mo = String(closing.getUTCMonth() + 1).padStart(2, "0");
   const dy = String(closing.getUTCDate()).padStart(2, "0");
@@ -26,12 +93,12 @@ function buildSlugsForClosing(closing) {
     `will-btc-be-higher-or-lower-${y}-${mo}-${dy}t${h}0000000z`,
     `will-btc-be-higher-or-lower-${y}-${mo}-${dy}t${h}00-00-000z`,
     `will-btc-be-higher-or-lower-${y}-${mo}-${dy}t${h}00z`,
-    `will-btc-be-higher-or-lower-${y}-${mo}-${dy}-${h}00`,
     `bitcoin-up-or-down-${y}-${mo}-${dy}-${h}00`,
-    `bitcoin-up-or-down-${y}-${mo}-${dy}t${h}0000000z`,
     `will-bitcoin-be-higher-or-lower-${y}-${mo}-${dy}t${h}0000000z`,
   ];
 }
+
+// ── Fetch helper ──────────────────────────────────────────────────────────────
 
 async function tryFetch(url) {
   try {
@@ -41,8 +108,18 @@ async function tryFetch(url) {
   } catch { return null; }
 }
 
-// Estrategia 1: slug exacto generado para la hora de cierre
-async function bySlug(slugs) {
+// ── Estrategias de búsqueda ───────────────────────────────────────────────────
+
+// Estrategia 1 (PRIORITARIA): slug ET canónico real de Polymarket
+// Ej: bitcoin-up-or-down-march-5-3pm-et
+async function byETSlug(etSlug) {
+  const data = await tryFetch(`${GAMMA}/markets?slug=${encodeURIComponent(etSlug)}`);
+  if (Array.isArray(data) && data.length > 0) return { market: data[0], slug: etSlug };
+  return null;
+}
+
+// Estrategia 2: slugs legacy ISO
+async function byLegacySlugs(slugs) {
   for (const slug of slugs) {
     const data = await tryFetch(`${GAMMA}/markets?slug=${encodeURIComponent(slug)}`);
     if (Array.isArray(data) && data.length > 0) return { market: data[0], slug };
@@ -50,7 +127,7 @@ async function bySlug(slugs) {
   return null;
 }
 
-// Estrategia 2: todos los mercados activos, filtrar BTC que cierran en ±90s del closing
+// Estrategia 3: mercados activos filtrados por tiempo de cierre ±90s
 async function byExactClosingTime(closing) {
   const closingMs   = closing.getTime();
   const toleranceMs = 90 * 1000;
@@ -73,7 +150,7 @@ async function byExactClosingTime(closing) {
   return null;
 }
 
-// Estrategia 3: tag bitcoin, filtrar <= 62 min al cierre, más próximo al closing
+// Estrategia 4: tag bitcoin, filtrar <= 62 min al cierre
 async function byTagAndTime(closing) {
   const now       = Date.now();
   const closingMs = closing.getTime();
@@ -97,10 +174,10 @@ async function byTagAndTime(closing) {
   return candidates.length > 0 ? { market: candidates[0], slug: candidates[0].slug } : null;
 }
 
-// Estrategia 4: keyword search
+// Estrategia 5: keyword search
 async function bySearch() {
   const now = Date.now();
-  for (const q of ["bitcoin higher lower", "btc up down hourly", "bitcoin up or down"]) {
+  for (const q of ["bitcoin up or down", "bitcoin higher lower hourly", "btc up down"]) {
     const data = await tryFetch(
       `${GAMMA}/markets?search=${encodeURIComponent(q)}&active=true&closed=false&limit=10`
     );
@@ -115,6 +192,8 @@ async function bySearch() {
   }
   return null;
 }
+
+// ── Normalización de la respuesta ─────────────────────────────────────────────
 
 function normalizeMarket(raw) {
   const endIso   = raw.endDateIso || raw.end_date_iso || raw.endDate || null;
@@ -148,17 +227,21 @@ function normalizeMarket(raw) {
   };
 }
 
+// ── Handler principal ─────────────────────────────────────────────────────────
+
 export async function GET() {
-  const now     = new Date();
-  const closing = getClosingHourUTC();
-  const slugs   = buildSlugsForClosing(closing);
+  const now      = new Date();
+  const closing  = getClosingHourUTC();
+  const etSlug   = buildETSlug(closing);
+  const legacySlugs = buildLegacySlugs(closing);
   const debugLog = [];
 
   const strategies = [
-    { name: "slug_exact",         fn: () => bySlug(slugs)              },
-    { name: "exact_closing_time", fn: () => byExactClosingTime(closing) },
-    { name: "tag_and_time",       fn: () => byTagAndTime(closing)       },
-    { name: "search_keyword",     fn: bySearch                          },
+    { name: "et_slug_canonical",  fn: () => byETSlug(etSlug)              },
+    { name: "legacy_slugs_iso",   fn: () => byLegacySlugs(legacySlugs)    },
+    { name: "exact_closing_time", fn: () => byExactClosingTime(closing)    },
+    { name: "tag_and_time",       fn: () => byTagAndTime(closing)          },
+    { name: "search_keyword",     fn: bySearch                             },
   ];
 
   let result = null;
@@ -176,13 +259,14 @@ export async function GET() {
     return Response.json({
       active:  false,
       market:  null,
-      error:   "No se encontró mercado Bitcoin Up or Down para esta hora UTC",
+      error:   "No se encontró mercado Bitcoin Up or Down para esta hora",
       debug: {
-        current_utc:   now.toISOString(),
-        closing_utc:   closing.toISOString(),
-        mins_to_close: (closing.getTime() - now.getTime()) / 60000,
-        slugs_tried:   slugs,
-        strategies:    debugLog,
+        current_utc:      now.toISOString(),
+        closing_utc:      closing.toISOString(),
+        et_slug_tried:    etSlug,
+        legacy_slugs:     legacySlugs,
+        mins_to_close:    (closing.getTime() - now.getTime()) / 60000,
+        strategies:       debugLog,
       },
       ts: Date.now(),
     });
@@ -194,6 +278,7 @@ export async function GET() {
     debug: {
       strategy_used: debugLog.find(d => d.found)?.strategy,
       closing_utc:   closing.toISOString(),
+      et_slug_tried: etSlug,
       slug_found:    result.slug,
     },
     ts: Date.now(),
