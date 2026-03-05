@@ -85,9 +85,28 @@ export default function MarketInfo({ market, minsLeft, activeWindow, error }) {
   if (error) {
     return (
       <div style={{ background: "var(--bg)", padding: "16px 24px", borderTop: "1px solid var(--border)" }}>
-        <div style={{ fontSize: 9, color: "#444", letterSpacing: "0.15em", marginBottom: 8 }}>◈ POLYMARKET — MERCADO ACTIVO</div>
-        <div style={{ fontSize: 11, color: "var(--red)", padding: "8px 12px", background: "rgba(255,68,102,0.06)", border: "1px solid rgba(255,68,102,0.2)", borderRadius: 3 }}>
-          ⚠ {error}
+        <div style={{ fontSize: 9, color: "#444", letterSpacing: "0.15em", marginBottom: 10 }}>◈ POLYMARKET — MERCADO ACTIVO</div>
+        <div style={{ padding: "12px 16px", background: "rgba(255,68,102,0.05)", border: "1px solid rgba(255,68,102,0.2)", borderRadius: 3 }}>
+          <div style={{ fontSize: 11, color: "var(--red)", marginBottom: 8 }}>⚠ {error}</div>
+          <div style={{ fontSize: 10, color: "#444", lineHeight: 1.8 }}>
+            <div>Posibles causas:</div>
+            <div>· El mercado aún no ha sido creado para esta hora</div>
+            <div>· El slug de Polymarket tiene un formato diferente al esperado</div>
+            <div>· La API de Polymarket no está disponible temporalmente</div>
+          </div>
+          <a
+            href="/api/market/debug"
+            target="_blank"
+            rel="noopener noreferrer"
+            style={{
+              display: "inline-block", marginTop: 10,
+              fontSize: 10, color: "var(--blue)",
+              border: "1px solid rgba(68,136,255,0.3)",
+              padding: "3px 10px", borderRadius: 2, textDecoration: "none",
+            }}
+          >
+            Ver diagnóstico ↗ /api/market/debug
+          </a>
         </div>
       </div>
     );
