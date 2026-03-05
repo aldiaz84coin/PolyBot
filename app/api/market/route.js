@@ -1,120 +1,128 @@
 // app/api/market/route.js
-// Busca el mercado BTC Up/Down Hourly activo en Polymarket
-// Usa múltiples estrategias para encontrarlo
+// Busca el mercado "Bitcoin Up or Down" que cierra al final de la hora UTC actual
+// Tiempo restante SIEMPRE <= 60 minutos (apuestas horarias)
 
 export const runtime = "edge";
 export const revalidate = 0;
 
 const GAMMA = "https://gamma-api.polymarket.com";
 
-// Genera TODOS los posibles formatos de slug para las próximas 2 horas
-function buildSlugs() {
+// La hora de cierre es SIEMPRE el próximo :00 UTC
+// Ej: son las 17:23 UTC → cierra a las 18:00 UTC → 37 min restantes
+function getClosingHourUTC() {
   const now = new Date();
-  const slugs = [];
+  const closing = new Date(now);
+  closing.setUTCMinutes(0, 0, 0);
+  closing.setUTCHours(closing.getUTCHours() + 1);
+  return closing;
+}
 
-  for (let offset = 0; offset <= 1; offset++) {
-    const d  = new Date(now.getTime() + offset * 3600 * 1000);
-    const y  = d.getUTCFullYear();
-    const mo = String(d.getUTCMonth() + 1).padStart(2, "0");
-    const dy = String(d.getUTCDate()).padStart(2, "0");
-    const h  = String(d.getUTCHours()).padStart(2, "0");
-
-    // Todos los formatos que Polymarket ha usado históricamente
-    slugs.push(
-      `will-btc-be-higher-or-lower-${y}-${mo}-${dy}t${h}0000000z`,
-      `will-btc-be-higher-or-lower-${y}-${mo}-${dy}t${h}00-00-000z`,
-      `will-btc-be-higher-or-lower-${y}-${mo}-${dy}t${h}00z`,
-      `will-bitcoin-be-higher-or-lower-${y}-${mo}-${dy}t${h}0000000z`,
-      `will-bitcoin-be-higher-or-lower-${y}-${mo}-${dy}t${h}00-00-000z`,
-      `btc-higher-lower-${y}-${mo}-${dy}-${h}00`,
-      `bitcoin-up-or-down-${y}-${mo}-${dy}-${h}`,
-    );
-  }
-  return [...new Set(slugs)]; // deduplicate
+function buildSlugsForClosing(closing) {
+  const y  = closing.getUTCFullYear();
+  const mo = String(closing.getUTCMonth() + 1).padStart(2, "0");
+  const dy = String(closing.getUTCDate()).padStart(2, "0");
+  const h  = String(closing.getUTCHours()).padStart(2, "0");
+  return [
+    `will-btc-be-higher-or-lower-${y}-${mo}-${dy}t${h}0000000z`,
+    `will-btc-be-higher-or-lower-${y}-${mo}-${dy}t${h}00-00-000z`,
+    `will-btc-be-higher-or-lower-${y}-${mo}-${dy}t${h}00z`,
+    `will-btc-be-higher-or-lower-${y}-${mo}-${dy}-${h}00`,
+    `bitcoin-up-or-down-${y}-${mo}-${dy}-${h}00`,
+    `bitcoin-up-or-down-${y}-${mo}-${dy}t${h}0000000z`,
+    `will-bitcoin-be-higher-or-lower-${y}-${mo}-${dy}t${h}0000000z`,
+  ];
 }
 
 async function tryFetch(url) {
   try {
     const r = await fetch(url, { cache: "no-store" });
     if (!r.ok) return null;
-    const data = await r.json();
-    return data;
-  } catch {
-    return null;
-  }
+    return await r.json();
+  } catch { return null; }
 }
 
-// Estrategia 1: slug exacto
-async function searchBySlugs(slugs) {
+// Estrategia 1: slug exacto generado para la hora de cierre
+async function bySlug(slugs) {
   for (const slug of slugs) {
     const data = await tryFetch(`${GAMMA}/markets?slug=${encodeURIComponent(slug)}`);
-    if (Array.isArray(data) && data.length > 0) return data[0];
+    if (Array.isArray(data) && data.length > 0) return { market: data[0], slug };
   }
   return null;
 }
 
-// Estrategia 2: búsqueda por tag bitcoin + filtro texto
-async function searchByTag() {
+// Estrategia 2: todos los mercados activos, filtrar BTC que cierran en ±90s del closing
+async function byExactClosingTime(closing) {
+  const closingMs   = closing.getTime();
+  const toleranceMs = 90 * 1000;
+  for (const limit of [50, 100]) {
+    const data = await tryFetch(
+      `${GAMMA}/markets?active=true&closed=false&limit=${limit}&order=endDate&ascending=true`
+    );
+    const list = Array.isArray(data) ? data : (data?.markets ?? []);
+    const match = list.find(m => {
+      const endIso = m.endDateIso || m.end_date_iso || m.endDate;
+      if (!endIso) return false;
+      const diff = Math.abs(new Date(endIso).getTime() - closingMs);
+      const q    = (m.question || m.title || "").toLowerCase();
+      return diff <= toleranceMs &&
+        (q.includes("bitcoin") || q.includes("btc")) &&
+        (q.includes("higher") || q.includes("lower") || q.includes("up") || q.includes("down"));
+    });
+    if (match) return { market: match, slug: match.slug };
+  }
+  return null;
+}
+
+// Estrategia 3: tag bitcoin, filtrar <= 62 min al cierre, más próximo al closing
+async function byTagAndTime(closing) {
+  const now       = Date.now();
+  const closingMs = closing.getTime();
   const data = await tryFetch(`${GAMMA}/markets?tag=bitcoin&active=true&closed=false&limit=50`);
   const list = Array.isArray(data) ? data : (data?.markets ?? []);
-  return list.find(m =>
-    (m.question?.toLowerCase().includes("higher or lower") ||
-     m.question?.toLowerCase().includes("up or down")) &&
-    m.question?.toLowerCase().includes("btc") || m.question?.toLowerCase().includes("bitcoin")
-  ) ?? null;
+  const candidates = list
+    .filter(m => {
+      const endIso = m.endDateIso || m.end_date_iso || m.endDate;
+      if (!endIso) return false;
+      const minsLeft = (new Date(endIso).getTime() - now) / 60000;
+      const q        = (m.question || m.title || "").toLowerCase();
+      return minsLeft > 0 && minsLeft <= 62 &&
+        (q.includes("bitcoin") || q.includes("btc")) &&
+        (q.includes("higher") || q.includes("lower") || q.includes("up") || q.includes("down"));
+    })
+    .sort((a, b) => {
+      const aEnd = new Date(a.endDateIso || a.end_date_iso || a.endDate).getTime();
+      const bEnd = new Date(b.endDateIso || b.end_date_iso || b.endDate).getTime();
+      return Math.abs(aEnd - closingMs) - Math.abs(bEnd - closingMs);
+    });
+  return candidates.length > 0 ? { market: candidates[0], slug: candidates[0].slug } : null;
 }
 
-// Estrategia 3: búsqueda full-text
-async function searchByKeyword() {
-  const data = await tryFetch(`${GAMMA}/markets?search=bitcoin+higher+lower&active=true&closed=false&limit=20`);
-  const list = Array.isArray(data) ? data : (data?.markets ?? []);
-  return list.find(m =>
-    m.question?.toLowerCase().includes("higher or lower") ||
-    m.question?.toLowerCase().includes("up or down")
-  ) ?? null;
-}
-
-// Estrategia 4: buscar eventos activos de BTC
-async function searchByEvents() {
-  const data = await tryFetch(`${GAMMA}/events?tag=bitcoin&active=true&closed=false&limit=20`);
-  const events = Array.isArray(data) ? data : (data?.events ?? []);
-  for (const ev of events) {
-    if (ev.slug?.includes("higher-or-lower") || ev.slug?.includes("up-or-down")) {
-      // Buscar el mercado de ese evento
-      const mdata = await tryFetch(`${GAMMA}/markets?event_slug=${encodeURIComponent(ev.slug)}`);
-      const mlist = Array.isArray(mdata) ? mdata : [];
-      if (mlist.length > 0) return mlist[0];
-    }
+// Estrategia 4: keyword search
+async function bySearch() {
+  const now = Date.now();
+  for (const q of ["bitcoin higher lower", "btc up down hourly", "bitcoin up or down"]) {
+    const data = await tryFetch(
+      `${GAMMA}/markets?search=${encodeURIComponent(q)}&active=true&closed=false&limit=10`
+    );
+    const list = Array.isArray(data) ? data : (data?.markets ?? []);
+    const match = list.find(m => {
+      const endIso = m.endDateIso || m.end_date_iso || m.endDate;
+      if (!endIso) return false;
+      const minsLeft = (new Date(endIso).getTime() - now) / 60000;
+      return minsLeft > 0 && minsLeft <= 62;
+    });
+    if (match) return { market: match, slug: match.slug };
   }
   return null;
-}
-
-// Estrategia 5: listar todos los mercados activos y filtrar por cierre en < 70min
-async function searchByUpcoming() {
-  const now = Date.now();
-  const data = await tryFetch(`${GAMMA}/markets?active=true&closed=false&limit=100&order=endDate&ascending=true`);
-  const list = Array.isArray(data) ? data : (data?.markets ?? []);
-  return list.find(m => {
-    const endIso = m.endDateIso || m.end_date_iso || m.endDate;
-    if (!endIso) return false;
-    const endMs = new Date(endIso).getTime();
-    const minsLeft = (endMs - now) / 60000;
-    const q = (m.question || m.title || "").toLowerCase();
-    return minsLeft > 0 && minsLeft < 70 &&
-      (q.includes("bitcoin") || q.includes("btc")) &&
-      (q.includes("higher") || q.includes("lower") || q.includes("up") || q.includes("down"));
-  }) ?? null;
 }
 
 function normalizeMarket(raw) {
   const endIso   = raw.endDateIso || raw.end_date_iso || raw.endDate || null;
   const endMs    = endIso ? new Date(endIso).getTime() : null;
   const minsLeft = endMs ? (endMs - Date.now()) / 60000 : null;
-
   const tokens   = raw.tokens || [];
   const yesToken = tokens.find(t => t.outcome === "Yes") || tokens[0] || null;
   const noToken  = tokens.find(t => t.outcome === "No")  || tokens[1] || null;
-
   return {
     slug:          raw.slug || null,
     condition_id:  raw.conditionId || raw.condition_id || null,
@@ -141,46 +149,53 @@ function normalizeMarket(raw) {
 }
 
 export async function GET() {
-  const slugs = buildSlugs();
+  const now     = new Date();
+  const closing = getClosingHourUTC();
+  const slugs   = buildSlugsForClosing(closing);
   const debugLog = [];
 
-  // Run all strategies in order
   const strategies = [
-    { name: "slug_exact",  fn: () => searchBySlugs(slugs) },
-    { name: "tag_bitcoin", fn: searchByTag },
-    { name: "keyword",     fn: searchByKeyword },
-    { name: "events",      fn: searchByEvents },
-    { name: "upcoming",    fn: searchByUpcoming },
+    { name: "slug_exact",         fn: () => bySlug(slugs)              },
+    { name: "exact_closing_time", fn: () => byExactClosingTime(closing) },
+    { name: "tag_and_time",       fn: () => byTagAndTime(closing)       },
+    { name: "search_keyword",     fn: bySearch                          },
   ];
 
-  let raw = null;
+  let result = null;
   for (const s of strategies) {
     try {
-      raw = await s.fn();
-      debugLog.push({ strategy: s.name, found: !!raw });
-      if (raw) break;
+      result = await s.fn();
+      debugLog.push({ strategy: s.name, found: !!result, slug: result?.slug ?? null });
+      if (result) break;
     } catch (e) {
       debugLog.push({ strategy: s.name, found: false, error: e.message });
     }
   }
 
-  if (!raw) {
+  if (!result) {
     return Response.json({
-      active: false,
-      market: null,
-      error: "No se encontró ningún mercado BTC Up/Down activo",
-      debug: { slugs_tried: slugs, strategies: debugLog },
+      active:  false,
+      market:  null,
+      error:   "No se encontró mercado Bitcoin Up or Down para esta hora UTC",
+      debug: {
+        current_utc:   now.toISOString(),
+        closing_utc:   closing.toISOString(),
+        mins_to_close: (closing.getTime() - now.getTime()) / 60000,
+        slugs_tried:   slugs,
+        strategies:    debugLog,
+      },
       ts: Date.now(),
     });
   }
 
-  const market = normalizeMarket(raw);
-
   return Response.json({
     active: true,
-    market,
-    debug: { strategy_used: debugLog.find(d => d.found)?.strategy, log: debugLog },
+    market: normalizeMarket(result.market),
+    debug: {
+      strategy_used: debugLog.find(d => d.found)?.strategy,
+      closing_utc:   closing.toISOString(),
+      slug_found:    result.slug,
+    },
     ts: Date.now(),
   });
 }
-
