@@ -72,8 +72,17 @@ function buildETSlug(closingUTC) {
   return `bitcoin-up-or-down-${month}-${day}-${h12}${ampm}-et`;
 }
 
-// ── Hora de cierre UTC ────────────────────────────────────────────────────────
+// ── Horas UTC ─────────────────────────────────────────────────────────────────
 
+// Hora de INICIO de la vela actual (para el slug ET — Polymarket nombra por hora de inicio)
+function getCurrentHourUTC() {
+  const now = new Date();
+  const cur = new Date(now);
+  cur.setUTCMinutes(0, 0, 0);
+  return cur;
+}
+
+// Hora de CIERRE (para filtrar mercados por endDate)
 function getClosingHourUTC() {
   const now = new Date();
   const closing = new Date(now);
@@ -230,9 +239,10 @@ function normalizeMarket(raw) {
 // ── Handler principal ─────────────────────────────────────────────────────────
 
 export async function GET() {
-  const now      = new Date();
-  const closing  = getClosingHourUTC();
-  const etSlug   = buildETSlug(closing);
+  const now         = new Date();
+  const closing     = getClosingHourUTC();     // para filtros por endDate
+  const currentHour = getCurrentHourUTC();     // para el slug ET (nombre = hora inicio)
+  const etSlug      = buildETSlug(currentHour);
   const legacySlugs = buildLegacySlugs(closing);
   const debugLog = [];
 
