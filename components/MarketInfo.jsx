@@ -47,8 +47,8 @@ function WindowTimeline({ minsLeft, activeWindow }) {
     <div style={{ marginTop: 2 }}>
       <div style={{ display: "flex", gap: 4 }}>
         {WINDOWS.map(w => {
-          const isActive  = activeWindow?.key === w.key;
-          const isPast    = minsLeft < w.min;
+          const isActive = activeWindow?.key === w.key;
+          const isPast   = minsLeft < w.min;
           return (
             <div key={w.key} style={{
               flex: 1, padding: "6px 4px", borderRadius: 3, textAlign: "center",
@@ -80,37 +80,103 @@ function WindowTimeline({ minsLeft, activeWindow }) {
   );
 }
 
-export default function MarketInfo({ market, minsLeft, activeWindow, error }) {
+/** Sección de diagnóstico compacta, siempre visible */
+function DebugBadge({ debug }) {
+  if (!debug) return null;
+  return (
+    <div style={{
+      marginTop: 8, padding: "7px 10px",
+      background: "#03030c", border: "1px solid #111",
+      borderRadius: 3, fontSize: 9, color: "#333", lineHeight: 1.9,
+    }}>
+      <div style={{ color: "#2a3a4a", letterSpacing: "0.1em", marginBottom: 3 }}>◎ DIAGNÓSTICO SLUG</div>
+      <div>
+        <span style={{ color: "#444" }}>DST: </span>
+        <span style={{ color: "#555" }}>{debug.dst_active ? "EDT (UTC‑4)" : "EST (UTC‑5)"}</span>
+        <span style={{ color: "#2a2a3a", margin: "0 6px" }}>|</span>
+        <span style={{ color: "#444" }}>UTC now: </span>
+        <span style={{ color: "#555" }}>{debug.now_utc?.slice(11, 19)}</span>
+      </div>
+      {(debug.slugs_all || debug.slugs_tried)?.map((s, i) => (
+        <div key={s} style={{ display: "flex", gap: 6, alignItems: "center" }}>
+          <span style={{
+            color: s === debug.found_slug ? "var(--green)" : "#2a2a3a",
+            fontSize: 8,
+          }}>
+            {s === debug.found_slug ? "✓" : "·"}
+          </span>
+          <span style={{ color: s === debug.found_slug ? "#3a5a4a" : "#2a2a3a" }}>{s}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+export default function MarketInfo({ market, minsLeft, activeWindow, error, apiResponse }) {
+
+  // Estado: error explícito
   if (error) {
     return (
       <div style={{ background: "var(--bg)", padding: "16px 24px", borderTop: "1px solid var(--border)" }}>
         <div style={{ fontSize: 9, color: "#444", letterSpacing: "0.15em", marginBottom: 10 }}>◈ POLYMARKET — MERCADO ACTIVO</div>
         <div style={{ padding: "12px 16px", background: "rgba(255,68,102,0.05)", border: "1px solid rgba(255,68,102,0.2)", borderRadius: 3 }}>
           <div style={{ fontSize: 11, color: "var(--red)", marginBottom: 8 }}>⚠ {error}</div>
-          <div style={{ fontSize: 10, color: "#444", lineHeight: 1.8 }}>
-            <div>Posibles causas:</div>
-            <div>· El mercado aún no ha sido creado para esta hora</div>
-            <div>· El slug de Polymarket tiene un formato diferente al esperado</div>
-            <div>· La API de Polymarket no está disponible temporalmente</div>
+          <div style={{ fontSize: 10, color: "#555", lineHeight: 1.9, marginBottom: 8 }}>
+            <span style={{ color: "#444" }}>Posibles causas:</span><br />
+            · El slug generado no coincide con el de Polymarket para esta hora<br />
+            · El mercado aún no ha sido creado para esta ventana horaria<br />
+            · La Gamma API de Polymarket no responde temporalmente
           </div>
-          <a
-            href="/api/market/debug"
-            target="_blank"
-            rel="noopener noreferrer"
-            style={{
-              display: "inline-block", marginTop: 10,
-              fontSize: 10, color: "var(--blue)",
-              border: "1px solid rgba(68,136,255,0.3)",
-              padding: "3px 10px", borderRadius: 2, textDecoration: "none",
-            }}
-          >
-            Ver diagnóstico ↗ /api/market/debug
-          </a>
+
+          {/* Slugs probados desde la respuesta de error */}
+          {apiResponse?.slugs_tried && (
+            <div style={{ fontSize: 9, lineHeight: 2, color: "#2a2a3a", marginBottom: 6 }}>
+              <div style={{ color: "#444", marginBottom: 2 }}>SLUGS PROBADOS:</div>
+              {apiResponse.slugs_tried.map(s => (
+                <div key={s} style={{ color: "#333", paddingLeft: 8 }}>· {s}</div>
+              ))}
+            </div>
+          )}
+          {apiResponse?.errors?.length > 0 && (
+            <div style={{ fontSize: 9, lineHeight: 1.8, color: "#2a2a3a", marginBottom: 6 }}>
+              <div style={{ color: "#444", marginBottom: 2 }}>ERRORES:</div>
+              {apiResponse.errors.map((e, i) => (
+                <div key={i} style={{ color: "#333", paddingLeft: 8 }}>· {e.slug?.slice(-20)} → {e.error}</div>
+              ))}
+            </div>
+          )}
+          {apiResponse?.dst_active !== undefined && (
+            <div style={{ fontSize: 9, color: "#333", marginBottom: 6 }}>
+              DST activo: <span style={{ color: "#444" }}>{apiResponse.dst_active ? "Sí — EDT (UTC‑4)" : "No — EST (UTC‑5)"}</span>
+              <span style={{ margin: "0 6px", color: "#222" }}>|</span>
+              UTC: <span style={{ color: "#444" }}>{apiResponse.now_utc?.slice(11,19)}</span>
+            </div>
+          )}
+
+          <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+            <a href="/api/market/debug" target="_blank" rel="noopener noreferrer"
+              style={{
+                display: "inline-block", fontSize: 10, color: "var(--blue)",
+                border: "1px solid rgba(68,136,255,0.3)", padding: "3px 10px",
+                borderRadius: 2, textDecoration: "none",
+              }}>
+              Ver diagnóstico completo ↗
+            </a>
+            <a href="/api/market" target="_blank" rel="noopener noreferrer"
+              style={{
+                display: "inline-block", fontSize: 10, color: "#555",
+                border: "1px solid #1a1a2e", padding: "3px 10px",
+                borderRadius: 2, textDecoration: "none",
+              }}>
+              Ver respuesta API ↗
+            </a>
+          </div>
         </div>
       </div>
     );
   }
 
+  // Estado: cargando
   if (!market) {
     return (
       <div style={{ background: "var(--bg)", padding: "16px 24px", borderTop: "1px solid var(--border)" }}>
@@ -122,17 +188,16 @@ export default function MarketInfo({ market, minsLeft, activeWindow, error }) {
     );
   }
 
-  // ── Tiempo restante en vivo (usa el prop minsLeft, actualizado cada segundo) ──
-  const totalSecs    = Math.max(0, minsLeft * 60);
-  const mm           = String(Math.floor(totalSecs / 60)).padStart(2, "0");
-  const ss           = String(Math.floor(totalSecs % 60)).padStart(2, "0");
-  const minsDisplay  = `${mm}:${ss}`;
-  const timeColor    = minsLeft < 5 ? "var(--red)" : minsLeft < 15 ? "var(--yellow)" : "var(--green)";
+  // ── Tiempo restante en vivo ───────────────────────────────────────────────
+  const totalSecs   = Math.max(0, minsLeft * 60);
+  const mm          = String(Math.floor(totalSecs / 60)).padStart(2, "0");
+  const ss          = String(Math.floor(totalSecs % 60)).padStart(2, "0");
+  const minsDisplay = `${mm}:${ss}`;
+  const timeColor   = minsLeft < 5 ? "var(--red)" : minsLeft < 15 ? "var(--yellow)" : "var(--green)";
 
   const closeTime = market.end_date_iso
     ? new Date(market.end_date_iso).toLocaleTimeString("es-ES", { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false })
     : null;
-
   const closeDate = market.end_date_iso
     ? new Date(market.end_date_iso).toLocaleDateString("es-ES", { day: "2-digit", month: "2-digit", year: "numeric" })
     : null;
@@ -147,21 +212,15 @@ export default function MarketInfo({ market, minsLeft, activeWindow, error }) {
           <span style={{
             fontSize: 9, color: "var(--green)", border: "1px solid rgba(0,255,136,0.3)",
             padding: "1px 6px", borderRadius: 2, animation: "pulse 2s infinite",
-          }}>
-            LIVE
-          </span>
+          }}>LIVE</span>
         </div>
         {market.url && (
-          <a
-            href={market.url}
-            target="_blank"
-            rel="noopener noreferrer"
+          <a href={market.url} target="_blank" rel="noopener noreferrer"
             style={{
-              fontSize: 10, color: "var(--blue)",
-              textDecoration: "none", letterSpacing: "0.08em",
-              border: "1px solid rgba(68,136,255,0.3)", padding: "2px 8px", borderRadius: 2,
-            }}
-          >
+              fontSize: 10, color: "var(--blue)", textDecoration: "none",
+              letterSpacing: "0.08em", border: "1px solid rgba(68,136,255,0.3)",
+              padding: "2px 8px", borderRadius: 2,
+            }}>
             VER EN POLYMARKET ↗
           </a>
         )}
@@ -169,7 +228,7 @@ export default function MarketInfo({ market, minsLeft, activeWindow, error }) {
 
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 20 }}>
 
-        {/* Left: market details */}
+        {/* Left: detalles del mercado */}
         <div>
           <div style={{
             fontSize: 12, color: "#c8c8d8", lineHeight: 1.5,
@@ -180,7 +239,6 @@ export default function MarketInfo({ market, minsLeft, activeWindow, error }) {
           </div>
 
           <Row label="CIERRE"          value={closeTime ? `${closeDate}  ${closeTime} UTC` : "—"} valueColor="#ffcc00" />
-          {/* Tiempo restante en vivo — MM:SS actualizado cada segundo */}
           <Row
             label="TIEMPO RESTANTE"
             value={
@@ -195,24 +253,26 @@ export default function MarketInfo({ market, minsLeft, activeWindow, error }) {
             valueColor="#555"
           />
           {market.volume != null && (
-            <Row label="VOLUMEN"    value={`$${Number(market.volume).toLocaleString("en-US", { maximumFractionDigits: 0 })}`} valueColor="#aaa" />
+            <Row label="VOLUMEN"   value={`$${Number(market.volume).toLocaleString("en-US", { maximumFractionDigits: 0 })}`} valueColor="#aaa" />
           )}
           {market.liquidity != null && (
-            <Row label="LIQUIDEZ"   value={`$${Number(market.liquidity).toLocaleString("en-US", { maximumFractionDigits: 0 })}`} valueColor="#aaa" />
+            <Row label="LIQUIDEZ"  value={`$${Number(market.liquidity).toLocaleString("en-US", { maximumFractionDigits: 0 })}`} valueColor="#aaa" />
           )}
           <Row label="SLUG" value={market.slug || "—"} valueColor="#333" />
+
+          {/* Badge de diagnóstico del slug encontrado */}
+          {market._debug && <DebugBadge debug={market._debug} />}
         </div>
 
-        {/* Right: tokens + window timeline */}
+        {/* Right: tokens + ventanas */}
         <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-
           <div>
             <div style={{ fontSize: 9, color: "#444", letterSpacing: "0.12em", marginBottom: 8 }}>
               PRECIOS DE TOKENS (1 = certeza)
             </div>
             <div style={{ display: "flex", gap: 8 }}>
-              <TokenBadge label="▲ YES (UP)"   price={market.tokens?.yes?.price} color="var(--green)" />
-              <TokenBadge label="▼ NO (DOWN)"  price={market.tokens?.no?.price}  color="var(--red)"   />
+              <TokenBadge label="▲ YES (UP)"  price={market.tokens?.yes?.price} color="var(--green)" />
+              <TokenBadge label="▼ NO (DOWN)" price={market.tokens?.no?.price}  color="var(--red)"   />
             </div>
           </div>
 
@@ -222,7 +282,6 @@ export default function MarketInfo({ market, minsLeft, activeWindow, error }) {
             </div>
             <WindowTimeline minsLeft={minsLeft} activeWindow={activeWindow} />
           </div>
-
         </div>
       </div>
     </div>

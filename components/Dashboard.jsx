@@ -45,23 +45,20 @@ export default function Dashboard() {
   const [priceHistory, setPriceHistory] = useState([]);
 
   const { price, prev, source, error: priceError, loading: priceLoading } = useBTCPrice(true);
-  const { market, endMs, active: marketActive, error: marketError } = useMarket();
+  const { market, endMs, active: marketActive, error: marketError, apiResponse } = useMarket();
   const now    = useClock();
   const { log, add: addLog } = useLog();
   const { balance, pnlDay, applyBet, applyResult } = useBalance(500);
 
-  // ── minsLeft: calculado en tiempo real cada segundo desde end_ms ──────────
+  // ── minsLeft: calculado en tiempo real cada segundo desde end_ms ─────────
   const minsLeft = endMs
     ? Math.max(0, (endMs - now.getTime()) / 60000)
     : getMinsLeft(now);
 
-  // ── Target = OPEN 1H de Binance (Price to Beat real) ──────────────────────
-  // Fuente primaria: OPEN de la vela 1H de Binance.
-  // La API devuelve candle_hour_utc para validar que el target corresponde
-  // a la hora UTC actual (y no a la hora anterior — bug corregido).
+  // ── Target = OPEN 1H de Binance (Price to Beat real) ─────────────────────
   const [target,        setTarget       ] = useState(null);
-  const [targetHourUtc, setTargetHourUtc] = useState(null); // hora UTC de la vela
-  const [targetSource,  setTargetSource ] = useState(null); // "binance_klines" | "fallback_clock"
+  const [targetHourUtc, setTargetHourUtc] = useState(null);
+  const [targetSource,  setTargetSource ] = useState(null);
   const [targetError,   setTargetError  ] = useState(null);
   const targetLoadingRef = useRef(false);
 
@@ -77,7 +74,6 @@ export default function Dashboard() {
         setTargetSource(d.source ?? null);
         setTargetError(null);
       } else {
-        // target=null → fallback activo, mostrar advertencia
         setTargetError(d.error || "target no disponible");
         setTargetSource(d.source ?? null);
       }
@@ -88,15 +84,12 @@ export default function Dashboard() {
     }
   }, []);
 
-  // Carga inicial + polling cada 60s
   useEffect(() => {
     fetchTarget();
     const id = setInterval(fetchTarget, 60_000);
     return () => clearInterval(id);
   }, [fetchTarget]);
 
-  // Refresco forzado al detectar cambio de hora UTC
-  // También invalida el target si la vela no coincide con la hora actual
   const currentUtcHour = now.getUTCHours();
   useEffect(() => {
     if (targetHourUtc !== null && targetHourUtc !== currentUtcHour) {
@@ -108,26 +101,36 @@ export default function Dashboard() {
     }
   }, [currentUtcHour, targetHourUtc, fetchTarget]);
 
-  // targetIsStale: tenemos un target pero es de otra hora UTC
   const targetIsStale = target !== null
     && targetHourUtc !== null
     && targetHourUtc !== currentUtcHour;
 
-  // Log + alerta cuando cambia el target
   const prevTargetRef = useRef(null);
   useEffect(() => {
     if (target && target !== prevTargetRef.current) {
       const prev = prevTargetRef.current;
       prevTargetRef.current = target;
       const changeStr = prev
-        ? ` (anterior: ${fmtUSD(prev)}, Δ ${target > prev ? "+" : ""}${fmtUSD(target - prev)})`
+        ? ` (Δ ${target > prev ? "+" : ""}${fmtUSD(target - prev)})`
         : "";
       addLog(
-        `🎯 Price to Beat fijado: ${fmtUSD(target)} — vela ${targetHourUtc ?? "?"}h UTC${changeStr}`,
+        `🎯 Price to Beat: ${fmtUSD(target)} — vela ${targetHourUtc ?? "?"}h UTC${changeStr}`,
         "info",
       );
     }
   }, [target]);
+
+  // Log cuando se detecta/pierde el mercado
+  const prevMarketSlug = useRef(null);
+  useEffect(() => {
+    if (market?.slug && market.slug !== prevMarketSlug.current) {
+      prevMarketSlug.current = market.slug;
+      addLog(`◈ Mercado detectado: ${market.slug}`, "success");
+    } else if (!market && prevMarketSlug.current) {
+      prevMarketSlug.current = null;
+      addLog(`⚠ Mercado perdido — buscando...`, "error");
+    }
+  }, [market?.slug]);
 
   const activeWindow = getActiveWindow(minsLeft);
   const umbral       = activeWindow ? config[activeWindow.configKey] : null;
@@ -219,14 +222,19 @@ export default function Dashboard() {
   const winRate   = (wins + losses) > 0 ? Math.round(wins / (wins + losses) * 100) : null;
   const dist      = price && target ? price - target : null;
 
-  // Label para el tag de target en el header
+  // Tag de estado del target
   const targetTag = targetIsStale
     ? { label: "TARGET STALE", color: "#4a1a1a" }
     : targetError
       ? { label: "TARGET ERR",   color: "#4a2a1a" }
       : target
-        ? { label: "TARGET OK",   color: "#2a3a4a" }
+        ? { label: "TARGET OK",   color: "#1a3a2a" }
         : null;
+
+  // Tag estado del mercado con info de slug
+  const marketSlugShort = market?.slug
+    ? market.slug.replace("bitcoin-up-or-down-", "").replace("-et", "")
+    : null;
 
   return (
     <div style={{ minHeight: "100vh", background: "var(--bg)", color: "var(--text)" }}>
@@ -248,13 +256,19 @@ export default function Dashboard() {
           <span style={{ color: "var(--green)", fontWeight: 700, letterSpacing: "0.12em", fontSize: 14 }}>
             POLYMARKET BTC BOT
           </span>
-          <Tag color="#2a4a3a">v2.3</Tag>
-          {marketActive ? <Tag color="#2a4a3a">MERCADO OK</Tag> : <Tag color="#4a2a2a">SIN MERCADO</Tag>}
+          <Tag color="#2a4a3a">v2.4</Tag>
+          {marketActive
+            ? <Tag color="#1a3a2a">◈ {marketSlugShort || "MERCADO OK"}</Tag>
+            : <Tag color="#4a2a2a">◈ SIN MERCADO</Tag>
+          }
           {targetTag && <Tag color={targetTag.color}>{targetTag.label}</Tag>}
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 20, fontSize: 12 }}>
           {priceError && <span style={{ color: "var(--red)", fontSize: 10 }}>⚠ PRECIO NO DISPONIBLE</span>}
-          <span style={{ color: "#444" }}>{now.toLocaleTimeString("es-ES", { hour12: false })} UTC+0: {String(currentUtcHour).padStart(2,"0")}h</span>
+          <span style={{ color: "#444" }}>
+            {now.toLocaleTimeString("es-ES", { hour12: false })}
+            <span style={{ marginLeft: 8, color: "#2a2a3a" }}>UTC {String(currentUtcHour).padStart(2,"0")}h</span>
+          </span>
           <span style={{ color: balance < 100 ? "var(--red)" : "var(--green)" }}>BAL: {fmtUSD(balance)}</span>
           <button
             onClick={() => {
@@ -302,15 +316,11 @@ export default function Dashboard() {
               {priceLoading ? "CARGANDO..." : price ? `$${fmt(price, 2)}` : "—"}
             </div>
 
-            {/* PRICE TO BEAT — bloque mejorado con validación de hora */}
+            {/* PRICE TO BEAT */}
             <div style={{ marginTop: 10, fontSize: 11 }}>
               <span style={{ color: "var(--muted)" }}>PRICE TO BEAT: </span>
               <span style={{
-                color: targetIsStale
-                  ? "var(--red)"
-                  : targetError
-                    ? "var(--yellow)"
-                    : target ? "var(--yellow)" : "#444",
+                color: targetIsStale ? "var(--red)" : targetError ? "var(--yellow)" : target ? "var(--yellow)" : "#444",
                 fontWeight: 700,
               }}>
                 {target ? fmtUSD(target) : "—"}
@@ -338,22 +348,19 @@ export default function Dashboard() {
               </span>
             </div>
 
-            {/* Advertencia si el target está stale o no disponible */}
             {targetIsStale && (
               <div style={{
                 marginTop: 8, padding: "5px 8px", fontSize: 10,
-                background: "rgba(255,68,102,0.08)",
-                border: "1px solid rgba(255,68,102,0.3)",
+                background: "rgba(255,68,102,0.08)", border: "1px solid rgba(255,68,102,0.3)",
                 borderRadius: 3, color: "var(--red)",
               }}>
-                ⚠ Target de la hora {targetHourUtc}h — refrescando...
+                ⚠ Target de hora {targetHourUtc}h — refrescando...
               </div>
             )}
             {!target && targetError && (
               <div style={{
                 marginTop: 8, padding: "5px 8px", fontSize: 10,
-                background: "rgba(255,204,0,0.06)",
-                border: "1px solid rgba(255,204,0,0.25)",
+                background: "rgba(255,204,0,0.06)", border: "1px solid rgba(255,204,0,0.25)",
                 borderRadius: 3, color: "var(--yellow)",
               }}>
                 ⚠ Sin conexión a Binance — bot en pausa
@@ -370,7 +377,6 @@ export default function Dashboard() {
             <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 4 }}>
               {activeWindow ? `UMBRAL: $${umbral}` : `FALTAN: ${fmt(minsLeft, 1)} min`}
             </div>
-            {/* Cuenta atrás MM:SS en tiempo real */}
             <div style={{
               marginTop: 6, fontSize: 20, fontWeight: 700, fontVariantNumeric: "tabular-nums",
               color: minsLeft < 5 ? "var(--red)" : minsLeft < 15 ? "var(--yellow)" : "#555",
@@ -406,20 +412,16 @@ export default function Dashboard() {
               </>
             ) : (
               <div style={{ fontSize: 16, color: "var(--dim)", marginTop: 8 }}>
-                {running && targetIsStale
-                  ? "⚠ TARGET STALE"
-                  : running && !target
-                    ? "⚠ SIN TARGET"
-                    : running
-                      ? "— FUERA DE VENTANA —"
-                      : "— BOT DETENIDO —"}
+                {running && targetIsStale  ? "⚠ TARGET STALE"
+                 : running && !target      ? "⚠ SIN TARGET"
+                 : running                 ? "— FUERA DE VENTANA —"
+                 :                          "— BOT DETENIDO —"}
               </div>
             )}
             {activeBet && (
               <div style={{
                 marginTop: 12, padding: "7px 10px",
-                background: "rgba(255,204,0,0.06)",
-                border: "1px solid rgba(255,204,0,0.25)",
+                background: "rgba(255,204,0,0.06)", border: "1px solid rgba(255,204,0,0.25)",
                 borderRadius: 3, fontSize: 11, color: "var(--yellow)",
               }}>
                 ● POSICIÓN ACTIVA — {activeBet.dir} @ {fmtUSD(activeBet.entry)}
@@ -427,9 +429,15 @@ export default function Dashboard() {
             )}
           </div>
 
-          {/* MARKET INFO */}
+          {/* MARKET INFO — ahora recibe apiResponse para diagnóstico */}
           <div style={{ gridColumn: "1/4" }}>
-            <MarketInfo market={market} minsLeft={minsLeft} activeWindow={activeWindow} error={marketError} />
+            <MarketInfo
+              market={market}
+              minsLeft={minsLeft}
+              activeWindow={activeWindow}
+              error={marketError}
+              apiResponse={apiResponse}
+            />
           </div>
 
           {/* STATS */}
