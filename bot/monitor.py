@@ -8,6 +8,9 @@ Cambios v2.4:
   - notify_hour_summary() al final de cada hora
   - Retry automático si get_open_1h_binance() falla
   - Validación: comprueba que la vela corresponde a la hora UTC actual
+
+FIX: mercado se obtiene ANTES que el target para pasar el slug a Binance.
+     get_open_1h_binance(slug=) usa startTime para pedir la vela exacta.
 """
 import logging
 import time
@@ -56,11 +59,20 @@ def _log_cycle(price, target, mins_left, ops_hoy, max_ops):
     )
 
 
-def _fetch_target_with_retry(cfg: dict, hour_utc: int) -> float | None:
-    """Obtiene el Price to Beat con reintentos y notificación Telegram."""
+def _fetch_target_with_retry(cfg: dict, hour_utc: int, slug: str | None = None) -> float | None:
+    """
+    Obtiene el Price to Beat con reintentos y notificación Telegram.
+
+    Si se pasa slug, get_open_1h_binance() usará startTime para pedir
+    la vela exacta correspondiente al mercado activo (más robusto en
+    transiciones de hora). Consistente con /api/target?slug= del front.
+    """
     for attempt in range(1, MAX_TARGET_RETRIES + 1):
-        logger.info(f"[MONITOR] Obteniendo Price to Beat (intento {attempt}/{MAX_TARGET_RETRIES})...")
-        target = get_open_1h_binance()
+        logger.info(
+            f"[MONITOR] Obteniendo Price to Beat (intento {attempt}/{MAX_TARGET_RETRIES})"
+            + (f" — slug: {slug}" if slug else "") + "..."
+        )
+        target = get_open_1h_binance(slug=slug)
 
         if target is not None:
             is_retry = attempt > 1
@@ -113,7 +125,7 @@ def run(cfg: dict):
     hour_wins    = 0
     hour_losses  = 0
     last_market  = None
-    last_window  = None   # para detectar transición de ventana
+    last_window  = None
 
     try:
         while True:
@@ -138,9 +150,9 @@ def run(cfg: dict):
                     hour_wins   = 0
                     hour_losses = 0
 
-                current_hour  = hour
-                fired_window  = None
-                last_window   = None
+                current_hour = hour
+                fired_window = None
+                last_window  = None
 
                 # Apuesta sin resolver → descarta
                 if active_bet:
@@ -150,17 +162,20 @@ def run(cfg: dict):
                     )
                     active_bet = None
 
-                # Nuevo Price to Beat
-                target = _fetch_target_with_retry(cfg, hour)
-
-                # Nuevo mercado
+                # ── Mercado PRIMERO para obtener el slug ──────────────────────
+                # El slug permite pedir la vela exacta a Binance por startTime.
                 logger.info("[MONITOR] Buscando mercado activo en Polymarket...")
-                last_market = get_active_market()
+                last_market  = get_active_market()
+                market_slug  = last_market.get("slug") if last_market else None
                 if last_market:
-                    mins_left = _mins_to_close()
-                    notify_market_found(cfg, last_market, mins_left)
+                    mins_left_now = _mins_to_close()
+                    notify_market_found(cfg, last_market, mins_left_now)
+                    logger.info(f"[MONITOR] Slug del mercado: {market_slug}")
                 else:
-                    notify_market_lost(cfg, [])   # slugs se registran en market_scanner log
+                    notify_market_lost(cfg, [])
+
+                # ── Price to Beat con slug ────────────────────────────────────
+                target = _fetch_target_with_retry(cfg, hour, slug=market_slug)
 
                 logger.info(_SEPARATOR)
 
@@ -217,7 +232,6 @@ def run(cfg: dict):
                     f"Target=${active_bet['target']:,.2f}  Close=${price:,.2f}"
                 )
                 if won:
-                    notify_win(cfg, active_bet, price)
                     hour_wins += 1
                     try:
                         tx = redimir_posicion(active_bet.get("market", {}), dir_, cfg)
@@ -225,9 +239,10 @@ def run(cfg: dict):
                     except Exception as e:
                         logger.error(f"[MONITOR] ❌ Claim fallido: {e}", exc_info=True)
                         notify_error(cfg, f"Claim fallido: {e}")
+                    notify_win(cfg, active_bet, price)
                 else:
-                    notify_loss(cfg, active_bet, price)
                     hour_losses += 1
+                    notify_loss(cfg, active_bet, price)
 
                 active_bet   = None
                 fired_window = None
@@ -265,7 +280,7 @@ def run(cfg: dict):
                     time.sleep(interval)
                     continue
 
-                # Buscar mercado (refresco si no hay o es nuevo ciclo)
+                # Buscar mercado (refresco si no hay en este ciclo)
                 if not last_market:
                     logger.info("[MONITOR] 🔍 Buscando mercado activo para ejecutar orden...")
                     last_market = get_active_market()

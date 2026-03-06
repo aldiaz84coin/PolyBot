@@ -1,5 +1,5 @@
 """
-market_scanner.py  (raíz /bot/)
+bot/market_scanner.py
 Detecta el mercado BTC Up/Down activo en Polymarket y obtiene el Price to Beat.
 
 FIX: Polymarket nombra cada mercado por la hora de CIERRE de la vela 1H (ET),
@@ -8,9 +8,14 @@ FIX: Polymarket nombra cada mercado por la hora de CIERRE de la vela 1H (ET),
        · Slug correcto: bitcoin-up-or-down-march-6-6am-et  (hora de CIERRE)
        · Bug anterior:  bitcoin-up-or-down-march-6-5am-et  (hora de APERTURA ❌)
 
-CORRECCIÓN: get_open_1h_binance() usa limit=1 (no limit=2).
+FIX: get_open_1h_binance() usa limit=1 (no limit=2).
   Con limit=2 klines[0] = vela ANTERIOR cerrada (precio incorrecto).
   Con limit=1 klines[0] = vela ACTUAL en curso  (correcto).
+
+CONSISTENCIA con /api/target:
+  get_open_1h_binance() acepta slug opcional. Si se pasa, parsea la hora
+  del mercado desde el slug y usa startTime en Binance para pedir
+  la vela exacta correspondiente al mercado activo.
 """
 import logging
 import requests
@@ -59,14 +64,10 @@ def _build_slugs(now: datetime) -> list[str]:
       · La vela ABRE a las 10:00 UTC = 5am ET
       · La vela CIERRA a las 11:00 UTC = 6am ET
       · Slug del mercado: "bitcoin-up-or-down-march-6-6am-et"  ← hora de cierre
-
-    Para obtener la hora de cierre: candle_close = candle_open + 1h
     """
     slugs = []
     for offset in [0, -1, 1]:
-        # Hora de apertura de la vela (= hora UTC actual ± offset)
         candle_open_utc  = now + timedelta(hours=offset)
-        # Hora de CIERRE = apertura + 1h → esto es lo que va en el slug
         candle_close_utc = candle_open_utc + timedelta(hours=1)
         et_close         = _to_et(candle_close_utc)
 
@@ -78,9 +79,7 @@ def _build_slugs(now: datetime) -> list[str]:
         if slug not in slugs:
             slugs.append(slug)
 
-    logger.debug(
-        f"[SCANNER] Slugs candidatos (hora cierre ET): {slugs}"
-    )
+    logger.debug(f"[SCANNER] Slugs candidatos (hora cierre ET): {slugs}")
     return slugs
 
 
@@ -101,6 +100,60 @@ def _parse_end_ms(raw: dict) -> int | None:
     return None
 
 
+def _slug_to_end_ms(slug: str, now: datetime) -> int | None:
+    """
+    Fallback: deriva el timestamp de cierre del mercado directamente desde el slug.
+    Consistente con slugToEndMs() en app/api/market/route.js.
+
+    El slug contiene la hora de CIERRE en ET (p.ej. "6am-et").
+    Convertimos esa hora ET a UTC ms.
+    """
+    try:
+        parts = slug.split("-")
+        month_idx = -1
+        month_part_idx = -1
+        for i, p in enumerate(parts):
+            if p in MONTHS:
+                month_idx = MONTHS.index(p)
+                month_part_idx = i
+                break
+        if month_idx == -1:
+            return None
+
+        day      = int(parts[month_part_idx + 1])
+        hour_str = parts[month_part_idx + 2]  # "6am", "12pm", etc.
+
+        if hour_str == "12am":
+            close_hour_et = 0
+        elif hour_str == "12pm":
+            close_hour_et = 12
+        elif hour_str.endswith("am"):
+            close_hour_et = int(hour_str[:-2])
+        elif hour_str.endswith("pm"):
+            close_hour_et = int(hour_str[:-2]) + 12
+        else:
+            return None
+
+        year = now.year
+        candidate = datetime(year, month_idx + 1, day, 12, 0, 0, tzinfo=timezone.utc)
+        et_offset = 4 if _is_dst(candidate) else 5
+
+        close_utc_ms = int(datetime(
+            year, month_idx + 1, day,
+            close_hour_et + et_offset, 0, 0,
+            tzinfo=timezone.utc,
+        ).timestamp() * 1000)
+
+        # Sanity: debe estar en un rango razonable (±2h de ahora)
+        diff = close_utc_ms - int(now.timestamp() * 1000)
+        if diff < -7_200_000 or diff > 7_200_000:
+            return None
+
+        return close_utc_ms
+    except Exception:
+        return None
+
+
 # ── Mercado activo ─────────────────────────────────────────────────────────────
 
 def get_active_market() -> dict | None:
@@ -116,12 +169,19 @@ def get_active_market() -> dict | None:
             if not data:
                 continue
 
-            m          = data[0]
-            tokens     = m.get("tokens", [])
-            yes_p      = next((float(t["price"]) for t in tokens if t.get("outcome") == "Yes"), None)
-            no_p       = next((float(t["price"]) for t in tokens if t.get("outcome") == "No"),  None)
-            end_ms     = _parse_end_ms(m)
-            mins       = max(0, (end_ms - int(now.timestamp() * 1000)) / 60_000) if end_ms else None
+            m      = data[0]
+            tokens = m.get("tokens", [])
+            yes_p  = next((float(t["price"]) for t in tokens if t.get("outcome") == "Yes"), None)
+            no_p   = next((float(t["price"]) for t in tokens if t.get("outcome") == "No"),  None)
+
+            # end_ms: primero desde Polymarket, fallback desde slug
+            end_ms = _parse_end_ms(m)
+            if not end_ms:
+                end_ms = _slug_to_end_ms(slug, now)
+                if end_ms:
+                    logger.debug(f"[SCANNER] end_ms derivado del slug (fallback): {end_ms}")
+
+            mins = max(0, (end_ms - int(now.timestamp() * 1000)) / 60_000) if end_ms else None
 
             market = {
                 "question":     m.get("question", "—"),
@@ -155,23 +215,86 @@ def get_active_market() -> dict | None:
 
 # ── Price to Beat ──────────────────────────────────────────────────────────────
 
-def get_open_1h_binance() -> float | None:
+def _slug_to_candle_start_ms(slug: str, now: datetime) -> int | None:
     """
-    Devuelve el precio OPEN de la vela 1H ACTUAL de Binance (= Price to Beat).
+    Parsea el slug para obtener el startTime UTC (ms) de la vela 1H del mercado.
+    Consistente con parseCandleStartFromSlug() en app/api/target/route.js.
+
+    El slug contiene la hora de CIERRE en ET → apertura = cierre - 1h.
+    """
+    try:
+        parts = slug.split("-")
+        month_idx = -1
+        month_part_idx = -1
+        for i, p in enumerate(parts):
+            if p in MONTHS:
+                month_idx = MONTHS.index(p)
+                month_part_idx = i
+                break
+        if month_idx == -1:
+            return None
+
+        day      = int(parts[month_part_idx + 1])
+        hour_str = parts[month_part_idx + 2]
+
+        if hour_str == "12am":
+            close_hour_et = 0
+        elif hour_str == "12pm":
+            close_hour_et = 12
+        elif hour_str.endswith("am"):
+            close_hour_et = int(hour_str[:-2])
+        elif hour_str.endswith("pm"):
+            close_hour_et = int(hour_str[:-2]) + 12
+        else:
+            return None
+
+        # Apertura = cierre - 1h
+        open_hour_et = (close_hour_et - 1) % 24
+        day_for_open = day - 1 if open_hour_et > close_hour_et else day  # cruce medianoche
+
+        year      = now.year
+        candidate = datetime(year, month_idx + 1, day_for_open, 12, 0, 0, tzinfo=timezone.utc)
+        et_offset = 4 if _is_dst(candidate) else 5
+
+        start_utc = datetime(
+            year, month_idx + 1, day_for_open,
+            open_hour_et + et_offset, 0, 0,
+            tzinfo=timezone.utc,
+        )
+        return int(start_utc.timestamp() * 1000)
+    except Exception:
+        return None
+
+
+def get_open_1h_binance(slug: str | None = None) -> float | None:
+    """
+    Devuelve el precio OPEN de la vela 1H del mercado activo (= Price to Beat).
 
     ⚠️  Por qué limit=1 y NO limit=2:
         Con limit=2 Binance devuelve en orden ASCENDENTE (la más antigua primero):
           klines[0] = vela ANTERIOR ya cerrada  → precio INCORRECTO
           klines[1] = vela ACTUAL en curso      → precio correcto
         Con limit=1 solo hay una entrada: la vela ACTUAL.
+
+    Si se pasa `slug`, se parsea la hora del mercado y se solicita la vela
+    exacta a Binance usando startTime (más robusto en transiciones de hora).
+    Consistente con /api/target?slug= en el front-end.
     """
-    logger.info("[SCANNER] 🕯 Obteniendo vela 1H actual de Binance (Price to Beat)...")
+    logger.info("[SCANNER] 🕯 Obteniendo vela 1H (Price to Beat)...")
+
+    now         = datetime.now(timezone.utc)
+    params: dict = {"symbol": "BTCUSDT", "interval": "1h", "limit": 1}
+    method_used = "limit=1 (vela actual)"
+
+    if slug:
+        start_ms = _slug_to_candle_start_ms(slug, now)
+        if start_ms:
+            params["startTime"] = start_ms
+            method_used = f"startTime={start_ms} (desde slug)"
+            logger.debug(f"[SCANNER] Vela solicitada por slug: {slug} → startTime={start_ms}")
+
     try:
-        r = requests.get(
-            BINANCE_KLINE,
-            params={"symbol": "BTCUSDT", "interval": "1h", "limit": 1},
-            timeout=TIMEOUT,
-        )
+        r = requests.get(BINANCE_KLINE, params=params, timeout=TIMEOUT)
         r.raise_for_status()
 
         kline      = r.json()[0]
@@ -182,28 +305,30 @@ def get_open_1h_binance() -> float | None:
         open_ts    = datetime.fromtimestamp(kline[0] / 1000, tz=timezone.utc)
         close_ts   = datetime.fromtimestamp(kline[6] / 1000, tz=timezone.utc)
 
-        now_utc    = datetime.now(timezone.utc)
-        now_ms     = int(now_utc.timestamp() * 1000)
-        close_ms   = int(kline[6])
-        mins_left  = max(0, (close_ms - now_ms) / 60_000)
-        mm, ss     = int(mins_left), int((mins_left % 1) * 60)
+        now_ms    = int(now.timestamp() * 1000)
+        close_ms  = int(kline[6])
+        mins_left = max(0, (close_ms - now_ms) / 60_000)
+        mm, ss    = int(mins_left), int((mins_left % 1) * 60)
 
+        # Verificación de hora (detección de desfases)
         candle_hour  = open_ts.hour
-        current_hour = now_utc.hour
+        current_hour = now.hour
         if candle_hour != current_hour:
             logger.warning(
-                f"[SCANNER] ⚠ La vela devuelta es de las {candle_hour:02d}h UTC "
-                f"pero ahora son las {current_hour:02d}h UTC — posible desfase de Binance"
+                f"[SCANNER] ⚠ Vela devuelta: {candle_hour:02d}h UTC | "
+                f"Hora actual: {current_hour:02d}h UTC — posible desfase"
             )
 
         logger.info(_SEPARATOR)
-        logger.info(f"[SCANNER] 🎯 PRICE TO BEAT (Binance 1H OPEN)")
+        logger.info(f"[SCANNER] 🎯 PRICE TO BEAT (Binance 1H OPEN) [{method_used}]")
         logger.info(f"[SCANNER]   Vela   : {open_ts.strftime('%H:%M UTC')} → {close_ts.strftime('%H:%M UTC')}")
         logger.info(f"[SCANNER]   Open   : ${open_price:>12,.2f}  ← TARGET OFICIAL")
         logger.info(f"[SCANNER]   High   : ${high:>12,.2f}")
         logger.info(f"[SCANNER]   Low    : ${low:>12,.2f}")
         logger.info(f"[SCANNER]   Close  : ${close:>12,.2f}  (precio actual de vela)")
         logger.info(f"[SCANNER]   Resta  : {mm:02d}:{ss:02d} para cerrar la vela")
+        if slug:
+            logger.info(f"[SCANNER]   Slug   : {slug}")
         logger.info(_SEPARATOR)
         return open_price
 
@@ -229,6 +354,8 @@ if __name__ == "__main__":
         datefmt="%H:%M:%S",
     )
     market = get_active_market()
-    target = get_open_1h_binance()
+    slug   = market.get("slug") if market else None
+    target = get_open_1h_binance(slug=slug)
     print(f"\nMercado : {market.get('question') if market else 'No encontrado'}")
+    print(f"Slug    : {slug or '—'}")
     print(f"Target  : ${target:,.2f}" if target else "Target  : No disponible")
