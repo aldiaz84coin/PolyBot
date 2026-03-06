@@ -1,10 +1,19 @@
 """
 market_scanner.py — Detecta el mercado BTC Up/Down activo en Polymarket
 y obtiene el Price to Beat (open vela 1H de Binance)
+
+FIX: Polymarket nombra cada mercado por la hora de CIERRE de la vela 1H (ET).
+     Ejemplo a las 10:30 UTC (5:30am ET):
+       · Vela activa: 10:00–11:00 UTC = 5am–6am ET
+       · Slug correcto: bitcoin-up-or-down-march-6-6am-et  ← hora CIERRE
+       · Bug anterior:  bitcoin-up-or-down-march-6-5am-et  ← hora apertura ❌
+
+     Además se corrigió el formato del slug (era "will-btc-be-higher-or-lower-..."
+     que ya no usa Polymarket).
 """
 import logging
 import requests
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -12,19 +21,62 @@ GAMMA_API     = "https://gamma-api.polymarket.com/markets"
 BINANCE_KLINE = "https://api.binance.com/api/v3/klines"
 TIMEOUT       = 8
 
-_last_slug = None   # para detectar cambios de slug entre llamadas
+MONTHS = [
+    "january","february","march","april","may","june",
+    "july","august","september","october","november","december",
+]
+
+
+# ── Helpers timezone ET ───────────────────────────────────────────────────────
+
+def _is_dst(utc_date: datetime) -> bool:
+    year      = utc_date.year
+    march     = datetime(year, 3, 1, tzinfo=timezone.utc)
+    dst_start = datetime(year, 3, 8 + (7 - march.weekday() - 1) % 7, tzinfo=timezone.utc)
+    nov       = datetime(year, 11, 1, tzinfo=timezone.utc)
+    dst_end   = datetime(year, 11, 1 + (7 - nov.weekday() - 1) % 7, tzinfo=timezone.utc)
+    return dst_start <= utc_date < dst_end
+
+
+def _to_et(utc_date: datetime) -> datetime:
+    return utc_date + timedelta(hours=-4 if _is_dst(utc_date) else -5)
+
+
+def _format_hour_12(h24: int) -> str:
+    if h24 == 0:   return "12am"
+    if h24 == 12:  return "12pm"
+    return f"{h24}am" if h24 < 12 else f"{h24 - 12}pm"
 
 
 def build_slugs() -> list[str]:
-    """Genera los slugs para la hora actual y la siguiente."""
-    now = datetime.now(timezone.utc)
-    base = f"will-btc-be-higher-or-lower-{now.year}-{now.month:02d}-{now.day:02d}"
-    slugs = [
-        f"{base}t{now.hour:02d}00-00-000z",
-        f"{base}t{(now.hour + 1) % 24:02d}00-00-000z",
-    ]
-    logger.debug(f"[SCANNER] Slugs candidatos: {slugs}")
+    """
+    Genera slugs candidatos para el mercado BTC Up/Down activo.
+
+    ⚠️ CLAVE — el slug usa la hora de CIERRE de la vela 1H en ET, no la de apertura.
+    La hora de cierre = hora de apertura UTC + 1h, convertida a ET.
+    """
+    now   = datetime.now(timezone.utc)
+    slugs = []
+
+    for offset in [0, -1, 1]:
+        candle_open_utc  = now + timedelta(hours=offset)
+        # Cierre = apertura + 1h → esto determina el slug en Polymarket
+        candle_close_utc = candle_open_utc + timedelta(hours=1)
+        et_close         = _to_et(candle_close_utc)
+
+        slug = (
+            f"bitcoin-up-or-down-"
+            f"{MONTHS[et_close.month - 1]}-{et_close.day}-"
+            f"{_format_hour_12(et_close.hour)}-et"
+        )
+        if slug not in slugs:
+            slugs.append(slug)
+
+    logger.debug(f"[SCANNER] Slugs candidatos (hora cierre ET): {slugs}")
     return slugs
+
+
+_last_slug: str | None = None
 
 
 def get_active_market() -> dict | None:
@@ -45,15 +97,14 @@ def get_active_market() -> dict | None:
                 logger.debug(f"[SCANNER] Sin resultados para slug={slug}")
                 continue
 
-            market = data[0]
-            question   = market.get("question", "—")
-            cond_id    = market.get("conditionId", market.get("condition_id", "—"))
-            end_date   = market.get("endDateIso", market.get("end_date_iso", market.get("endDate", "—")))
-            tokens     = market.get("tokens", [])
-            yes_price  = next((float(t["price"]) for t in tokens if t.get("outcome") == "Yes"), None)
-            no_price   = next((float(t["price"]) for t in tokens if t.get("outcome") == "No"),  None)
+            market    = data[0]
+            question  = market.get("question", "—")
+            cond_id   = market.get("conditionId", market.get("condition_id", "—"))
+            end_date  = market.get("endDateIso", market.get("end_date_iso", market.get("endDate", "—")))
+            tokens    = market.get("tokens", [])
+            yes_price = next((float(t["price"]) for t in tokens if t.get("outcome") == "Yes"), None)
+            no_price  = next((float(t["price"]) for t in tokens if t.get("outcome") == "No"),  None)
 
-            # ── Detección de cambio de slug ────────────────────────────────
             if _last_slug is None:
                 logger.info(f"[SCANNER] ✅ Mercado inicial detectado")
             elif _last_slug != slug:
@@ -72,8 +123,7 @@ def get_active_market() -> dict | None:
                 f"           Pregunta   : {question}\n"
                 f"           Slug       : {slug}\n"
                 f"           ConditionID: {cond_id}\n"
-                f"           Cierre     : {end_date}\n"
-                f"           YES price  : {yes_price:.4f}" if yes_price else "           YES price  : —"
+                f"           Cierre     : {end_date}"
             )
             if yes_price and no_price:
                 logger.info(
@@ -101,11 +151,10 @@ def get_active_market() -> dict | None:
 
 def get_open_1h_binance() -> float | None:
     """Obtiene el precio OPEN de la vela 1H actual de Binance (= Price to Beat)."""
-    url = BINANCE_KLINE
     params = {"symbol": "BTCUSDT", "interval": "1h", "limit": 1}
-    logger.debug(f"[SCANNER] GET {url} params={params}")
+    logger.debug(f"[SCANNER] GET {BINANCE_KLINE} params={params}")
     try:
-        r = requests.get(url, params=params, timeout=TIMEOUT)
+        r = requests.get(BINANCE_KLINE, params=params, timeout=TIMEOUT)
         logger.debug(f"[SCANNER] HTTP {r.status_code} — Binance klines")
         r.raise_for_status()
 
