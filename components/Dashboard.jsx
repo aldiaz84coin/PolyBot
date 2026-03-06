@@ -45,37 +45,56 @@ export default function Dashboard() {
   const [priceHistory, setPriceHistory] = useState([]);
 
   const { price, prev, source, error: priceError, loading: priceLoading } = useBTCPrice(true);
-  const { market, endMs, priceToBeat, active: marketActive, error: marketError } = useMarket();
+  const { market, endMs, active: marketActive, error: marketError } = useMarket();
   const now    = useClock();  // se actualiza cada segundo
   const { log, add: addLog } = useLog();
   const { balance, pnlDay, applyBet, applyResult } = useBalance(500);
 
-  // ── minsLeft: calculado en tiempo real cada segundo desde end_ms ─────────
-  // Si el mercado no está disponible, usa el reloj local como fallback
+  // ── minsLeft: calculado en tiempo real cada segundo desde end_ms ──────────
+  // end_ms viene del mercado (con fallback al fin de hora UTC si la API no devuelve fecha)
   const minsLeft = endMs
     ? Math.max(0, (endMs - now.getTime()) / 60000)
     : getMinsLeft(now);
 
-  // ── Target = Price to Beat del mercado Polymarket ────────────────────────
-  // priceToBeat viene de la descripción del mercado (extraído en el API)
-  // Si no está disponible, fallback al OPEN 1H de Binance (no ideal pero funcional)
-  const [binanceTarget, setBinanceTarget] = useState(null);
-  const binanceHourRef = useRef(null);
+  // ── Target = OPEN 1H de Binance (Price to Beat real) ──────────────────────
+  // Es la fuente primaria y definitiva: el mercado Polymarket BTC resuelve
+  // comparando el precio de cierre con el OPEN de la vela 1H de Binance.
+  // Se refresca: al montar, cada 60s, y al detectar cambio de hora.
+  const [target, setTarget]   = useState(null);
+  const [targetTs, setTargetTs] = useState(null);  // hora UTC del target cargado
+  const targetLoadingRef = useRef(false);
 
-  // Fallback: fetch OPEN 1H de Binance solo si Polymarket no da el precio
+  const fetchTarget = useCallback(async () => {
+    if (targetLoadingRef.current) return;
+    targetLoadingRef.current = true;
+    try {
+      const r = await fetch("/api/target");
+      const d = await r.json();
+      if (d.target) {
+        setTarget(d.target);
+        setTargetTs(new Date().getUTCHours());
+      }
+    } catch (_) {
+      // silencioso — se reintentará en el siguiente ciclo
+    } finally {
+      targetLoadingRef.current = false;
+    }
+  }, []);
+
+  // Carga inicial + polling cada 60s
   useEffect(() => {
-    if (priceToBeat) return; // Polymarket tiene el precio, no necesitamos Binance
-    const h = now.getHours();
-    if (binanceHourRef.current === h) return;
-    binanceHourRef.current = h;
-    fetch("/api/target")
-      .then(r => r.json())
-      .then(d => { if (d.target) setBinanceTarget(d.target); })
-      .catch(() => {});
-  }, [now.getHours(), priceToBeat]);
+    fetchTarget();
+    const id = setInterval(fetchTarget, 60_000);
+    return () => clearInterval(id);
+  }, [fetchTarget]);
 
-  // El target final: Polymarket > Binance fallback
-  const target = priceToBeat ?? binanceTarget;
+  // Refresco forzado al cambiar de hora UTC (nuevo mercado, nuevo Price to Beat)
+  useEffect(() => {
+    const currentHour = now.getUTCHours();
+    if (targetTs !== null && targetTs !== currentHour) {
+      fetchTarget();
+    }
+  }, [now.getUTCHours(), targetTs, fetchTarget]);
 
   const activeWindow = getActiveWindow(minsLeft);
   const umbral       = activeWindow ? config[activeWindow.configKey] : null;
@@ -87,8 +106,7 @@ export default function Dashboard() {
   useEffect(() => {
     if (target && target !== prevTargetRef.current) {
       prevTargetRef.current = target;
-      const src = priceToBeat ? "Polymarket" : "Binance 1H";
-      addLog(`🎯 Price to Beat: ${fmtUSD(target)} (fuente: ${src})`, "info");
+      addLog(`🎯 Price to Beat (Binance 1H open): ${fmtUSD(target)}`, "info");
     }
   }, [target]);
 
@@ -99,7 +117,7 @@ export default function Dashboard() {
     setPriceHistory(h => [...h.slice(-59), { ts, price, target }]);
   }, [price]);
 
-  // ── Bot logic ────────────────────────────────────────────────────────────
+  // ── Bot logic ─────────────────────────────────────────────────────────────
   const firedWindow = useRef(null);
   useEffect(() => { if (!activeWindow) firedWindow.current = null; }, [activeWindow?.key]);
 
@@ -179,9 +197,9 @@ export default function Dashboard() {
           <span style={{ color: "var(--green)", fontWeight: 700, letterSpacing: "0.12em", fontSize: 14 }}>
             POLYMARKET BTC BOT
           </span>
-          <Tag color="#2a4a3a">v2.1</Tag>
+          <Tag color="#2a4a3a">v2.2</Tag>
           {marketActive ? <Tag color="#2a4a3a">MERCADO OK</Tag> : <Tag color="#4a2a2a">SIN MERCADO</Tag>}
-          {priceToBeat && <Tag color="#2a3a4a">PRICE TO BEAT OK</Tag>}
+          {target && <Tag color="#2a3a4a">TARGET OK</Tag>}
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 20, fontSize: 12 }}>
           {priceError && <span style={{ color: "var(--red)", fontSize: 10 }}>⚠ PRECIO NO DISPONIBLE</span>}
@@ -233,8 +251,8 @@ export default function Dashboard() {
               <span style={{ color: target ? "var(--yellow)" : "#444", fontWeight: 700 }}>
                 {target ? fmtUSD(target) : "—"}
               </span>
-              {priceToBeat &&
-                <span style={{ fontSize: 9, color: "#2a4a3a", marginLeft: 6 }}>● POLYMARKET</span>
+              {target &&
+                <span style={{ fontSize: 9, color: "#2a3a4a", marginLeft: 6 }}>● BINANCE 1H</span>
               }
             </div>
             <div style={{ marginTop: 4, fontSize: 11 }}>
@@ -257,13 +275,10 @@ export default function Dashboard() {
             <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 4 }}>
               {activeWindow ? `UMBRAL: $${umbral}` : `FALTAN: ${fmt(minsLeft, 1)} min`}
             </div>
-            {/* Cuenta atrás en tiempo real */}
+            {/* Cuenta atrás MM:SS en tiempo real */}
             <div style={{ marginTop: 6, fontSize: 20, fontWeight: 700, fontVariantNumeric: "tabular-nums",
               color: minsLeft < 5 ? "var(--red)" : minsLeft < 15 ? "var(--yellow)" : "#555" }}>
-              {endMs
-                ? `${String(Math.floor(minsLeft)).padStart(2,"0")}:${String(Math.floor((minsLeft % 1) * 60)).padStart(2,"0")}`
-                : `${fmt(minsLeft, 1)} min`
-              }
+              {String(Math.floor(minsLeft)).padStart(2, "0")}:{String(Math.floor((minsLeft % 1) * 60)).padStart(2, "0")}
             </div>
             <div style={{ marginTop: 8 }}>
               <WindowBar minsLeft={minsLeft} activeWindow={activeWindow} />

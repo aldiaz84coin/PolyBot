@@ -49,7 +49,6 @@ function WindowTimeline({ minsLeft, activeWindow }) {
         {WINDOWS.map(w => {
           const isActive  = activeWindow?.key === w.key;
           const isPast    = minsLeft < w.min;
-          const isFuture  = minsLeft > w.max;
           return (
             <div key={w.key} style={{
               flex: 1, padding: "6px 4px", borderRadius: 3, textAlign: "center",
@@ -123,6 +122,13 @@ export default function MarketInfo({ market, minsLeft, activeWindow, error }) {
     );
   }
 
+  // ── Tiempo restante en vivo (usa el prop minsLeft, actualizado cada segundo) ──
+  const totalSecs    = Math.max(0, minsLeft * 60);
+  const mm           = String(Math.floor(totalSecs / 60)).padStart(2, "0");
+  const ss           = String(Math.floor(totalSecs % 60)).padStart(2, "0");
+  const minsDisplay  = `${mm}:${ss}`;
+  const timeColor    = minsLeft < 5 ? "var(--red)" : minsLeft < 15 ? "var(--yellow)" : "var(--green)";
+
   const closeTime = market.end_date_iso
     ? new Date(market.end_date_iso).toLocaleTimeString("es-ES", { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false })
     : null;
@@ -130,10 +136,6 @@ export default function MarketInfo({ market, minsLeft, activeWindow, error }) {
   const closeDate = market.end_date_iso
     ? new Date(market.end_date_iso).toLocaleDateString("es-ES", { day: "2-digit", month: "2-digit", year: "numeric" })
     : null;
-
-  const minsDisplay = market.mins_to_close != null
-    ? `${Math.floor(market.mins_to_close)}m ${Math.round((market.mins_to_close % 1) * 60)}s`
-    : "—";
 
   return (
     <div style={{ background: "var(--bg)", padding: "16px 24px", borderTop: "1px solid var(--border)" }}>
@@ -169,7 +171,6 @@ export default function MarketInfo({ market, minsLeft, activeWindow, error }) {
 
         {/* Left: market details */}
         <div>
-          {/* Question */}
           <div style={{
             fontSize: 12, color: "#c8c8d8", lineHeight: 1.5,
             padding: "8px 12px", background: "rgba(255,255,255,0.03)",
@@ -178,19 +179,26 @@ export default function MarketInfo({ market, minsLeft, activeWindow, error }) {
             {market.question || "—"}
           </div>
 
-          <Row label="CIERRE"       value={closeTime ? `${closeDate}  ${closeTime} UTC` : "—"} valueColor="#ffcc00" />
-          <Row label="TIEMPO RESTANTE" value={minsDisplay} valueColor={
-            minsLeft < 5 ? "var(--red)" : minsLeft < 15 ? "var(--yellow)" : "var(--green)"
-          } />
+          <Row label="CIERRE"          value={closeTime ? `${closeDate}  ${closeTime} UTC` : "—"} valueColor="#ffcc00" />
+          {/* Tiempo restante en vivo — MM:SS actualizado cada segundo */}
+          <Row
+            label="TIEMPO RESTANTE"
+            value={
+              <span style={{ fontVariantNumeric: "tabular-nums", fontSize: 14, fontWeight: 700, color: timeColor }}>
+                {minsDisplay}
+              </span>
+            }
+            valueColor={timeColor}
+          />
           <Row label="CONDITION ID"
             value={market.condition_id ? market.condition_id.slice(0, 18) + "..." : "—"}
             valueColor="#555"
           />
           {market.volume != null && (
-            <Row label="VOLUMEN"     value={`$${Number(market.volume).toLocaleString("en-US", { maximumFractionDigits: 0 })}`} valueColor="#aaa" />
+            <Row label="VOLUMEN"    value={`$${Number(market.volume).toLocaleString("en-US", { maximumFractionDigits: 0 })}`} valueColor="#aaa" />
           )}
           {market.liquidity != null && (
-            <Row label="LIQUIDEZ"    value={`$${Number(market.liquidity).toLocaleString("en-US", { maximumFractionDigits: 0 })}`} valueColor="#aaa" />
+            <Row label="LIQUIDEZ"   value={`$${Number(market.liquidity).toLocaleString("en-US", { maximumFractionDigits: 0 })}`} valueColor="#aaa" />
           )}
           <Row label="SLUG" value={market.slug || "—"} valueColor="#333" />
         </div>
@@ -198,26 +206,16 @@ export default function MarketInfo({ market, minsLeft, activeWindow, error }) {
         {/* Right: tokens + window timeline */}
         <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
 
-          {/* Token prices */}
           <div>
             <div style={{ fontSize: 9, color: "#444", letterSpacing: "0.12em", marginBottom: 8 }}>
               PRECIOS DE TOKENS (1 = certeza)
             </div>
             <div style={{ display: "flex", gap: 8 }}>
-              <TokenBadge
-                label="▲ YES (UP)"
-                price={market.tokens?.yes?.price}
-                color="var(--green)"
-              />
-              <TokenBadge
-                label="▼ NO (DOWN)"
-                price={market.tokens?.no?.price}
-                color="var(--red)"
-              />
+              <TokenBadge label="▲ YES (UP)"   price={market.tokens?.yes?.price} color="var(--green)" />
+              <TokenBadge label="▼ NO (DOWN)"  price={market.tokens?.no?.price}  color="var(--red)"   />
             </div>
           </div>
 
-          {/* Window timeline */}
           <div>
             <div style={{ fontSize: 9, color: "#444", letterSpacing: "0.12em", marginBottom: 8 }}>
               VENTANAS DE ENTRADA
