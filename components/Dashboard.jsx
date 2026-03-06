@@ -62,11 +62,20 @@ export default function Dashboard() {
   const [targetError,   setTargetError  ] = useState(null);
   const targetLoadingRef = useRef(false);
 
+  // Ref para leer el slug actual dentro de fetchTarget sin añadirlo como
+  // dependencia del useCallback (evita recrear el callback en cada render).
+  const marketSlugRef = useRef(null);
+  marketSlugRef.current = market?.slug ?? null;
+
   const fetchTarget = useCallback(async () => {
     if (targetLoadingRef.current) return;
     targetLoadingRef.current = true;
     try {
-      const r = await fetch("/api/target");
+      // Pasamos el slug para que /api/target pida la vela exacta a Binance.
+      // El slug codifica la hora del mercado (p.ej. "march-6-6am-et").
+      const slug = marketSlugRef.current;
+      const slugParam = slug ? `?slug=${encodeURIComponent(slug)}` : "";
+      const r = await fetch(`/api/target${slugParam}`);
       const d = await r.json();
       if (d.target) {
         setTarget(d.target);
@@ -82,7 +91,7 @@ export default function Dashboard() {
     } finally {
       targetLoadingRef.current = false;
     }
-  }, []);
+  }, []); // sin dependencias: usa ref para el slug
 
   useEffect(() => {
     fetchTarget();
@@ -120,17 +129,20 @@ export default function Dashboard() {
     }
   }, [target]);
 
-  // Log cuando se detecta/pierde el mercado
+  // Log cuando se detecta/pierde el mercado.
+  // Al detectar un nuevo slug re-fetch inmediato del target con ese slug.
   const prevMarketSlug = useRef(null);
   useEffect(() => {
     if (market?.slug && market.slug !== prevMarketSlug.current) {
       prevMarketSlug.current = market.slug;
       addLog(`◈ Mercado detectado: ${market.slug}`, "success");
+      // Nuevo mercado → pedir target con el slug correcto sin esperar al intervalo
+      fetchTarget();
     } else if (!market && prevMarketSlug.current) {
       prevMarketSlug.current = null;
       addLog(`⚠ Mercado perdido — buscando...`, "error");
     }
-  }, [market?.slug]);
+  }, [market?.slug, fetchTarget]);
 
   const activeWindow = getActiveWindow(minsLeft);
   const umbral       = activeWindow ? config[activeWindow.configKey] : null;
@@ -371,40 +383,29 @@ export default function Dashboard() {
           {/* VENTANA */}
           <div style={{ background: "var(--bg)", padding: "20px 24px" }}>
             <div style={{ fontSize: 9, color: "#444", letterSpacing: "0.15em", marginBottom: 8 }}>VENTANA ACTIVA</div>
-            <div style={{ fontSize: 30, fontWeight: 700, color: activeWindow ? "var(--yellow)" : "var(--dim)" }}>
-              {activeWindow ? activeWindow.label : minsLeft < 2 ? "≈ CIERRE" : "ESPERA"}
+            <div style={{ fontSize: 30, fontWeight: 700, color: activeWindow ? activeWindow.color : "#222" }}>
+              {activeWindow ? activeWindow.label : "— ESPERA —"}
             </div>
-            <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 4 }}>
-              {activeWindow ? `UMBRAL: $${umbral}` : `FALTAN: ${fmt(minsLeft, 1)} min`}
-            </div>
-            <div style={{
-              marginTop: 6, fontSize: 20, fontWeight: 700, fontVariantNumeric: "tabular-nums",
-              color: minsLeft < 5 ? "var(--red)" : minsLeft < 15 ? "var(--yellow)" : "#555",
-            }}>
-              {String(Math.floor(minsLeft)).padStart(2, "0")}:{String(Math.floor((minsLeft % 1) * 60)).padStart(2, "0")}
-            </div>
-            <div style={{ marginTop: 8 }}>
-              <WindowBar minsLeft={minsLeft} activeWindow={activeWindow} />
-              <div style={{ display: "flex", justifyContent: "space-between", marginTop: 4, fontSize: 9, color: "#333" }}>
-                <span>60m</span><span>T‑20</span><span>T‑15</span><span>T‑10</span><span>T‑5</span><span>0m</span>
+            {activeWindow && (
+              <div style={{ fontSize: 11, color: "#444", marginTop: 4 }}>
+                {activeWindow.min}–{activeWindow.max} min restantes
               </div>
-            </div>
+            )}
+            <WindowBar minsLeft={minsLeft} />
           </div>
 
           {/* DECISIÓN */}
           <div style={{ background: "var(--bg)", padding: "20px 24px" }}>
-            <div style={{ fontSize: 9, color: "#444", letterSpacing: "0.15em", marginBottom: 8 }}>DECISIÓN</div>
+            <div style={{ fontSize: 9, color: "#444", letterSpacing: "0.15em", marginBottom: 8 }}>SEÑAL</div>
             {decision ? (
               <>
                 <div style={{
-                  fontSize: 34, fontWeight: 700,
-                  color: decision.dir === "UP" ? "var(--green)" : decision.dir === "DOWN" ? "var(--red)" : "var(--yellow)",
-                  textShadow: decision.signal ? "0 0 24px currentColor" : "none",
-                  letterSpacing: "0.06em",
+                  fontSize: 30, fontWeight: 700,
+                  color: decision.dir === "UP" ? "var(--green)" : decision.dir === "DOWN" ? "var(--red)" : "#444",
                 }}>
-                  {decision.dir === "UP" ? "▲ UP" : decision.dir === "DOWN" ? "▼ DOWN" : "✕ WAIT"}
+                  {decision.dir === "UP" ? "▲ UP" : decision.dir === "DOWN" ? "▼ DOWN" : "— WAIT —"}
                 </div>
-                <div style={{ fontSize: 10, color: "var(--muted)", marginTop: 6 }}>
+                <div style={{ fontSize: 11, color: "#444", marginTop: 4 }}>
                   {decision.signal
                     ? `DIST $${Math.abs(decision.dist).toFixed(0)} > $${umbral} ✓`
                     : `DIST $${Math.abs(decision.dist).toFixed(0)} < $${umbral} — NO ENTRAR`}
@@ -429,7 +430,7 @@ export default function Dashboard() {
             )}
           </div>
 
-          {/* MARKET INFO — ahora recibe apiResponse para diagnóstico */}
+          {/* MARKET INFO */}
           <div style={{ gridColumn: "1/4" }}>
             <MarketInfo
               market={market}
@@ -446,62 +447,51 @@ export default function Dashboard() {
             display: "flex", gap: 32, flexWrap: "wrap",
           }}>
             <StatBox label="P&L HOY"  value={fmtUSD(pnlDay)} color={pnlDay >= 0 ? "var(--green)" : "var(--red)"} />
-            <StatBox label="WIN RATE" value={winRate != null ? winRate + "%" : "—"} />
-            <StatBox label="OPS HOY"  value={`${todayBets.length}/${config.max_ops_dia}`} />
-            <StatBox label="GANADAS"  value={wins}   color="var(--green)" />
-            <StatBox label="PERDIDAS" value={losses} color="var(--red)" />
-            <StatBox label="STAKE/OP" value={fmtUSD(config.stake_usdc)} />
-          </div>
-
-          {/* AI */}
-          <div style={{ background: "var(--bg)", padding: "16px 24px" }}>
-            <div style={{
-              fontSize: 9, color: "#444", letterSpacing: "0.15em", marginBottom: 10,
-              display: "flex", gap: 8, alignItems: "center",
-            }}>
-              ◈ ANÁLISIS IA
-              {aiLoading && <span style={{ color: "#333", animation: "blink 1s infinite" }}>PROCESANDO...</span>}
-            </div>
-            <p style={{ fontSize: 11, color: "#8888aa", lineHeight: 1.7, minHeight: 56, margin: 0 }}>{aiText}</p>
+            <StatBox label="WIN RATE" value={winRate != null ? `${winRate}%` : "—"} color={winRate != null && winRate >= 50 ? "var(--green)" : "var(--red)"} />
+            <StatBox label="WINS"     value={wins}   color="var(--green)" />
+            <StatBox label="LOSSES"   value={losses} color="var(--red)"   />
+            <StatBox label="BALANCE"  value={fmtUSD(balance)} color={balance >= 500 ? "var(--green)" : "var(--yellow)"} />
           </div>
 
           {/* CHART */}
-          <div style={{ gridColumn: "1/4", background: "var(--bg2)", borderTop: "1px solid var(--border)" }}>
+          <div style={{ background: "var(--bg)", padding: "16px 24px" }}>
+            <div style={{ fontSize: 9, color: "#444", letterSpacing: "0.15em", marginBottom: 8 }}>PRECIO 1 MIN</div>
             <PriceChart data={priceHistory} target={target} />
           </div>
 
           {/* LOG */}
-          <div style={{ gridColumn: "1/4", background: "#02020a", maxHeight: 180, overflowY: "auto", borderTop: "1px solid var(--border)" }}>
-            <div style={{
-              padding: "7px 16px", borderBottom: "1px solid var(--border)",
-              fontSize: 9, color: "#333", letterSpacing: "0.12em",
-              display: "flex", justifyContent: "space-between",
-              position: "sticky", top: 0, background: "#02020a",
-            }}>
-              <span>SYSTEM LOG</span>
-              <span style={{ color: "#1a3a22" }}>{log.length} eventos</span>
-            </div>
-            {log.length === 0
-              ? <div style={{ padding: "14px 16px", color: "var(--dim)", fontSize: 11 }}>Esperando eventos...</div>
-              : log.map(l => (
-                <div key={l.id} style={{
-                  padding: "3px 16px", display: "flex", gap: 12, fontSize: 11,
-                  borderBottom: "1px solid #070710",
-                  color: l.type === "success" ? "#00bb66"
-                       : l.type === "error"   ? "#cc3355"
-                       : "var(--muted)",
+          <div style={{ gridColumn: "1/4", background: "var(--bg)", padding: "16px 24px" }}>
+            <div style={{ fontSize: 9, color: "#444", letterSpacing: "0.15em", marginBottom: 8 }}>LOG DE EVENTOS</div>
+            <div style={{ height: 160, overflowY: "auto", fontFamily: "var(--font)", fontSize: 11 }}>
+              {log.length === 0 && <div style={{ color: "#333" }}>Sin eventos.</div>}
+              {log.map(entry => (
+                <div key={entry.id} style={{
+                  color: entry.type === "success" ? "var(--green)"
+                       : entry.type === "error"   ? "var(--red)"
+                       : entry.type === "warning" ? "var(--yellow)"
+                       : "#555",
+                  marginBottom: 2,
                 }}>
-                  <span style={{ color: "#2a2a3a", flexShrink: 0 }}>{l.ts}</span>
-                  <span>{l.msg}</span>
+                  <span style={{ color: "#2a2a3a", marginRight: 8 }}>{entry.ts}</span>
+                  {entry.msg}
                 </div>
-              ))
-            }
+              ))}
+            </div>
           </div>
         </div>
       )}
 
-      {tab === "historial" && <BetsTable bets={bets} />}
-      {tab === "config"    && <ConfigPanel config={config} onChange={setConfig} />}
+      {tab === "historial" && (
+        <div style={{ padding: "24px" }}>
+          <BetsTable bets={bets} />
+        </div>
+      )}
+
+      {tab === "config" && (
+        <div style={{ padding: "24px" }}>
+          <ConfigPanel config={config} onChange={setConfig} />
+        </div>
+      )}
     </div>
   );
 }
