@@ -49,27 +49,83 @@ function WindowTimeline({ minsLeft, activeWindow }) {
         {WINDOWS.map(w => {
           const isActive = activeWindow?.key === w.key;
           const isPast   = minsLeft < w.min;
+
+          // Progreso dentro de la ventana activa: 0% al entrar, 100% al salir
+          const windowPct = isActive
+            ? Math.min(100, Math.max(0, ((w.max - minsLeft) / (w.max - w.min)) * 100))
+            : 0;
+
+          // Segundos restantes dentro de la ventana activa
+          const secsInWindow = isActive ? Math.max(0, (minsLeft - w.min) * 60) : 0;
+          const wMM = String(Math.floor(secsInWindow / 60)).padStart(2, "0");
+          const wSS = String(Math.floor(secsInWindow % 60)).padStart(2, "0");
+
           return (
             <div key={w.key} style={{
-              flex: 1, padding: "6px 4px", borderRadius: 3, textAlign: "center",
+              flex: 1,
+              borderRadius: 3, textAlign: "center",
               background: isActive  ? `${w.color}1a`
                         : isPast    ? "rgba(255,255,255,0.02)"
                         : "rgba(255,255,255,0.04)",
               border: `1px solid ${isActive ? w.color + "55" : "#111122"}`,
               transition: "all 0.3s",
+              overflow: "hidden",
+              position: "relative",
             }}>
-              <div style={{
-                fontSize: 11, fontWeight: isActive ? 700 : 400,
-                color: isActive ? w.color : isPast ? "#222" : "#555",
-              }}>
-                {w.label}
-              </div>
-              <div style={{ fontSize: 8, color: isActive ? w.color + "99" : "#2a2a3a", marginTop: 2 }}>
-                {w.min}–{w.max}m
-              </div>
+              {/* Relleno de progreso interno (aparece solo en ventana activa) */}
               {isActive && (
-                <div style={{ fontSize: 8, color: w.color, marginTop: 2, animation: "blink 1.2s infinite" }}>
-                  ● ACTIVA
+                <div style={{
+                  position: "absolute",
+                  left: 0, top: 0, bottom: 0,
+                  width: `${windowPct}%`,
+                  background: `${w.color}1a`,
+                  transition: "width 1s linear",
+                  pointerEvents: "none",
+                }} />
+              )}
+
+              <div style={{ padding: "6px 4px", position: "relative", zIndex: 1 }}>
+                <div style={{
+                  fontSize: 11, fontWeight: isActive ? 700 : 400,
+                  color: isActive ? w.color : isPast ? "#222" : "#555",
+                }}>
+                  {w.label}
+                </div>
+                <div style={{ fontSize: 8, color: isActive ? w.color + "99" : "#2a2a3a", marginTop: 2 }}>
+                  {w.min}–{w.max}m
+                </div>
+                {isActive && (
+                  <>
+                    <div style={{ fontSize: 8, color: w.color, marginTop: 2, animation: "blink 1.2s infinite" }}>
+                      ● ACTIVA
+                    </div>
+                    {/* Cuenta atrás dentro de la ventana */}
+                    <div style={{
+                      fontSize: 10, fontWeight: 700, color: w.color,
+                      marginTop: 3, fontVariantNumeric: "tabular-nums",
+                      letterSpacing: "0.04em",
+                    }}>
+                      {wMM}:{wSS}
+                    </div>
+                  </>
+                )}
+              </div>
+
+              {/* Barra de progreso inferior de la ventana activa */}
+              {isActive && (
+                <div style={{
+                  height: 3,
+                  background: "#0a0a14",
+                  position: "relative",
+                }}>
+                  <div style={{
+                    position: "absolute",
+                    left: 0, top: 0, bottom: 0,
+                    width: `${windowPct}%`,
+                    background: w.color,
+                    boxShadow: `0 0 6px ${w.color}`,
+                    transition: "width 1s linear",
+                  }} />
                 </div>
               )}
             </div>
@@ -127,8 +183,6 @@ export default function MarketInfo({ market, minsLeft, activeWindow, error, apiR
             · El mercado aún no ha sido creado para esta ventana horaria<br />
             · La Gamma API de Polymarket no responde temporalmente
           </div>
-
-          {/* Slugs probados desde la respuesta de error */}
           {apiResponse?.slugs_tried && (
             <div style={{ fontSize: 9, lineHeight: 2, color: "#2a2a3a", marginBottom: 6 }}>
               <div style={{ color: "#444", marginBottom: 2 }}>SLUGS PROBADOS:</div>
@@ -147,12 +201,12 @@ export default function MarketInfo({ market, minsLeft, activeWindow, error, apiR
           )}
           {apiResponse?.dst_active !== undefined && (
             <div style={{ fontSize: 9, color: "#333", marginBottom: 6 }}>
-              DST activo: <span style={{ color: "#444" }}>{apiResponse.dst_active ? "Sí — EDT (UTC‑4)" : "No — EST (UTC‑5)"}</span>
+              DST activo: <span style={{ color: "#444" }}>{apiResponse.dst_active
+                ? "Sí — EDT (UTC‑4)" : "No — EST (UTC‑5)"}</span>
               <span style={{ margin: "0 6px", color: "#222" }}>|</span>
               UTC: <span style={{ color: "#444" }}>{apiResponse.now_utc?.slice(11,19)}</span>
             </div>
           )}
-
           <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
             <a href="/api/market/debug" target="_blank" rel="noopener noreferrer"
               style={{
@@ -238,7 +292,7 @@ export default function MarketInfo({ market, minsLeft, activeWindow, error, apiR
             {market.question || "—"}
           </div>
 
-          <Row label="CIERRE"          value={closeTime ? `${closeDate}  ${closeTime} UTC` : "—"} valueColor="#ffcc00" />
+          <Row label="CIERRE" value={closeTime ? `${closeDate}  ${closeTime} UTC` : "—"} valueColor="#ffcc00" />
           <Row
             label="TIEMPO RESTANTE"
             value={
@@ -253,10 +307,10 @@ export default function MarketInfo({ market, minsLeft, activeWindow, error, apiR
             valueColor="#555"
           />
           {market.volume != null && (
-            <Row label="VOLUMEN"   value={`$${Number(market.volume).toLocaleString("en-US", { maximumFractionDigits: 0 })}`} valueColor="#aaa" />
+            <Row label="VOLUMEN" value={`$${Number(market.volume).toLocaleString("en-US", { maximumFractionDigits: 0 })}`} valueColor="#aaa" />
           )}
           {market.liquidity != null && (
-            <Row label="LIQUIDEZ"  value={`$${Number(market.liquidity).toLocaleString("en-US", { maximumFractionDigits: 0 })}`} valueColor="#aaa" />
+            <Row label="LIQUIDEZ" value={`$${Number(market.liquidity).toLocaleString("en-US", { maximumFractionDigits: 0 })}`} valueColor="#aaa" />
           )}
           <Row label="SLUG" value={market.slug || "—"} valueColor="#333" />
 
