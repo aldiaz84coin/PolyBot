@@ -1,6 +1,7 @@
 // app/api/market/route.js
 // Obtiene el mercado BTC Up/Down activo en Polymarket Gamma API
 // FIX: El slug usa la hora de CIERRE de la vela 1H (ET), no la de apertura.
+// FIX: end_ms tiene fallback derivado del slug si Polymarket no devuelve endDateIso.
 
 export const runtime = "edge";
 export const revalidate = 0;
@@ -51,11 +52,60 @@ function buildSlugs(now) {
   return slugs;
 }
 
+/**
+ * Parsea el campo de fecha de cierre de la respuesta de Polymarket.
+ */
 function parseEndMs(m) {
   const raw = m.endDateIso || m.end_date_iso || m.endDate || m.end_date || null;
   if (!raw) return null;
   if (typeof raw === "number") return raw < 2e10 ? raw * 1000 : raw;
   try { return new Date(raw).getTime(); } catch { return null; }
+}
+
+/**
+ * Fallback: deriva end_ms directamente del slug cuando Polymarket no devuelve
+ * un campo de fecha parseable.
+ *
+ * Slug: "bitcoin-up-or-down-{month}-{day}-{closeHour}-et"
+ * La hora en el slug es la HORA DE CIERRE de la vela (= cierre del mercado) en ET.
+ * Convertimos esa hora ET a UTC timestamp.
+ */
+function slugToEndMs(slug, now) {
+  try {
+    const parts = slug.split("-");
+    let monthIdx = -1;
+    let monthPartIdx = -1;
+    for (let i = 0; i < parts.length; i++) {
+      const m = MONTHS.indexOf(parts[i]);
+      if (m !== -1) { monthIdx = m; monthPartIdx = i; break; }
+    }
+    if (monthIdx === -1) return null;
+
+    const day     = parseInt(parts[monthPartIdx + 1], 10);
+    const hourStr = parts[monthPartIdx + 2];
+    if (!day || !hourStr) return null;
+
+    let closeHourET;
+    if (hourStr === "12am")          closeHourET = 0;
+    else if (hourStr === "12pm")     closeHourET = 12;
+    else if (hourStr.endsWith("am")) closeHourET = parseInt(hourStr, 10);
+    else if (hourStr.endsWith("pm")) closeHourET = parseInt(hourStr, 10) + 12;
+    else return null;
+
+    const year = now.getUTCFullYear();
+    // Calculamos el UTC del cierre: hora ET cierre + |offset|
+    const candidateUtc  = new Date(Date.UTC(year, monthIdx, day, 12, 0, 0));
+    const etOffsetHours = isDST(candidateUtc) ? 4 : 5;
+    const closeUtcMs    = Date.UTC(year, monthIdx, day, closeHourET + etOffsetHours, 0, 0, 0);
+
+    // Sanity: debe estar en un rango razonable (±2h de ahora)
+    const diff = closeUtcMs - now.getTime();
+    if (diff < -7_200_000 || diff > 7_200_000) return null;
+
+    return closeUtcMs;
+  } catch {
+    return null;
+  }
 }
 
 export async function GET() {
@@ -86,8 +136,14 @@ export async function GET() {
       const tokens = m.tokens || [];
       const yesT   = tokens.find(t => t.outcome === "Yes");
       const noT    = tokens.find(t => t.outcome === "No");
-      const endMs  = parseEndMs(m);
+
+      // end_ms: primero intentamos parsear el campo de Polymarket,
+      // si falla usamos el slug como fuente de verdad (más robusto)
+      let endMs  = parseEndMs(m);
       const endIso = m.endDateIso || m.end_date_iso || m.endDate || null;
+      if (!endMs) {
+        endMs = slugToEndMs(slug, now);
+      }
 
       const market = {
         question:     m.question || m.title || slug,
@@ -102,14 +158,14 @@ export async function GET() {
         volume:    m.volume    ?? null,
         liquidity: m.liquidity ?? null,
         url:       `https://polymarket.com/event/${slug}`,
-        // Datos de diagnóstico incluidos siempre para facilitar depuración
         _debug: {
-          slugs_tried:  tried,
-          slugs_all:    slugs,
-          found_slug:   slug,
-          now_utc:      now.toISOString(),
-          dst_active:   isDST(now),
-          et_offset:    isDST(now) ? "UTC-4 (EDT)" : "UTC-5 (EST)",
+          slugs_tried:      tried,
+          slugs_all:        slugs,
+          found_slug:       slug,
+          end_ms_source:    endMs && !parseEndMs(m) ? "slug_fallback" : "polymarket",
+          now_utc:          now.toISOString(),
+          dst_active:       isDST(now),
+          et_offset:        isDST(now) ? "UTC-4 (EDT)" : "UTC-5 (EST)",
         },
       };
 
@@ -120,7 +176,6 @@ export async function GET() {
     }
   }
 
-  // No se encontró ningún mercado
   return Response.json({
     active: false,
     error:  "Mercado no encontrado",
