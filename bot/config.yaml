@@ -29,6 +29,6 @@ telegram:
   notificar_stop_loss: true
 
 logging:
-  nivel:          "INFO"
+  nivel:          "DEBUG"
   archivo:        "logs/bot.log"
   historial_csv:  "logs/operaciones.csv"
