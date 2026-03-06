@@ -2,13 +2,19 @@
 market_scanner.py  (raíz /bot/)
 Detecta el mercado BTC Up/Down activo en Polymarket y obtiene el Price to Beat.
 
-CORRECCIÓN: get_open_1h_binance() ahora usa limit=1 (no limit=2).
-  Con limit=2 klines[0] = vela ANTERIOR cerrada (¡precio incorrecto!).
+FIX: Polymarket nombra cada mercado por la hora de CIERRE de la vela 1H (ET),
+     NO por la hora de apertura. Ejemplo:
+       · Vela 10:00–11:00 UTC = 5am–6am ET
+       · Slug correcto: bitcoin-up-or-down-march-6-6am-et  (hora de CIERRE)
+       · Bug anterior:  bitcoin-up-or-down-march-6-5am-et  (hora de APERTURA ❌)
+
+CORRECCIÓN: get_open_1h_binance() usa limit=1 (no limit=2).
+  Con limit=2 klines[0] = vela ANTERIOR cerrada (precio incorrecto).
   Con limit=1 klines[0] = vela ACTUAL en curso  (correcto).
 """
 import logging
 import requests
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 logger    = logging.getLogger(__name__)
 _SEPARATOR = "─" * 60
@@ -35,7 +41,6 @@ def _is_dst(utc_date: datetime) -> bool:
 
 
 def _to_et(utc_date: datetime) -> datetime:
-    from datetime import timedelta
     return utc_date + timedelta(hours=-4 if _is_dst(utc_date) else -5)
 
 
@@ -46,18 +51,36 @@ def _format_hour_12(h24: int) -> str:
 
 
 def _build_slugs(now: datetime) -> list[str]:
-    from datetime import timedelta
+    """
+    Genera los slugs candidatos para el mercado activo.
+
+    ⚠️ CLAVE — Polymarket usa la hora de CIERRE de la vela 1H (ET) en el slug,
+    NO la hora de apertura. Ejemplo a las 10:30 UTC (5:30am ET, vela 5am–6am ET):
+      · La vela ABRE a las 10:00 UTC = 5am ET
+      · La vela CIERRA a las 11:00 UTC = 6am ET
+      · Slug del mercado: "bitcoin-up-or-down-march-6-6am-et"  ← hora de cierre
+
+    Para obtener la hora de cierre: candle_close = candle_open + 1h
+    """
     slugs = []
     for offset in [0, -1, 1]:
-        utc_d = now + timedelta(hours=offset)
-        et_d  = _to_et(utc_d)
-        slug  = (
+        # Hora de apertura de la vela (= hora UTC actual ± offset)
+        candle_open_utc  = now + timedelta(hours=offset)
+        # Hora de CIERRE = apertura + 1h → esto es lo que va en el slug
+        candle_close_utc = candle_open_utc + timedelta(hours=1)
+        et_close         = _to_et(candle_close_utc)
+
+        slug = (
             f"bitcoin-up-or-down-"
-            f"{MONTHS[et_d.month - 1]}-{et_d.day}-"
-            f"{_format_hour_12(et_d.hour)}-et"
+            f"{MONTHS[et_close.month - 1]}-{et_close.day}-"
+            f"{_format_hour_12(et_close.hour)}-et"
         )
         if slug not in slugs:
             slugs.append(slug)
+
+    logger.debug(
+        f"[SCANNER] Slugs candidatos (hora cierre ET): {slugs}"
+    )
     return slugs
 
 
@@ -101,15 +124,15 @@ def get_active_market() -> dict | None:
             mins       = max(0, (end_ms - int(now.timestamp() * 1000)) / 60_000) if end_ms else None
 
             market = {
-                "question":    m.get("question", "—"),
+                "question":     m.get("question", "—"),
                 "condition_id": m.get("conditionId", m.get("condition_id", "—")),
-                "slug":        slug,
-                "end_ms":      end_ms,
-                "yes_price":   yes_p,
-                "no_price":    no_p,
-                "volume":      m.get("volume"),
-                "liquidity":   m.get("liquidity"),
-                "url":         f"https://polymarket.com/event/{slug}",
+                "slug":         slug,
+                "end_ms":       end_ms,
+                "yes_price":    yes_p,
+                "no_price":     no_p,
+                "volume":       m.get("volume"),
+                "liquidity":    m.get("liquidity"),
+                "url":          f"https://polymarket.com/event/{slug}",
             }
 
             logger.info(_SEPARATOR)
@@ -136,23 +159,22 @@ def get_open_1h_binance() -> float | None:
     """
     Devuelve el precio OPEN de la vela 1H ACTUAL de Binance (= Price to Beat).
 
-    ⚠️  IMPORTANTE — por qué limit=1 y NO limit=2:
+    ⚠️  Por qué limit=1 y NO limit=2:
         Con limit=2 Binance devuelve en orden ASCENDENTE (la más antigua primero):
           klines[0] = vela ANTERIOR ya cerrada  → precio INCORRECTO
           klines[1] = vela ACTUAL en curso      → precio correcto
         Con limit=1 solo hay una entrada: la vela ACTUAL.
-        Usar klines[0] con limit=2 devolvería el open de la hora anterior.
     """
     logger.info("[SCANNER] 🕯 Obteniendo vela 1H actual de Binance (Price to Beat)...")
     try:
         r = requests.get(
             BINANCE_KLINE,
-            params={"symbol": "BTCUSDT", "interval": "1h", "limit": 1},  # ← limit=1, no 2
+            params={"symbol": "BTCUSDT", "interval": "1h", "limit": 1},
             timeout=TIMEOUT,
         )
         r.raise_for_status()
 
-        kline      = r.json()[0]   # única entrada = vela actual en curso
+        kline      = r.json()[0]
         open_price = float(kline[1])
         high       = float(kline[2])
         low        = float(kline[3])
@@ -166,8 +188,7 @@ def get_open_1h_binance() -> float | None:
         mins_left  = max(0, (close_ms - now_ms) / 60_000)
         mm, ss     = int(mins_left), int((mins_left % 1) * 60)
 
-        # Validación: la vela debe corresponder a la hora UTC actual
-        candle_hour = open_ts.hour
+        candle_hour  = open_ts.hour
         current_hour = now_utc.hour
         if candle_hour != current_hour:
             logger.warning(
