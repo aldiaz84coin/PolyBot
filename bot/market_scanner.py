@@ -2,26 +2,26 @@
 bot/market_scanner.py
 Detecta el mercado BTC Up/Down activo en Polymarket y obtiene el Price to Beat.
 
-FIX: Polymarket nombra cada mercado por la hora de CIERRE de la vela 1H (ET),
-     NO por la hora de apertura. Ejemplo:
-       · Vela 10:00–11:00 UTC = 5am–6am ET
-       · Slug correcto: bitcoin-up-or-down-march-6-6am-et  (hora de CIERRE)
-       · Bug anterior:  bitcoin-up-or-down-march-6-5am-et  (hora de APERTURA ❌)
+FIX v3 (BUG SLUG HORA):
+  Polymarket nombra cada mercado por la hora de APERTURA de la vela 1H (ET).
+  Ejemplo a las 7:30am ET (= 11:30 UTC con EDT):
+    · Vela activa   : 11:00–12:00 UTC = 7am–8am ET
+    · Slug correcto : bitcoin-up-or-down-march-6-7am-et   ← hora APERTURA ✓
+    · Bug anterior  : bitcoin-up-or-down-march-6-8am-et   ← hora CIERRE ❌
 
-FIX: get_open_1h_binance() usa limit=1 (no limit=2).
-  Con limit=2 klines[0] = vela ANTERIOR cerrada (precio incorrecto).
-  Con limit=1 klines[0] = vela ACTUAL en curso  (correcto).
+  La corrección es doble:
+    1. Truncar `now` a la hora UTC actual (candle open boundary).
+    2. Convertir ese candle open UTC → ET → usar su hora para el slug.
+  El código anterior añadía +1h antes de convertir, cogiendo la hora de cierre.
 
-CONSISTENCIA con /api/target:
-  get_open_1h_binance() acepta slug opcional. Si se pasa, parsea la hora
-  del mercado desde el slug y usa startTime en Binance para pedir
-  la vela exacta correspondiente al mercado activo.
+FIX previo mantenido:
+  get_open_1h_binance() usa limit=1 → klines[0] = vela actual en curso.
 """
 import logging
 import requests
 from datetime import datetime, timedelta, timezone
 
-logger    = logging.getLogger(__name__)
+logger     = logging.getLogger(__name__)
 _SEPARATOR = "─" * 60
 
 GAMMA_API     = "https://gamma-api.polymarket.com/markets"
@@ -59,27 +59,32 @@ def _build_slugs(now: datetime) -> list[str]:
     """
     Genera los slugs candidatos para el mercado activo.
 
-    ⚠️ CLAVE — Polymarket usa la hora de CIERRE de la vela 1H (ET) en el slug,
-    NO la hora de apertura. Ejemplo a las 10:30 UTC (5:30am ET, vela 5am–6am ET):
-      · La vela ABRE a las 10:00 UTC = 5am ET
-      · La vela CIERRA a las 11:00 UTC = 6am ET
-      · Slug del mercado: "bitcoin-up-or-down-march-6-6am-et"  ← hora de cierre
+    ⚠️ CLAVE — Polymarket usa la hora de APERTURA de la vela 1H (ET) en el slug.
+    Ejemplo a las 7:30am ET (vela 7am–8am ET):
+      · Slug correcto: bitcoin-up-or-down-march-6-7am-et  ← hora APERTURA
+
+    Algoritmo:
+      1. Truncar `now` a la hora UTC (= inicio de la vela actual).
+      2. Convertir ese instante a ET → hora ET de apertura → usarla para el slug.
+      3. Generar también ±1h como candidatos de respaldo.
     """
+    # Truncar al inicio de la vela actual (candle open boundary)
+    candle_open_now = now.replace(minute=0, second=0, microsecond=0)
     slugs = []
+
     for offset in [0, -1, 1]:
-        candle_open_utc  = now + timedelta(hours=offset)
-        candle_close_utc = candle_open_utc + timedelta(hours=1)
-        et_close         = _to_et(candle_close_utc)
+        candle_open = candle_open_now + timedelta(hours=offset)
+        et_open     = _to_et(candle_open)
 
         slug = (
             f"bitcoin-up-or-down-"
-            f"{MONTHS[et_close.month - 1]}-{et_close.day}-"
-            f"{_format_hour_12(et_close.hour)}-et"
+            f"{MONTHS[et_open.month - 1]}-{et_open.day}-"
+            f"{_format_hour_12(et_open.hour)}-et"
         )
         if slug not in slugs:
             slugs.append(slug)
 
-    logger.debug(f"[SCANNER] Slugs candidatos (hora cierre ET): {slugs}")
+    logger.debug(f"[SCANNER] Slugs candidatos (hora apertura ET): {slugs}")
     return slugs
 
 
@@ -102,44 +107,48 @@ def _parse_end_ms(raw: dict) -> int | None:
 
 def _slug_to_end_ms(slug: str, now: datetime) -> int | None:
     """
-    Fallback: deriva el timestamp de cierre del mercado directamente desde el slug.
-    Consistente con slugToEndMs() en app/api/market/route.js.
+    Fallback: deriva el timestamp de CIERRE del mercado directamente desde el slug.
 
-    El slug contiene la hora de CIERRE en ET (p.ej. "6am-et").
-    Convertimos esa hora ET a UTC ms.
+    ⚠️ El slug contiene la hora de APERTURA en ET.
+    Hora de cierre = hora de apertura + 1h.
     """
     try:
         parts = slug.split("-")
-        month_idx = -1
+        month_idx     = -1
         month_part_idx = -1
         for i, p in enumerate(parts):
             if p in MONTHS:
-                month_idx = MONTHS.index(p)
+                month_idx      = MONTHS.index(p)
                 month_part_idx = i
                 break
         if month_idx == -1:
             return None
 
         day      = int(parts[month_part_idx + 1])
-        hour_str = parts[month_part_idx + 2]  # "6am", "12pm", etc.
+        hour_str = parts[month_part_idx + 2]  # "7am", "12pm", etc.
 
+        # La hora del slug = hora de APERTURA en ET
         if hour_str == "12am":
-            close_hour_et = 0
+            open_hour_et = 0
         elif hour_str == "12pm":
-            close_hour_et = 12
+            open_hour_et = 12
         elif hour_str.endswith("am"):
-            close_hour_et = int(hour_str[:-2])
+            open_hour_et = int(hour_str[:-2])
         elif hour_str.endswith("pm"):
-            close_hour_et = int(hour_str[:-2]) + 12
+            open_hour_et = int(hour_str[:-2]) + 12
         else:
             return None
 
-        year = now.year
-        candidate = datetime(year, month_idx + 1, day, 12, 0, 0, tzinfo=timezone.utc)
+        # Cierre = apertura + 1h
+        close_hour_et = (open_hour_et + 1) % 24
+        close_day     = day + 1 if open_hour_et == 23 else day  # cruce medianoche
+
+        year      = now.year
+        candidate = datetime(year, month_idx + 1, close_day, 12, 0, 0, tzinfo=timezone.utc)
         et_offset = 4 if _is_dst(candidate) else 5
 
         close_utc_ms = int(datetime(
-            year, month_idx + 1, day,
+            year, month_idx + 1, close_day,
             close_hour_et + et_offset, 0, 0,
             tzinfo=timezone.utc,
         ).timestamp() * 1000)
@@ -220,15 +229,15 @@ def _slug_to_candle_start_ms(slug: str, now: datetime) -> int | None:
     Parsea el slug para obtener el startTime UTC (ms) de la vela 1H del mercado.
     Consistente con parseCandleStartFromSlug() en app/api/target/route.js.
 
-    El slug contiene la hora de CIERRE en ET → apertura = cierre - 1h.
+    ⚠️ El slug contiene la hora de APERTURA en ET → esa es directamente la hora de start.
     """
     try:
         parts = slug.split("-")
-        month_idx = -1
+        month_idx     = -1
         month_part_idx = -1
         for i, p in enumerate(parts):
             if p in MONTHS:
-                month_idx = MONTHS.index(p)
+                month_idx      = MONTHS.index(p)
                 month_part_idx = i
                 break
         if month_idx == -1:
@@ -237,27 +246,24 @@ def _slug_to_candle_start_ms(slug: str, now: datetime) -> int | None:
         day      = int(parts[month_part_idx + 1])
         hour_str = parts[month_part_idx + 2]
 
+        # La hora del slug = hora de APERTURA en ET (directamente)
         if hour_str == "12am":
-            close_hour_et = 0
+            open_hour_et = 0
         elif hour_str == "12pm":
-            close_hour_et = 12
+            open_hour_et = 12
         elif hour_str.endswith("am"):
-            close_hour_et = int(hour_str[:-2])
+            open_hour_et = int(hour_str[:-2])
         elif hour_str.endswith("pm"):
-            close_hour_et = int(hour_str[:-2]) + 12
+            open_hour_et = int(hour_str[:-2]) + 12
         else:
             return None
 
-        # Apertura = cierre - 1h
-        open_hour_et = (close_hour_et - 1) % 24
-        day_for_open = day - 1 if open_hour_et > close_hour_et else day  # cruce medianoche
-
         year      = now.year
-        candidate = datetime(year, month_idx + 1, day_for_open, 12, 0, 0, tzinfo=timezone.utc)
+        candidate = datetime(year, month_idx + 1, day, 12, 0, 0, tzinfo=timezone.utc)
         et_offset = 4 if _is_dst(candidate) else 5
 
         start_utc = datetime(
-            year, month_idx + 1, day_for_open,
+            year, month_idx + 1, day,
             open_hour_et + et_offset, 0, 0,
             tzinfo=timezone.utc,
         )
@@ -270,66 +276,50 @@ def get_open_1h_binance(slug: str | None = None) -> float | None:
     """
     Devuelve el precio OPEN de la vela 1H del mercado activo (= Price to Beat).
 
-    ⚠️  Por qué limit=1 y NO limit=2:
-        Con limit=2 Binance devuelve en orden ASCENDENTE (la más antigua primero):
-          klines[0] = vela ANTERIOR ya cerrada  → precio INCORRECTO
-          klines[1] = vela ACTUAL en curso      → precio correcto
-        Con limit=1 solo hay una entrada: la vela ACTUAL.
-
-    Si se pasa `slug`, se parsea la hora del mercado y se solicita la vela
-    exacta a Binance usando startTime (más robusto en transiciones de hora).
-    Consistente con /api/target?slug= en el front-end.
+    Si se pasa slug, pide la vela exacta por startTime (más robusto en
+    transiciones de hora). Si no, pide la vela 1H actual con limit=1.
     """
-    logger.info("[SCANNER] 🕯 Obteniendo vela 1H (Price to Beat)...")
-
-    now         = datetime.now(timezone.utc)
-    params: dict = {"symbol": "BTCUSDT", "interval": "1h", "limit": 1}
-    method_used = "limit=1 (vela actual)"
+    now    = datetime.now(timezone.utc)
+    params: dict = {"symbol": "BTCUSDT", "interval": "1h"}
 
     if slug:
         start_ms = _slug_to_candle_start_ms(slug, now)
         if start_ms:
             params["startTime"] = start_ms
-            method_used = f"startTime={start_ms} (desde slug)"
-            logger.debug(f"[SCANNER] Vela solicitada por slug: {slug} → startTime={start_ms}")
+            params["limit"]     = 1
+            logger.debug(f"[SCANNER] Binance klines — startTime={start_ms} slug={slug}")
+        else:
+            logger.warning(f"[SCANNER] No se pudo parsear startTime del slug={slug}, usando limit=1")
+            params["limit"] = 1
+    else:
+        params["limit"] = 1
 
+    logger.debug(f"[SCANNER] GET {BINANCE_KLINE} params={params}")
     try:
         r = requests.get(BINANCE_KLINE, params=params, timeout=TIMEOUT)
         r.raise_for_status()
+        klines = r.json()
 
-        kline      = r.json()[0]
+        if not klines:
+            logger.error("[SCANNER] ❌ Binance devolvió lista vacía de klines")
+            return None
+
+        kline      = klines[0]
         open_price = float(kline[1])
         high       = float(kline[2])
         low        = float(kline[3])
         close      = float(kline[4])
-        open_ts    = datetime.fromtimestamp(kline[0] / 1000, tz=timezone.utc)
-        close_ts   = datetime.fromtimestamp(kline[6] / 1000, tz=timezone.utc)
+        open_ts    = datetime.fromtimestamp(kline[0] / 1000, tz=timezone.utc).strftime("%H:%M:%S UTC")
+        close_ts   = datetime.fromtimestamp(kline[6] / 1000, tz=timezone.utc).strftime("%H:%M:%S UTC")
 
-        now_ms    = int(now.timestamp() * 1000)
-        close_ms  = int(kline[6])
-        mins_left = max(0, (close_ms - now_ms) / 60_000)
-        mm, ss    = int(mins_left), int((mins_left % 1) * 60)
-
-        # Verificación de hora (detección de desfases)
-        candle_hour  = open_ts.hour
-        current_hour = now.hour
-        if candle_hour != current_hour:
-            logger.warning(
-                f"[SCANNER] ⚠ Vela devuelta: {candle_hour:02d}h UTC | "
-                f"Hora actual: {current_hour:02d}h UTC — posible desfase"
-            )
-
-        logger.info(_SEPARATOR)
-        logger.info(f"[SCANNER] 🎯 PRICE TO BEAT (Binance 1H OPEN) [{method_used}]")
-        logger.info(f"[SCANNER]   Vela   : {open_ts.strftime('%H:%M UTC')} → {close_ts.strftime('%H:%M UTC')}")
-        logger.info(f"[SCANNER]   Open   : ${open_price:>12,.2f}  ← TARGET OFICIAL")
-        logger.info(f"[SCANNER]   High   : ${high:>12,.2f}")
-        logger.info(f"[SCANNER]   Low    : ${low:>12,.2f}")
-        logger.info(f"[SCANNER]   Close  : ${close:>12,.2f}  (precio actual de vela)")
-        logger.info(f"[SCANNER]   Resta  : {mm:02d}:{ss:02d} para cerrar la vela")
-        if slug:
-            logger.info(f"[SCANNER]   Slug   : {slug}")
-        logger.info(_SEPARATOR)
+        logger.info(
+            f"[SCANNER] Vela 1H Binance:\n"
+            f"           Open  : ${open_price:,.2f}  ← Price to Beat\n"
+            f"           High  : ${high:,.2f}\n"
+            f"           Low   : ${low:,.2f}\n"
+            f"           Close : ${close:,.2f}\n"
+            f"           Desde : {open_ts}  →  {close_ts}"
+        )
         return open_price
 
     except requests.exceptions.Timeout:

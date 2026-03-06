@@ -1,7 +1,16 @@
 // app/api/market/route.js
 // Obtiene el mercado BTC Up/Down activo en Polymarket Gamma API
-// FIX: El slug usa la hora de CIERRE de la vela 1H (ET), no la de apertura.
-// FIX: end_ms tiene fallback derivado del slug si Polymarket no devuelve endDateIso.
+//
+// FIX v3 (BUG SLUG HORA):
+//   Polymarket usa la hora de APERTURA de la vela 1H (ET) en el slug.
+//   Ejemplo a las 7:30am ET (vela 7am–8am ET):
+//     Slug correcto: "bitcoin-up-or-down-march-6-7am-et"  ← hora APERTURA ✓
+//     Bug anterior:  "bitcoin-up-or-down-march-6-8am-et"  ← hora CIERRE ❌
+//
+//   La corrección es doble:
+//     1. Truncar `now` a la hora UTC actual (candle open boundary).
+//     2. Convertir ese instante a ET → usar su hora para el slug.
+//   El código anterior añadía +1h y luego convertía a ET, cogiendo la hora de cierre.
 
 export const runtime = "edge";
 export const revalidate = 0;
@@ -35,18 +44,23 @@ function formatHour12(h24) {
 
 /**
  * Genera slugs candidatos.
- * ⚠️ CLAVE: Polymarket usa la hora de CIERRE de la vela 1H en ET, no la apertura.
- * Ejemplo a las 10:30 UTC (vela 10:00–11:00 UTC = 5am–6am ET):
- *   Slug correcto: "bitcoin-up-or-down-march-6-6am-et"  (hora CIERRE = 6am ET)
- *   Bug anterior:  "bitcoin-up-or-down-march-6-5am-et"  (hora apertura ❌)
+ *
+ * ⚠️ CLAVE: Polymarket usa la hora de APERTURA de la vela 1H en ET para el slug.
+ * Algoritmo:
+ *   1. Truncar now al inicio de la vela (floor a la hora UTC).
+ *   2. Convertir ese candle-open UTC a ET → usar esa hora para el slug.
+ *   3. Generar también ±1h como candidatos de respaldo.
  */
 function buildSlugs(now) {
+  // Truncar al inicio de la vela actual (candle open boundary)
+  const candleOpenNow = new Date(now);
+  candleOpenNow.setUTCMinutes(0, 0, 0);
+
   const slugs = [];
   for (const offset of [0, -1, 1]) {
-    const candleOpenUtc  = new Date(now.getTime() + offset * 3600 * 1000);
-    const candleCloseUtc = new Date(candleOpenUtc.getTime() + 3600 * 1000);
-    const etClose        = toET(candleCloseUtc);
-    const slug = `bitcoin-up-or-down-${MONTHS[etClose.getUTCMonth()]}-${etClose.getUTCDate()}-${formatHour12(etClose.getUTCHours())}-et`;
+    const candleOpen = new Date(candleOpenNow.getTime() + offset * 3600 * 1000);
+    const etOpen     = toET(candleOpen);
+    const slug = `bitcoin-up-or-down-${MONTHS[etOpen.getUTCMonth()]}-${etOpen.getUTCDate()}-${formatHour12(etOpen.getUTCHours())}-et`;
     if (!slugs.includes(slug)) slugs.push(slug);
   }
   return slugs;
@@ -63,12 +77,10 @@ function parseEndMs(m) {
 }
 
 /**
- * Fallback: deriva end_ms directamente del slug cuando Polymarket no devuelve
- * un campo de fecha parseable.
+ * Fallback: deriva end_ms del slug cuando Polymarket no devuelve fecha parseable.
  *
- * Slug: "bitcoin-up-or-down-{month}-{day}-{closeHour}-et"
- * La hora en el slug es la HORA DE CIERRE de la vela (= cierre del mercado) en ET.
- * Convertimos esa hora ET a UTC timestamp.
+ * ⚠️ El slug contiene la hora de APERTURA en ET.
+ * Hora de cierre = hora de apertura + 1h.
  */
 function slugToEndMs(slug, now) {
   try {
@@ -85,18 +97,23 @@ function slugToEndMs(slug, now) {
     const hourStr = parts[monthPartIdx + 2];
     if (!day || !hourStr) return null;
 
-    let closeHourET;
-    if (hourStr === "12am")          closeHourET = 0;
-    else if (hourStr === "12pm")     closeHourET = 12;
-    else if (hourStr.endsWith("am")) closeHourET = parseInt(hourStr, 10);
-    else if (hourStr.endsWith("pm")) closeHourET = parseInt(hourStr, 10) + 12;
+    // La hora del slug = hora de APERTURA en ET
+    let openHourET;
+    if (hourStr === "12am")          openHourET = 0;
+    else if (hourStr === "12pm")     openHourET = 12;
+    else if (hourStr.endsWith("am")) openHourET = parseInt(hourStr, 10);
+    else if (hourStr.endsWith("pm")) openHourET = parseInt(hourStr, 10) + 12;
     else return null;
 
-    const year = now.getUTCFullYear();
-    // Calculamos el UTC del cierre: hora ET cierre + |offset|
-    const candidateUtc  = new Date(Date.UTC(year, monthIdx, day, 12, 0, 0));
+    // Cierre = apertura + 1h
+    const closeHourET = (openHourET + 1) % 24;
+    const closeDay    = openHourET === 23 ? day + 1 : day; // cruce medianoche
+
+    const year          = now.getUTCFullYear();
+    const candidateUtc  = new Date(Date.UTC(year, monthIdx, closeDay, 12, 0, 0));
     const etOffsetHours = isDST(candidateUtc) ? 4 : 5;
-    const closeUtcMs    = Date.UTC(year, monthIdx, day, closeHourET + etOffsetHours, 0, 0, 0);
+
+    const closeUtcMs = Date.UTC(year, monthIdx, closeDay, closeHourET + etOffsetHours, 0, 0, 0);
 
     // Sanity: debe estar en un rango razonable (±2h de ahora)
     const diff = closeUtcMs - now.getTime();
@@ -137,8 +154,6 @@ export async function GET() {
       const yesT   = tokens.find(t => t.outcome === "Yes");
       const noT    = tokens.find(t => t.outcome === "No");
 
-      // end_ms: primero intentamos parsear el campo de Polymarket,
-      // si falla usamos el slug como fuente de verdad (más robusto)
       let endMs  = parseEndMs(m);
       const endIso = m.endDateIso || m.end_date_iso || m.endDate || null;
       if (!endMs) {

@@ -2,14 +2,15 @@
 market_scanner.py — Detecta el mercado BTC Up/Down activo en Polymarket
 y obtiene el Price to Beat (open vela 1H de Binance)
 
-FIX: Polymarket nombra cada mercado por la hora de CIERRE de la vela 1H (ET).
-     Ejemplo a las 10:30 UTC (5:30am ET):
-       · Vela activa: 10:00–11:00 UTC = 5am–6am ET
-       · Slug correcto: bitcoin-up-or-down-march-6-6am-et  ← hora CIERRE
-       · Bug anterior:  bitcoin-up-or-down-march-6-5am-et  ← hora apertura ❌
+FIX v3 (BUG SLUG HORA):
+  Polymarket nombra cada mercado por la hora de APERTURA de la vela 1H (ET).
+  Ejemplo a las 7:30am ET (vela 7am–8am ET):
+    · Slug correcto: bitcoin-up-or-down-march-6-7am-et   ← hora APERTURA ✓
+    · Bug anterior:  bitcoin-up-or-down-march-6-8am-et   ← hora CIERRE ❌
 
-     Además se corrigió el formato del slug (era "will-btc-be-higher-or-lower-..."
-     que ya no usa Polymarket).
+  La corrección es doble:
+    1. Truncar `now` a la hora UTC actual (candle open boundary).
+    2. Convertir ese instante a ET → usar su hora para el slug (sin +1h).
 """
 import logging
 import requests
@@ -52,27 +53,28 @@ def build_slugs() -> list[str]:
     """
     Genera slugs candidatos para el mercado BTC Up/Down activo.
 
-    ⚠️ CLAVE — el slug usa la hora de CIERRE de la vela 1H en ET, no la de apertura.
-    La hora de cierre = hora de apertura UTC + 1h, convertida a ET.
+    ⚠️ CLAVE — el slug usa la hora de APERTURA de la vela 1H en ET.
+    Algoritmo:
+      1. Truncar now al inicio de la vela (floor a hora UTC).
+      2. Convertir a ET → hora ET de apertura → usar para el slug.
     """
-    now   = datetime.now(timezone.utc)
-    slugs = []
+    now              = datetime.now(timezone.utc)
+    candle_open_now  = now.replace(minute=0, second=0, microsecond=0)
+    slugs            = []
 
     for offset in [0, -1, 1]:
-        candle_open_utc  = now + timedelta(hours=offset)
-        # Cierre = apertura + 1h → esto determina el slug en Polymarket
-        candle_close_utc = candle_open_utc + timedelta(hours=1)
-        et_close         = _to_et(candle_close_utc)
+        candle_open = candle_open_now + timedelta(hours=offset)
+        et_open     = _to_et(candle_open)
 
         slug = (
             f"bitcoin-up-or-down-"
-            f"{MONTHS[et_close.month - 1]}-{et_close.day}-"
-            f"{_format_hour_12(et_close.hour)}-et"
+            f"{MONTHS[et_open.month - 1]}-{et_open.day}-"
+            f"{_format_hour_12(et_open.hour)}-et"
         )
         if slug not in slugs:
             slugs.append(slug)
 
-    logger.debug(f"[SCANNER] Slugs candidatos (hora cierre ET): {slugs}")
+    logger.debug(f"[SCANNER] Slugs candidatos (hora apertura ET): {slugs}")
     return slugs
 
 
@@ -181,7 +183,7 @@ def get_open_1h_binance() -> float | None:
     except requests.exceptions.ConnectionError as e:
         logger.error(f"[SCANNER] ❌ Error de conexión con Binance: {e}")
     except requests.exceptions.HTTPError as e:
-        logger.error(f"[SCANNER] ❌ HTTP {r.status_code} de Binance klines: {e}")
+        logger.error(f"[SCANNER] ❌ HTTP error Binance klines: {e}")
     except (IndexError, KeyError, ValueError) as e:
         logger.error(f"[SCANNER] ❌ Error parseando respuesta de Binance: {type(e).__name__}: {e}")
     except Exception as e:
@@ -191,7 +193,8 @@ def get_open_1h_binance() -> float | None:
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.DEBUG)
+    import logging as _log
+    _log.basicConfig(level=_log.DEBUG)
     market = get_active_market()
     target = get_open_1h_binance()
     print(f"Mercado: {market.get('question') if market else 'No encontrado'}")

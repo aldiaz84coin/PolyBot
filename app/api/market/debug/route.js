@@ -1,6 +1,8 @@
 // app/api/market/debug/route.js
 // Diagnóstico: muestra qué devuelve la Gamma API y los slugs ET generados
 // Acceder en: /api/market/debug
+//
+// FIX v3: Slug usa hora de APERTURA ET (no cierre).
 
 export const runtime = "edge";
 export const revalidate = 0;
@@ -46,15 +48,19 @@ export async function GET() {
   const now   = new Date();
   const etNow = toET(now);
 
-  // Slugs que generamos para ±1h
+  // Truncar al inicio de la vela actual
+  const candleOpenNow = new Date(now);
+  candleOpenNow.setUTCMinutes(0, 0, 0);
+
+  // Slugs candidatos: ±1h usando hora de APERTURA ET
   const slugs = [];
   for (const offset of [-1, 0, 1]) {
-    const d  = new Date(now.getTime() + offset * 3600 * 1000);
-    const et = toET(d);
+    const candleOpen = new Date(candleOpenNow.getTime() + offset * 3600 * 1000);
+    const et         = toET(candleOpen);
     slugs.push({
       offset,
-      utc:  d.toISOString(),
-      et:   et.toISOString(),
+      candle_open_utc: candleOpen.toISOString(),
+      et_open:         et.toISOString(),
       slug: `bitcoin-up-or-down-${MONTHS[et.getUTCMonth()]}-${et.getUTCDate()}-${formatHour12(et.getUTCHours())}-et`,
     });
   }
