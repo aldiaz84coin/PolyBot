@@ -1,11 +1,13 @@
 """
 monitor.py — Loop principal del bot: ventana horaria, stop loss, resolución
 
-Cambios respecto a versión anterior:
-  - notify_target_change() al fijar nuevo Price to Beat
-  - notify_target_failed() tras MAX_TARGET_RETRIES intentos fallidos
-  - Retry automático si get_open_1h_binance() falla al cambiar de hora
-  - Validación: comprueba que la vela devuelta corresponde a la hora UTC actual
+Cambios v2.4:
+  - notify_market_found() al detectar mercado activo
+  - notify_market_lost() cuando no se encuentra mercado
+  - notify_signal_eval() al entrar en nueva ventana
+  - notify_hour_summary() al final de cada hora
+  - Retry automático si get_open_1h_binance() falla
+  - Validación: comprueba que la vela corresponde a la hora UTC actual
 """
 import logging
 import time
@@ -19,6 +21,9 @@ from .notifier       import (
     notify_start, notify_stop,
     notify_bet, notify_win, notify_loss, notify_stop_loss,
     notify_target_change, notify_target_failed,
+    notify_market_found, notify_market_lost,
+    notify_signal_eval,
+    notify_hour_summary,
     notify_error,
 )
 
@@ -27,7 +32,6 @@ logger = logging.getLogger(__name__)
 _SEPARATOR  = "─" * 60
 _SEPARATOR2 = "·" * 60
 
-# Número máximo de reintentos para obtener el Price to Beat al cambiar de hora
 MAX_TARGET_RETRIES = 5
 TARGET_RETRY_WAIT  = 10   # segundos entre reintentos
 
@@ -37,10 +41,7 @@ def _mins_to_close() -> float:
     return 60 - now.minute - now.second / 60
 
 
-def _log_cycle(
-    price: float, target: float | None,
-    mins_left: float, ops_hoy: int, max_ops: int,
-):
+def _log_cycle(price, target, mins_left, ops_hoy, max_ops):
     dist_str = "—"
     if price and target:
         dist     = price - target
@@ -56,14 +57,9 @@ def _log_cycle(
 
 
 def _fetch_target_with_retry(cfg: dict, hour_utc: int) -> float | None:
-    """
-    Intenta obtener el Price to Beat hasta MAX_TARGET_RETRIES veces.
-    Notifica por Telegram en cada caso (éxito o fallo definitivo).
-    """
+    """Obtiene el Price to Beat con reintentos y notificación Telegram."""
     for attempt in range(1, MAX_TARGET_RETRIES + 1):
-        logger.info(
-            f"[MONITOR] Obteniendo Price to Beat (intento {attempt}/{MAX_TARGET_RETRIES})..."
-        )
+        logger.info(f"[MONITOR] Obteniendo Price to Beat (intento {attempt}/{MAX_TARGET_RETRIES})...")
         target = get_open_1h_binance()
 
         if target is not None:
@@ -77,10 +73,7 @@ def _fetch_target_with_retry(cfg: dict, hour_utc: int) -> float | None:
             return target
 
         if attempt < MAX_TARGET_RETRIES:
-            logger.warning(
-                f"[MONITOR] ⚠ Intento {attempt} fallido — "
-                f"reintentando en {TARGET_RETRY_WAIT}s..."
-            )
+            logger.warning(f"[MONITOR] ⚠ Intento {attempt} fallido — reintentando en {TARGET_RETRY_WAIT}s...")
             time.sleep(TARGET_RETRY_WAIT)
         else:
             logger.error(
@@ -112,42 +105,44 @@ def run(cfg: dict):
 
     notify_start(cfg)
 
-    ops_hoy       = 0
-    active_bet    = None
-    fired_window  = None
-    target        = None
-    current_hour  = None
-    hour_wins     = 0
-    hour_losses   = 0
+    ops_hoy      = 0
+    active_bet   = None
+    fired_window = None
+    target       = None
+    current_hour = None
+    hour_wins    = 0
+    hour_losses  = 0
+    last_market  = None
+    last_window  = None   # para detectar transición de ventana
 
     try:
         while True:
             now  = datetime.now(timezone.utc)
             hour = now.hour
 
-            # ── Cambio de hora: nuevo ciclo ───────────────────────────────────
+            # ── Cambio de hora ────────────────────────────────────────────────
             if hour != current_hour:
                 logger.info(_SEPARATOR)
-                logger.info(
-                    f"[MONITOR] 🕐 NUEVO CICLO HORARIO — "
-                    f"{now.strftime('%Y-%m-%d %H:00 UTC')}"
-                )
+                logger.info(f"[MONITOR] 🕐 NUEVO CICLO HORARIO — {now.strftime('%Y-%m-%d %H:00 UTC')}")
 
+                # Resumen de la hora anterior + notificación Telegram
                 if current_hour is not None:
-                    wr = hour_wins / (hour_wins + hour_losses) * 100 \
+                    wr = int(hour_wins / (hour_wins + hour_losses) * 100) \
                          if (hour_wins + hour_losses) > 0 else 0
                     logger.info(
                         f"[MONITOR] Resumen hora anterior: "
-                        f"W={hour_wins}  L={hour_losses}  WR={wr:.0f}%  "
-                        f"Ops={ops_hoy}/{max_ops}"
+                        f"W={hour_wins}  L={hour_losses}  WR={wr}%  Ops={ops_hoy}/{max_ops}"
                     )
+                    if target:
+                        notify_hour_summary(cfg, current_hour, hour_wins, hour_losses, ops_hoy, target)
                     hour_wins   = 0
                     hour_losses = 0
 
-                current_hour = hour
-                fired_window = None
+                current_hour  = hour
+                fired_window  = None
+                last_window   = None
 
-                # Apuesta sin resolver al cambiar de hora → descartar
+                # Apuesta sin resolver → descarta
                 if active_bet:
                     logger.warning(
                         f"[MONITOR] ⚠ Apuesta sin resolver al cambiar de hora — "
@@ -155,26 +150,37 @@ def run(cfg: dict):
                     )
                     active_bet = None
 
-                # Obtener nuevo Price to Beat con reintentos + notificación
+                # Nuevo Price to Beat
                 target = _fetch_target_with_retry(cfg, hour)
 
-            # ── Ciclo normal de monitoreo ─────────────────────────────────────
-            price = get_btc_price()
-            if not price:
-                logger.warning("[MONITOR] ⚠ No se pudo obtener precio BTC — esperando...")
+                # Nuevo mercado
+                logger.info("[MONITOR] Buscando mercado activo en Polymarket...")
+                last_market = get_active_market()
+                if last_market:
+                    mins_left = _mins_to_close()
+                    notify_market_found(cfg, last_market, mins_left)
+                else:
+                    notify_market_lost(cfg, [])   # slugs se registran en market_scanner log
+
+                logger.info(_SEPARATOR)
+
+            # ── Precio BTC ────────────────────────────────────────────────────
+            try:
+                price = get_btc_price()
+            except Exception as e:
+                logger.error(f"[MONITOR] ❌ Error obteniendo precio BTC: {e}")
                 time.sleep(interval)
                 continue
 
             mins_left = _mins_to_close()
             _log_cycle(price, target, mins_left, ops_hoy, max_ops)
 
-            # Sin target no se puede operar
             if not target:
                 logger.warning("[MONITOR] ⏸ Sin Price to Beat — no se puede operar")
                 time.sleep(interval)
                 continue
 
-            # ── Stop loss ─────────────────────────────────────────────────────
+            # ── Stop Loss ─────────────────────────────────────────────────────
             if active_bet:
                 entry = active_bet["entry"]
                 dir_  = active_bet["direction"]
@@ -183,58 +189,141 @@ def run(cfg: dict):
                     if dir_ == "UP"
                     else (entry - price) / entry * 100
                 )
+                logger.debug(
+                    f"[MONITOR] Posición activa — {dir_} entry=${entry:,.2f}  "
+                    f"actual=${price:,.2f}  P&L={pnl:+.2f}%"
+                )
                 if pnl <= -(stop_pct * 100):
                     logger.warning(
                         f"[MONITOR] 🛑 STOP LOSS — P&L={pnl:.2f}%  "
                         f"Entry=${entry:,.2f}  Actual=${price:,.2f}"
                     )
                     notify_stop_loss(cfg, active_bet, pnl)
-                    active_bet = None
+                    active_bet   = None
+                    fired_window = None
+                    time.sleep(interval)
+                    continue
 
-            # ── Resolución de apuesta al cierre ───────────────────────────────
-            if active_bet and mins_left <= 0:
-                dir_   = active_bet["direction"]
-                won    = (dir_ == "UP" and price > target) or \
-                         (dir_ == "DOWN" and price < target)
+            # ── Resolución al cierre ──────────────────────────────────────────
+            if active_bet and mins_left <= 0.1:
+                dir_ = active_bet["direction"]
+                won  = (
+                    (dir_ == "UP"   and price > active_bet["target"]) or
+                    (dir_ == "DOWN" and price < active_bet["target"])
+                )
+                logger.info(
+                    f"[MONITOR] {'✅ WIN' if won else '❌ LOSS'} — "
+                    f"{dir_}  Entry=${active_bet['entry']:,.2f}  "
+                    f"Target=${active_bet['target']:,.2f}  Close=${price:,.2f}"
+                )
                 if won:
-                    logger.info(f"[MONITOR] ✅ WIN — {dir_}  Close=${price:,.2f}  Target=${target:,.2f}")
                     notify_win(cfg, active_bet, price)
                     hour_wins += 1
                     try:
-                        redimir_posicion(cfg, active_bet)
+                        tx = redimir_posicion(active_bet.get("market", {}), dir_, cfg)
+                        logger.info(f"[MONITOR] ✅ Claim tx: {tx}")
                     except Exception as e:
-                        logger.error(f"[MONITOR] Error redimiendo: {e}")
-                        notify_error(cfg, f"Error claim: {e}")
+                        logger.error(f"[MONITOR] ❌ Claim fallido: {e}", exc_info=True)
+                        notify_error(cfg, f"Claim fallido: {e}")
                 else:
-                    logger.info(f"[MONITOR] ❌ LOSS — {dir_}  Close=${price:,.2f}  Target=${target:,.2f}")
                     notify_loss(cfg, active_bet, price)
                     hour_losses += 1
-                active_bet = None
+
+                active_bet   = None
                 fired_window = None
+                time.sleep(interval)
+                continue
 
             # ── Evaluación de señal ───────────────────────────────────────────
-            if not active_bet and ops_hoy < max_ops and target:
+            if not active_bet and ops_hoy < max_ops:
                 signal = evaluate(price, target, mins_left, cfg)
-                if signal and signal.window != fired_window:
-                    order = execute_order(cfg, signal, price, target)
-                    if order:
-                        active_bet   = order
-                        fired_window = signal.window
-                        ops_hoy     += 1
-                        notify_bet(cfg, order, signal)
-                        logger.info(
-                            f"[MONITOR] 📌 Apuesta ejecutada: "
-                            f"{order['direction']}  "
-                            f"Entry=${price:,.2f}  Target=${target:,.2f}  "
-                            f"Ventana={signal.window}"
+
+                if signal is None:
+                    if last_window is not None:
+                        last_window = None
+                    time.sleep(interval)
+                    continue
+
+                # Notificar Telegram al entrar en nueva ventana
+                if signal.window != last_window:
+                    last_window = signal.window
+                    logger.info(f"[MONITOR] 🪟 Entrando en ventana {signal.window}")
+                    notify_signal_eval(
+                        cfg, price, target, signal.distance,
+                        signal.umbral, signal.window, signal.direction.value, mins_left,
+                    )
+
+                if not signal.is_actionable:
+                    time.sleep(interval)
+                    continue
+
+                if fired_window == signal.window:
+                    logger.debug(
+                        f"[MONITOR] Señal {signal.direction.value} en ventana {signal.window} "
+                        f"ya ejecutada — skip"
+                    )
+                    time.sleep(interval)
+                    continue
+
+                # Buscar mercado (refresco si no hay o es nuevo ciclo)
+                if not last_market:
+                    logger.info("[MONITOR] 🔍 Buscando mercado activo para ejecutar orden...")
+                    last_market = get_active_market()
+                    if last_market:
+                        notify_market_found(cfg, last_market, mins_left)
+                    else:
+                        logger.warning(
+                            f"[MONITOR] ⚠ Mercado no encontrado — señal "
+                            f"{signal.direction.value} descartada en ventana {signal.window}"
                         )
+                        notify_market_lost(cfg, [])
+                        time.sleep(interval)
+                        continue
+
+                logger.info(
+                    f"[MONITOR] 📊 Ejecutando orden — "
+                    f"{signal.direction.value} | ventana {signal.window} | "
+                    f"dist={signal.distance:+,.0f}"
+                )
+                result = execute_order(signal, last_market, cfg)
+
+                if result:
+                    fired_window = signal.window
+                    ops_hoy     += 1
+                    active_bet   = {
+                        "direction": signal.direction.value,
+                        "entry":     price,
+                        "target":    target,
+                        "window":    signal.window,
+                        "stake":     stake,
+                        "market":    last_market,
+                    }
+                    notify_bet(cfg, active_bet, signal)
+                    logger.info(
+                        f"[MONITOR] ✅ Apuesta registrada ({ops_hoy}/{max_ops}):\n"
+                        f"           {signal.direction.value}  Entry=${price:,.2f}  "
+                        f"Target=${target:,.2f}  Ventana={signal.window}"
+                    )
+                else:
+                    logger.error(
+                        f"[MONITOR] ❌ Orden fallida — señal {signal.direction.value} "
+                        f"en ventana {signal.window} no ejecutada."
+                    )
+                    notify_error(cfg, f"Orden fallida: {signal.direction.value} en {signal.window}")
+
+            elif ops_hoy >= max_ops:
+                logger.debug(f"[MONITOR] Límite diario ({ops_hoy}/{max_ops}) — en pausa")
 
             time.sleep(interval)
 
     except KeyboardInterrupt:
-        logger.info("[MONITOR] 🛑 Bot detenido por el usuario")
+        logger.info(_SEPARATOR)
+        logger.info(f"[MONITOR] 🛑 Bot detenido por el usuario (Ctrl+C)")
+        logger.info(f"[MONITOR] Resumen sesión: {ops_hoy} operaciones ejecutadas")
+        logger.info(_SEPARATOR)
         notify_stop(cfg)
+
     except Exception as e:
-        logger.exception(f"[MONITOR] 💥 Error fatal: {e}")
+        logger.critical(f"[MONITOR] 💥 ERROR CRÍTICO: {type(e).__name__}: {e}", exc_info=True)
         notify_error(cfg, str(e))
         raise
