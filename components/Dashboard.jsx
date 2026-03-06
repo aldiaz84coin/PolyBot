@@ -51,15 +51,18 @@ export default function Dashboard() {
   const { balance, pnlDay, applyBet, applyResult } = useBalance(500);
 
   // ── minsLeft: calculado en tiempo real cada segundo desde end_ms ──────────
+  // end_ms viene del mercado (con fallback al fin de hora UTC si la API no devuelve fecha)
   const minsLeft = endMs
     ? Math.max(0, (endMs - now.getTime()) / 60000)
     : getMinsLeft(now);
 
   // ── Target = OPEN 1H de Binance (Price to Beat real) ──────────────────────
-  const [target, setTarget]     = useState(null);
-  const [targetTs, setTargetTs] = useState(null);
-  const targetLoadingRef        = useRef(false);
-  const prevSlugRef             = useRef(null);   // ← para detectar cambio de slug
+  // Es la fuente primaria y definitiva: el mercado Polymarket BTC resuelve
+  // comparando el precio de cierre con el OPEN de la vela 1H de Binance.
+  // Se refresca: al montar, cada 60s, y al detectar cambio de hora.
+  const [target, setTarget]   = useState(null);
+  const [targetTs, setTargetTs] = useState(null);  // hora UTC del target cargado
+  const targetLoadingRef = useRef(false);
 
   const fetchTarget = useCallback(async () => {
     if (targetLoadingRef.current) return;
@@ -85,7 +88,7 @@ export default function Dashboard() {
     return () => clearInterval(id);
   }, [fetchTarget]);
 
-  // Refresco forzado al cambiar de hora UTC
+  // Refresco forzado al cambiar de hora UTC (nuevo mercado, nuevo Price to Beat)
   useEffect(() => {
     const currentHour = now.getUTCHours();
     if (targetTs !== null && targetTs !== currentHour) {
@@ -93,26 +96,12 @@ export default function Dashboard() {
     }
   }, [now.getUTCHours(), targetTs, fetchTarget]);
 
-  // ── FIX: Refresco forzado al detectar nuevo slug de mercado ──────────────
-  // Cuando Polymarket activa un nuevo mercado horario el slug cambia.
-  // En ese momento el Price to Beat (OPEN 1H de Binance) debe actualizarse
-  // de inmediato, independientemente de cuándo cambie el reloj UTC.
-  useEffect(() => {
-    const slug = market?.slug;
-    if (!slug) return;
-    if (prevSlugRef.current !== null && prevSlugRef.current !== slug) {
-      addLog(`🔄 Nuevo mercado detectado (${slug}) — actualizando Price to Beat...`, "info");
-      fetchTarget();
-    }
-    prevSlugRef.current = slug;
-  }, [market?.slug, fetchTarget]);   // addLog excluido a propósito para no re-ejecutar
-
   const activeWindow = getActiveWindow(minsLeft);
   const umbral       = activeWindow ? config[activeWindow.configKey] : null;
   const decision     = (running && activeWindow && price && target)
     ? getDecision(price, target, umbral) : null;
 
-  // Log cuando el target cambia
+  // Log cuando el target cambia (nuevo mercado horario)
   const prevTargetRef = useRef(null);
   useEffect(() => {
     if (target && target !== prevTargetRef.current) {
@@ -208,7 +197,7 @@ export default function Dashboard() {
           <span style={{ color: "var(--green)", fontWeight: 700, letterSpacing: "0.12em", fontSize: 14 }}>
             POLYMARKET BTC BOT
           </span>
-          <Tag color="#2a4a3a">v2.3</Tag>
+          <Tag color="#2a4a3a">v2.2</Tag>
           {marketActive ? <Tag color="#2a4a3a">MERCADO OK</Tag> : <Tag color="#4a2a2a">SIN MERCADO</Tag>}
           {target && <Tag color="#2a3a4a">TARGET OK</Tag>}
         </div>
