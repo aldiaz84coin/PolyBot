@@ -1,16 +1,17 @@
 // app/api/market/route.js
 // Obtiene el mercado BTC Up/Down activo en Polymarket Gamma API
 //
-// FIX v3 (BUG SLUG HORA):
-//   Polymarket usa la hora de APERTURA de la vela 1H (ET) en el slug.
-//   Ejemplo a las 7:30am ET (vela 7am–8am ET):
-//     Slug correcto: "bitcoin-up-or-down-march-6-7am-et"  ← hora APERTURA ✓
-//     Bug anterior:  "bitcoin-up-or-down-march-6-8am-et"  ← hora CIERRE ❌
+// FIX v4 (BUG TIEMPO RESTANTE 00:00):
+//   parseEndMs() podía devolver un timestamp del mercado ANTERIOR (ya expirado).
+//   Como era un número válido, !endMs era false y no hacía fallback a slugToEndMs().
+//   El dashboard calculaba Math.max(0, pasado - ahora) = 0 → mostraba 00:00.
 //
-//   La corrección es doble:
-//     1. Truncar `now` a la hora UTC actual (candle open boundary).
-//     2. Convertir ese instante a ET → usar su hora para el slug.
-//   El código anterior añadía +1h y luego convertía a ET, cogiendo la hora de cierre.
+//   Solución: si endMs ya es pasado (< now), ignorarlo y usar slugToEndMs() como
+//   fuente de verdad (deriva el cierre directamente del slug del mercado activo).
+//
+// FIX v3 (BUG SLUG HORA):
+//   La hora del slug es la APERTURA de la vela 1H en ET (no el cierre).
+//   buildSlugs() trunca now al candle open y convierte a ET → usa esa hora.
 
 export const runtime = "edge";
 export const revalidate = 0;
@@ -44,15 +45,9 @@ function formatHour12(h24) {
 
 /**
  * Genera slugs candidatos.
- *
- * ⚠️ CLAVE: Polymarket usa la hora de APERTURA de la vela 1H en ET para el slug.
- * Algoritmo:
- *   1. Truncar now al inicio de la vela (floor a la hora UTC).
- *   2. Convertir ese candle-open UTC a ET → usar esa hora para el slug.
- *   3. Generar también ±1h como candidatos de respaldo.
+ * Polymarket usa la hora de APERTURA de la vela 1H en ET para el slug.
  */
 function buildSlugs(now) {
-  // Truncar al inicio de la vela actual (candle open boundary)
   const candleOpenNow = new Date(now);
   candleOpenNow.setUTCMinutes(0, 0, 0);
 
@@ -68,19 +63,37 @@ function buildSlugs(now) {
 
 /**
  * Parsea el campo de fecha de cierre de la respuesta de Polymarket.
+ * Devuelve null si el valor no es parseable o ya está en el pasado.
+ *
+ * FIX v4: si endMs < now.getTime() (mercado anterior ya expirado), devuelve null
+ * para que el llamante use slugToEndMs() como fallback.
  */
-function parseEndMs(m) {
+function parseEndMs(m, now) {
   const raw = m.endDateIso || m.end_date_iso || m.endDate || m.end_date || null;
   if (!raw) return null;
-  if (typeof raw === "number") return raw < 2e10 ? raw * 1000 : raw;
-  try { return new Date(raw).getTime(); } catch { return null; }
+
+  let ms;
+  if (typeof raw === "number") {
+    ms = raw < 2e10 ? raw * 1000 : raw;
+  } else {
+    try {
+      ms = new Date(raw).getTime();
+    } catch {
+      return null;
+    }
+  }
+
+  // Rechazar timestamps NaN, pasados o demasiado lejanos (> 2h en el futuro)
+  if (!ms || isNaN(ms)) return null;
+  if (ms <= now.getTime()) return null;               // ← FIX v4: mercado expirado
+  if (ms - now.getTime() > 7_200_000) return null;   // > 2h → sospechoso
+
+  return ms;
 }
 
 /**
  * Fallback: deriva end_ms del slug cuando Polymarket no devuelve fecha parseable.
- *
- * ⚠️ El slug contiene la hora de APERTURA en ET.
- * Hora de cierre = hora de apertura + 1h.
+ * Hora de cierre = hora de apertura del slug + 1h.
  */
 function slugToEndMs(slug, now) {
   try {
@@ -97,7 +110,6 @@ function slugToEndMs(slug, now) {
     const hourStr = parts[monthPartIdx + 2];
     if (!day || !hourStr) return null;
 
-    // La hora del slug = hora de APERTURA en ET
     let openHourET;
     if (hourStr === "12am")          openHourET = 0;
     else if (hourStr === "12pm")     openHourET = 12;
@@ -107,7 +119,7 @@ function slugToEndMs(slug, now) {
 
     // Cierre = apertura + 1h
     const closeHourET = (openHourET + 1) % 24;
-    const closeDay    = openHourET === 23 ? day + 1 : day; // cruce medianoche
+    const closeDay    = openHourET === 23 ? day + 1 : day;
 
     const year          = now.getUTCFullYear();
     const candidateUtc  = new Date(Date.UTC(year, monthIdx, closeDay, 12, 0, 0));
@@ -115,9 +127,9 @@ function slugToEndMs(slug, now) {
 
     const closeUtcMs = Date.UTC(year, monthIdx, closeDay, closeHourET + etOffsetHours, 0, 0, 0);
 
-    // Sanity: debe estar en un rango razonable (±2h de ahora)
+    // Sanity: debe estar en un rango razonable (entre -5min y +65min de ahora)
     const diff = closeUtcMs - now.getTime();
-    if (diff < -7_200_000 || diff > 7_200_000) return null;
+    if (diff < -300_000 || diff > 3_900_000) return null;
 
     return closeUtcMs;
   } catch {
@@ -154,8 +166,11 @@ export async function GET() {
       const yesT   = tokens.find(t => t.outcome === "Yes");
       const noT    = tokens.find(t => t.outcome === "No");
 
-      let endMs  = parseEndMs(m);
+      // FIX v4: parseEndMs ahora recibe `now` y rechaza timestamps pasados.
+      // Si devuelve null, slugToEndMs actúa como fuente de verdad.
+      let endMs  = parseEndMs(m, now);
       const endIso = m.endDateIso || m.end_date_iso || m.endDate || null;
+      const endMsSource = endMs ? "polymarket" : "slug_fallback";
       if (!endMs) {
         endMs = slugToEndMs(slug, now);
       }
@@ -177,7 +192,7 @@ export async function GET() {
           slugs_tried:      tried,
           slugs_all:        slugs,
           found_slug:       slug,
-          end_ms_source:    endMs && !parseEndMs(m) ? "slug_fallback" : "polymarket",
+          end_ms_source:    endMsSource,
           now_utc:          now.toISOString(),
           dst_active:       isDST(now),
           et_offset:        isDST(now) ? "UTC-4 (EDT)" : "UTC-5 (EST)",
