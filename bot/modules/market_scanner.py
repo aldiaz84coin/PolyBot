@@ -1,94 +1,84 @@
 """
-market_scanner.py — Detecta el mercado BTC Up/Down activo en Polymarket
-y obtiene el Price to Beat (open vela 1H de Binance)
+market_scanner.py  ·  bot/modules/
+Detecta el mercado BTC Up/Down activo en Polymarket Gamma API.
 
-FIX v3 (BUG SLUG HORA):
-  Polymarket nombra cada mercado por la hora de APERTURA de la vela 1H (ET).
-  Ejemplo a las 7:30am ET (vela 7am–8am ET):
-    · Slug correcto: bitcoin-up-or-down-march-6-7am-et   ← hora APERTURA ✓
-    · Bug anterior:  bitcoin-up-or-down-march-6-8am-et   ← hora CIERRE ❌
-
-  La corrección es doble:
-    1. Truncar `now` a la hora UTC actual (candle open boundary).
-    2. Convertir ese instante a ET → usar su hora para el slug (sin +1h).
+FIX: get_open_1h_binance() ahora acepta slug opcional para pedir la vela exacta
+     por startTime (más robusto en transiciones de hora).
+     Consistente con bot/market_scanner.py y /api/target?slug= del frontend.
 """
 import logging
 import requests
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
-GAMMA_API     = "https://gamma-api.polymarket.com/markets"
+GAMMA_API    = "https://gamma-api.polymarket.com/markets"
 BINANCE_KLINE = "https://api.binance.com/api/v3/klines"
-TIMEOUT       = 8
+TIMEOUT      = 10
 
 MONTHS = [
-    "january","february","march","april","may","june",
-    "july","august","september","october","november","december",
+    "january", "february", "march", "april", "may", "june",
+    "july", "august", "september", "october", "november", "december",
 ]
 
-
-# ── Helpers timezone ET ───────────────────────────────────────────────────────
-
-def _is_dst(utc_date: datetime) -> bool:
-    year      = utc_date.year
-    march     = datetime(year, 3, 1, tzinfo=timezone.utc)
-    dst_start = datetime(year, 3, 8 + (7 - march.weekday() - 1) % 7, tzinfo=timezone.utc)
-    nov       = datetime(year, 11, 1, tzinfo=timezone.utc)
-    dst_end   = datetime(year, 11, 1 + (7 - nov.weekday() - 1) % 7, tzinfo=timezone.utc)
-    return dst_start <= utc_date < dst_end
+_last_slug = None
 
 
-def _to_et(utc_date: datetime) -> datetime:
-    return utc_date + timedelta(hours=-4 if _is_dst(utc_date) else -5)
+# ── DST helper ─────────────────────────────────────────────────────────────
 
+def _is_dst(utc_dt: datetime) -> bool:
+    year  = utc_dt.year
+    # Segundo domingo de marzo
+    march = datetime(year, 3, 1, tzinfo=timezone.utc)
+    dst_start = datetime(year, 3, 8 + (6 - march.weekday()) % 7, tzinfo=timezone.utc)
+    # Primer domingo de noviembre
+    nov   = datetime(year, 11, 1, tzinfo=timezone.utc)
+    dst_end = datetime(year, 11, 1 + (6 - nov.weekday()) % 7, tzinfo=timezone.utc)
+    return dst_start <= utc_dt < dst_end
+
+
+# ── Slug builders ──────────────────────────────────────────────────────────
 
 def _format_hour_12(h24: int) -> str:
-    if h24 == 0:   return "12am"
-    if h24 == 12:  return "12pm"
+    if h24 == 0:  return "12am"
+    if h24 == 12: return "12pm"
     return f"{h24}am" if h24 < 12 else f"{h24 - 12}pm"
 
 
-def build_slugs() -> list[str]:
-    """
-    Genera slugs candidatos para el mercado BTC Up/Down activo.
+def build_slugs(now: datetime | None = None) -> list[str]:
+    """Genera slugs candidatos para el mercado activo (hora actual ± 1h)."""
+    if now is None:
+        now = datetime.now(timezone.utc)
 
-    ⚠️ CLAVE — el slug usa la hora de APERTURA de la vela 1H en ET.
-    Algoritmo:
-      1. Truncar now al inicio de la vela (floor a hora UTC).
-      2. Convertir a ET → hora ET de apertura → usar para el slug.
-    """
-    now              = datetime.now(timezone.utc)
-    candle_open_now  = now.replace(minute=0, second=0, microsecond=0)
-    slugs            = []
-
-    for offset in [0, -1, 1]:
-        candle_open = candle_open_now + timedelta(hours=offset)
-        et_open     = _to_et(candle_open)
-
-        slug = (
-            f"bitcoin-up-or-down-"
-            f"{MONTHS[et_open.month - 1]}-{et_open.day}-"
-            f"{_format_hour_12(et_open.hour)}-et"
-        )
+    candle_open = now.replace(minute=0, second=0, microsecond=0)
+    slugs = []
+    for offset_h in [0, -1, 1]:
+        from datetime import timedelta
+        co = candle_open + timedelta(hours=offset_h)
+        et_offset = 4 if _is_dst(co) else 5
+        et_hour   = (co.hour - et_offset) % 24
+        et_day    = co.day
+        # ajuste día si la conversión cruza medianoche
+        if co.hour < et_offset:
+            from datetime import timedelta as _td
+            et_day = (co - _td(days=1)).day
+            month_idx = (co - _td(days=1)).month - 1
+        else:
+            month_idx = co.month - 1
+        slug = f"bitcoin-up-or-down-{MONTHS[month_idx]}-{et_day}-{_format_hour_12(et_hour)}-et"
         if slug not in slugs:
             slugs.append(slug)
-
-    logger.debug(f"[SCANNER] Slugs candidatos (hora apertura ET): {slugs}")
     return slugs
 
 
-_last_slug: str | None = None
-
+# ── Mercado activo ─────────────────────────────────────────────────────────
 
 def get_active_market() -> dict | None:
-    """Devuelve el primer mercado BTC activo encontrado, o None."""
+    """Devuelve el primer mercado BTC Up/Down activo que encuentre en Polymarket."""
     global _last_slug
     slugs = build_slugs()
 
     for slug in slugs:
-        url = f"{GAMMA_API}?slug={slug}"
-        logger.debug(f"[SCANNER] GET {url}")
         try:
             r = requests.get(GAMMA_API, params={"slug": slug}, timeout=TIMEOUT)
             logger.debug(f"[SCANNER] HTTP {r.status_code} — slug={slug}")
@@ -151,16 +141,91 @@ def get_active_market() -> dict | None:
     return None
 
 
-def get_open_1h_binance() -> float | None:
-    """Obtiene el precio OPEN de la vela 1H actual de Binance (= Price to Beat)."""
-    params = {"symbol": "BTCUSDT", "interval": "1h", "limit": 1}
+# ── Price to Beat (Binance 1H open) ───────────────────────────────────────
+
+def _slug_to_candle_start_ms(slug: str, now: datetime) -> int | None:
+    """
+    Parsea el slug para obtener el startTime UTC (ms) de la vela 1H.
+
+    ⚠️ El slug contiene la hora de APERTURA en ET → esa es directamente el start.
+    Consistente con parseCandleStartFromSlug() en app/api/target/route.js.
+    """
+    try:
+        parts = slug.split("-")
+        month_idx      = -1
+        month_part_idx = -1
+        for i, p in enumerate(parts):
+            if p in MONTHS:
+                month_idx      = MONTHS.index(p)
+                month_part_idx = i
+                break
+        if month_idx == -1:
+            return None
+
+        day      = int(parts[month_part_idx + 1])
+        hour_str = parts[month_part_idx + 2]
+
+        # La hora del slug = hora de APERTURA en ET (directamente)
+        if hour_str == "12am":
+            open_hour_et = 0
+        elif hour_str == "12pm":
+            open_hour_et = 12
+        elif hour_str.endswith("am"):
+            open_hour_et = int(hour_str[:-2])
+        elif hour_str.endswith("pm"):
+            open_hour_et = int(hour_str[:-2]) + 12
+        else:
+            return None
+
+        year      = now.year
+        candidate = datetime(year, month_idx + 1, day, 12, 0, 0, tzinfo=timezone.utc)
+        et_offset = 4 if _is_dst(candidate) else 5
+
+        start_utc = datetime(
+            year, month_idx + 1, day,
+            open_hour_et + et_offset, 0, 0,
+            tzinfo=timezone.utc,
+        )
+        return int(start_utc.timestamp() * 1000)
+    except Exception:
+        return None
+
+
+def get_open_1h_binance(slug: str | None = None) -> float | None:
+    """
+    Devuelve el precio OPEN de la vela 1H del mercado activo (= Price to Beat).
+
+    Si se pasa slug, pide la vela exacta por startTime (más robusto en
+    transiciones de hora). Si no, pide la vela 1H actual con limit=1.
+
+    FIX: antes no aceptaba el parámetro slug → TypeError al llamar con slug=slug.
+    """
+    now    = datetime.now(timezone.utc)
+    params: dict = {"symbol": "BTCUSDT", "interval": "1h"}
+
+    if slug:
+        start_ms = _slug_to_candle_start_ms(slug, now)
+        if start_ms:
+            params["startTime"] = start_ms
+            params["limit"]     = 1
+            logger.debug(f"[SCANNER] Binance klines — startTime={start_ms} slug={slug}")
+        else:
+            logger.warning(f"[SCANNER] No se pudo parsear startTime del slug={slug}, usando limit=1")
+            params["limit"] = 1
+    else:
+        params["limit"] = 1
+
     logger.debug(f"[SCANNER] GET {BINANCE_KLINE} params={params}")
     try:
         r = requests.get(BINANCE_KLINE, params=params, timeout=TIMEOUT)
-        logger.debug(f"[SCANNER] HTTP {r.status_code} — Binance klines")
         r.raise_for_status()
+        klines = r.json()
 
-        kline      = r.json()[0]
+        if not klines:
+            logger.error("[SCANNER] ❌ Binance devolvió lista vacía de klines")
+            return None
+
+        kline      = klines[0]
         open_price = float(kline[1])
         high       = float(kline[2])
         low        = float(kline[3])
@@ -179,13 +244,13 @@ def get_open_1h_binance() -> float | None:
         return open_price
 
     except requests.exceptions.Timeout:
-        logger.error(f"[SCANNER] ❌ Timeout obteniendo vela 1H de Binance ({TIMEOUT}s)")
+        logger.error(f"[SCANNER] ❌ Timeout ({TIMEOUT}s) — Binance klines")
     except requests.exceptions.ConnectionError as e:
-        logger.error(f"[SCANNER] ❌ Error de conexión con Binance: {e}")
+        logger.error(f"[SCANNER] ❌ Conexión fallida con Binance: {e}")
     except requests.exceptions.HTTPError as e:
         logger.error(f"[SCANNER] ❌ HTTP error Binance klines: {e}")
     except (IndexError, KeyError, ValueError) as e:
-        logger.error(f"[SCANNER] ❌ Error parseando respuesta de Binance: {type(e).__name__}: {e}")
+        logger.error(f"[SCANNER] ❌ Error parseando respuesta Binance: {type(e).__name__}: {e}")
     except Exception as e:
         logger.error(f"[SCANNER] ❌ Error inesperado: {type(e).__name__}: {e}")
 
@@ -194,8 +259,14 @@ def get_open_1h_binance() -> float | None:
 
 if __name__ == "__main__":
     import logging as _log
-    _log.basicConfig(level=_log.DEBUG)
+    _log.basicConfig(
+        level=_log.DEBUG,
+        format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+        datefmt="%H:%M:%S",
+    )
     market = get_active_market()
-    target = get_open_1h_binance()
-    print(f"Mercado: {market.get('question') if market else 'No encontrado'}")
-    print(f"Target : ${target:,.2f}" if target else "Target: No disponible")
+    slug   = market.get("slug") if market else None
+    target = get_open_1h_binance(slug=slug)
+    print(f"\nMercado : {market.get('question') if market else 'No encontrado'}")
+    print(f"Slug    : {slug or '—'}")
+    print(f"Target  : ${target:,.2f}" if target else "Target  : No disponible")
