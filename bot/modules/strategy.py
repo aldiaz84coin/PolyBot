@@ -165,7 +165,7 @@ def execute_order(signal: Signal, market: dict, cfg: dict) -> dict | None:
 
     try:
         from py_clob_client.client import ClobClient
-        from py_clob_client.clob_types import ApiCreds, OrderArgs
+        from py_clob_client.clob_types import ApiCreds, OrderArgs, CreateOrderOptions
 
         host        = "https://clob.polymarket.com"
         private_key = cfg["polymarket"]["private_key"]
@@ -173,13 +173,33 @@ def execute_order(signal: Signal, market: dict, cfg: dict) -> dict | None:
         chain_id    = cfg["polymarket"]["chain_id"]
         sig_type    = cfg["polymarket"]["signature_type"]
 
-        # neg_risk: leído del mercado; los BTC Up/Down son siempre False,
+        # ── Credenciales Level 2 (necesarias para post_order) ─────────────
+        api_key        = cfg["polymarket"].get("api_key", "")
+        api_secret     = cfg["polymarket"].get("api_secret", "")
+        api_passphrase = cfg["polymarket"].get("api_passphrase", "")
+
+        if not all([api_key, api_secret, api_passphrase]):
+            logger.error(
+                "[ORDER] ❌ Faltan credenciales Level 2 en config:\n"
+                "         Necesitas polymarket.api_key, api_secret y api_passphrase\n"
+                "         (o las vars de entorno POLY_API_KEY, POLY_API_SECRET, POLY_API_PASSPHRASE)"
+            )
+            return None
+
+        creds = ApiCreds(
+            api_key=api_key,
+            api_secret=api_secret,
+            api_passphrase=api_passphrase,
+        )
+
+        # neg_risk: los BTC Up/Down son siempre False,
         # pero lo derivamos dinámicamente por si acaso.
         neg_risk = bool(market.get("neg_risk", False))
 
         logger.debug(
             f"[ORDER] Conectando a CLOB — host={host}  chain={chain_id}  "
-            f"sig_type={sig_type}  neg_risk={neg_risk}"
+            f"sig_type={sig_type}  neg_risk={neg_risk}  "
+            f"api_key={api_key[:8]}..."
         )
 
         client = ClobClient(
@@ -188,6 +208,7 @@ def execute_order(signal: Signal, market: dict, cfg: dict) -> dict | None:
             chain_id=chain_id,
             signature_type=sig_type,
             funder=funder,
+            creds=creds,          # ← Level 2 auth
         )
 
         order_args = OrderArgs(
@@ -199,10 +220,6 @@ def execute_order(signal: Signal, market: dict, cfg: dict) -> dict | None:
 
         logger.info(f"[ORDER] 📤 Enviando orden FOK al CLOB...")
 
-        # ── py_clob_client >= 0.18: CreateOrderOptions requiere neg_risk ──
-        # neg_risk es un argumento posicional obligatorio desde 0.18.
-        # NO usar el fallback sin options: causa PolyException L2_AUTH.
-        from py_clob_client.clob_types import CreateOrderOptions
         resp = client.create_and_post_order(
             order_args,
             CreateOrderOptions(neg_risk=neg_risk, tick_size=None),
