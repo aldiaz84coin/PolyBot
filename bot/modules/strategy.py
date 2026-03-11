@@ -173,8 +173,13 @@ def execute_order(signal: Signal, market: dict, cfg: dict) -> dict | None:
         chain_id    = cfg["polymarket"]["chain_id"]
         sig_type    = cfg["polymarket"]["signature_type"]
 
+        # neg_risk: leído del mercado; los BTC Up/Down son siempre False,
+        # pero lo derivamos dinámicamente por si acaso.
+        neg_risk = bool(market.get("neg_risk", False))
+
         logger.debug(
-            f"[ORDER] Conectando a CLOB — host={host}  chain={chain_id}  sig_type={sig_type}"
+            f"[ORDER] Conectando a CLOB — host={host}  chain={chain_id}  "
+            f"sig_type={sig_type}  neg_risk={neg_risk}"
         )
 
         client = ClobClient(
@@ -193,13 +198,15 @@ def execute_order(signal: Signal, market: dict, cfg: dict) -> dict | None:
         )
 
         logger.info(f"[ORDER] 📤 Enviando orden FOK al CLOB...")
-        try:
-            # py_clob_client >=0.14: segundo arg es CreateOrderOptions, no OrderType
-            from py_clob_client.clob_types import CreateOrderOptions
-            resp = client.create_and_post_order(order_args, CreateOrderOptions(tick_size=None))
-        except (ImportError, TypeError):
-            # Fallback para versiones anteriores o si falla el options
-            resp = client.create_and_post_order(order_args)
+
+        # ── py_clob_client >= 0.18: CreateOrderOptions requiere neg_risk ──
+        # neg_risk es un argumento posicional obligatorio desde 0.18.
+        # NO usar el fallback sin options: causa PolyException L2_AUTH.
+        from py_clob_client.clob_types import CreateOrderOptions
+        resp = client.create_and_post_order(
+            order_args,
+            CreateOrderOptions(neg_risk=neg_risk, tick_size=None),
+        )
 
         order_id = resp.get("orderID", resp.get("id", "—"))
         status   = resp.get("status", "—")
