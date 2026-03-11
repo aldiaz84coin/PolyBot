@@ -425,8 +425,9 @@ def run(cfg: dict):
             if signal and not active_bet and fired_window != signal.window:
                 if ops_hoy < max_ops:
                     notify_signal_eval(
-                        cfg, signal.direction.value, price, target,
-                        signal.distance, signal.umbral, mins_left, signal.window,
+                        cfg, price, target,
+                        signal.distance, signal.umbral, signal.window,
+                        signal.direction.value, mins_left,
                     )
 
                     result = execute_order(signal, market, cfg)
