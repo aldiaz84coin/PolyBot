@@ -2,6 +2,13 @@
 bot/market_scanner.py
 Detecta el mercado BTC Up/Down activo en Polymarket y obtiene el Price to Beat.
 
+FIX v5 (TOKENS VACÍOS):
+  Polymarket Gamma API a veces devuelve tokens: [] aunque el mercado esté activo.
+  En ese caso, se reconstruyen los tokens desde clobTokenIds (índice 0 = YES, 1 = NO).
+  Además, el dict retornado por get_active_market() ahora incluye siempre "tokens"
+  para que strategy.execute_order() pueda encontrar el token_id correcto.
+  Sin este fix, las órdenes fallaban con "Token UP no encontrado en el mercado".
+
 FIX v4 (BINANCE BLOQUEADO EN RAILWAY):
   Railway despliega en servidores US donde Binance bloquea conexiones.
   Se añade Kraken OHLC como fuente de fallback automático.
@@ -11,6 +18,7 @@ FIX v3 (BUG SLUG HORA):
   Polymarket nombra cada mercado por la hora de APERTURA de la vela 1H (ET).
   get_open_1h_binance() usa limit=1 → klines[0] = vela actual en curso.
 """
+import json
 import logging
 import requests
 from datetime import datetime, timedelta, timezone
@@ -129,6 +137,42 @@ def _slug_to_end_ms(slug: str, now: datetime) -> int | None:
         return None
 
 
+# ── Helpers de tokens ──────────────────────────────────────────────────────────
+
+def _rebuild_tokens_from_clob(market_raw: dict) -> list[dict]:
+    """
+    FIX v5: Reconstruye la lista de tokens desde clobTokenIds cuando tokens[] viene vacío.
+
+    Polymarket Gamma API siempre incluye clobTokenIds aunque omita tokens[].
+    Formato: JSON string o lista — índice 0 = YES (UP), índice 1 = NO (DOWN).
+    Los precios no están disponibles aquí, se usa 0.5 como placeholder;
+    el CLOB los actualizará en tiempo real al ejecutar la orden.
+    """
+    clob_raw = market_raw.get("clobTokenIds")
+    if not clob_raw:
+        return []
+
+    try:
+        clob_ids = json.loads(clob_raw) if isinstance(clob_raw, str) else clob_raw
+        if not isinstance(clob_ids, list) or len(clob_ids) < 2:
+            logger.warning(f"[SCANNER] clobTokenIds inesperado: {clob_raw}")
+            return []
+
+        tokens = [
+            {"outcome": "Yes", "token_id": clob_ids[0], "price": 0.5},
+            {"outcome": "No",  "token_id": clob_ids[1], "price": 0.5},
+        ]
+        logger.warning(
+            f"[SCANNER] ⚠ tokens[] vacío en Gamma API — reconstruidos desde clobTokenIds\n"
+            f"           YES token_id: {str(clob_ids[0])[:16]}...\n"
+            f"           NO  token_id: {str(clob_ids[1])[:16]}..."
+        )
+        return tokens
+    except Exception as e:
+        logger.error(f"[SCANNER] ❌ No se pudo parsear clobTokenIds: {e}")
+        return []
+
+
 # ── Mercado activo ─────────────────────────────────────────────────────────────
 
 def get_active_market() -> dict | None:
@@ -146,6 +190,11 @@ def get_active_market() -> dict | None:
 
             m      = data[0]
             tokens = m.get("tokens", [])
+
+            # ── FIX v5: fallback a clobTokenIds si tokens viene vacío ──────────
+            if not tokens:
+                tokens = _rebuild_tokens_from_clob(m)
+
             yes_p  = next((float(t["price"]) for t in tokens if t.get("outcome") == "Yes"), None)
             no_p   = next((float(t["price"]) for t in tokens if t.get("outcome") == "No"),  None)
 
@@ -164,6 +213,7 @@ def get_active_market() -> dict | None:
                 "end_ms":       end_ms,
                 "yes_price":    yes_p,
                 "no_price":     no_p,
+                "tokens":       tokens,   # ← FIX v5: necesario para execute_order()
                 "volume":       m.get("volume"),
                 "liquidity":    m.get("liquidity"),
                 "url":          f"https://polymarket.com/event/{slug}",
@@ -174,6 +224,7 @@ def get_active_market() -> dict | None:
             if mins is not None:
                 mm, ss = int(mins), int((mins % 1) * 60)
                 logger.info(f"[SCANNER]   Cierre : {mm:02d}:{ss:02d}  ({mins:.1f} min)")
+            logger.info(f"[SCANNER]   Tokens : {len(tokens)} (YES+NO)")
             if yes_p: logger.info(f"[SCANNER]   YES    : ${yes_p:.4f}  (▲ UP  {yes_p*100:.1f}%)")
             if no_p:  logger.info(f"[SCANNER]   NO     : ${no_p:.4f}  (▼ DOWN {no_p*100:.1f}%)")
             logger.info(_SEPARATOR)
@@ -320,7 +371,6 @@ def _try_kraken(slug: str | None, now: datetime) -> float | None:
             logger.error("[SCANNER] ❌ Kraken: no se encontraron datos de par")
             return None
 
-        # Buscar vela exacta por timestamp si tenemos start_s
         candle = None
         if start_s:
             candle = next((c for c in pair_data if int(c[0]) == start_s), None)
