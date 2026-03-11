@@ -2,6 +2,11 @@
 market_scanner.py  ·  bot/modules/
 Detecta el mercado BTC Up/Down activo en Polymarket Gamma API.
 
+FIX v5 (TOKENS VACÍOS):
+  Polymarket Gamma API a veces devuelve tokens: [] aunque el mercado esté activo.
+  En ese caso, se reconstruyen los tokens desde clobTokenIds (índice 0 = YES, 1 = NO).
+  Sin este fix, strategy.execute_order() no encuentra el token y aborta la orden.
+
 FIX v4 (BINANCE BLOQUEADO EN RAILWAY):
   Railway despliega en servidores US donde Binance bloquea conexiones.
   Se añade Kraken OHLC como fuente de fallback automático en get_open_1h_binance().
@@ -11,6 +16,7 @@ FIX previos mantenidos:
   - get_open_1h_binance() acepta slug opcional para pedir vela exacta por startTime.
   - Consistente con bot/market_scanner.py y /api/target?slug= del frontend.
 """
+import json
 import logging
 import requests
 from datetime import datetime, timedelta, timezone
@@ -75,6 +81,42 @@ def build_slugs(now: datetime | None = None) -> list[str]:
     return slugs
 
 
+# ── Helpers de tokens ──────────────────────────────────────────────────────
+
+def _rebuild_tokens_from_clob(market_raw: dict) -> list[dict]:
+    """
+    FIX v5: Reconstruye la lista de tokens desde clobTokenIds cuando tokens[] viene vacío.
+
+    Polymarket Gamma API siempre incluye clobTokenIds aunque omita tokens[].
+    Formato: JSON string o lista — índice 0 = YES (UP), índice 1 = NO (DOWN).
+    Los precios no están disponibles aquí, se usa 0.5 como placeholder;
+    el CLOB los actualizará en tiempo real al ejecutar la orden.
+    """
+    clob_raw = market_raw.get("clobTokenIds")
+    if not clob_raw:
+        return []
+
+    try:
+        clob_ids = json.loads(clob_raw) if isinstance(clob_raw, str) else clob_raw
+        if not isinstance(clob_ids, list) or len(clob_ids) < 2:
+            logger.warning(f"[SCANNER] clobTokenIds inesperado: {clob_raw}")
+            return []
+
+        tokens = [
+            {"outcome": "Yes", "token_id": clob_ids[0], "price": 0.5},
+            {"outcome": "No",  "token_id": clob_ids[1], "price": 0.5},
+        ]
+        logger.warning(
+            f"[SCANNER] ⚠ tokens[] vacío en Gamma API — reconstruidos desde clobTokenIds\n"
+            f"           YES token_id: {str(clob_ids[0])[:16]}...\n"
+            f"           NO  token_id: {str(clob_ids[1])[:16]}..."
+        )
+        return tokens
+    except Exception as e:
+        logger.error(f"[SCANNER] ❌ No se pudo parsear clobTokenIds: {e}")
+        return []
+
+
 # ── Mercado activo ─────────────────────────────────────────────────────────
 
 def get_active_market() -> dict | None:
@@ -98,6 +140,13 @@ def get_active_market() -> dict | None:
             cond_id   = market.get("conditionId", market.get("condition_id", "—"))
             end_date  = market.get("endDateIso", market.get("end_date_iso", market.get("endDate", "—")))
             tokens    = market.get("tokens", [])
+
+            # ── FIX v5: fallback a clobTokenIds si tokens viene vacío ──────────
+            if not tokens:
+                tokens = _rebuild_tokens_from_clob(market)
+                if tokens:
+                    market["tokens"] = tokens  # propagar al dict para execute_order()
+
             yes_price = next((float(t["price"]) for t in tokens if t.get("outcome") == "Yes"), None)
             no_price  = next((float(t["price"]) for t in tokens if t.get("outcome") == "No"),  None)
 
@@ -119,7 +168,8 @@ def get_active_market() -> dict | None:
                 f"           Pregunta   : {question}\n"
                 f"           Slug       : {slug}\n"
                 f"           ConditionID: {cond_id}\n"
-                f"           Cierre     : {end_date}"
+                f"           Cierre     : {end_date}\n"
+                f"           Tokens     : {len(tokens)} (YES+NO)"
             )
             if yes_price and no_price:
                 logger.info(
