@@ -17,10 +17,17 @@ def load_config(path: str = "config.yaml") -> dict:
 
     # ── Overrides desde variables de entorno (Railway) ──────────────────────
     env_map = {
+        # Polymarket wallet
         "POLYMARKET_PRIVATE_KEY": ("polymarket", "private_key"),
         "POLYMARKET_FUNDER":      ("polymarket", "funder"),
+        # Polymarket CLOB API credentials (Level 2) — necesarias para post_order
+        "POLY_API_KEY":           ("polymarket", "api_key"),
+        "POLY_API_SECRET":        ("polymarket", "api_secret"),
+        "POLY_API_PASSPHRASE":    ("polymarket", "api_passphrase"),
+        # Telegram
         "TELEGRAM_BOT_TOKEN":     ("telegram",   "bot_token"),
         "TELEGRAM_CHAT_ID":       ("telegram",   "chat_id"),
+        # Capital / strategy
         "STAKE_USDC":             ("capital",    "stake_usdc"),
         "T20_UMBRAL_USD":         ("strategy",   "t20_umbral_usd"),
         "T15_UMBRAL_USD":         ("strategy",   "t15_umbral_usd"),
