@@ -50,8 +50,9 @@ def notify_stop(cfg: dict):
 
 # ── Price to Beat ─────────────────────────────────────────────────────────────
 
-def notify_target_change(cfg: dict, target: float, hour_utc: int, is_retry: bool = False):
+def notify_target_change(cfg: dict, target: float, hour_utc, is_retry: bool = False):
     """Notifica el nuevo Price to Beat al inicio de cada hora."""
+    hour_utc  = int(hour_utc)   # FIX: JSON devuelve float, :02d requiere int
     retry_tag = "  <i>(reintento exitoso)</i>" if is_retry else ""
     _send(cfg, (
         f"🎯 <b>Nuevo Price to Beat — {hour_utc:02d}:00 UTC</b>{retry_tag}\n"
@@ -61,7 +62,8 @@ def notify_target_change(cfg: dict, target: float, hour_utc: int, is_retry: bool
     ))
 
 
-def notify_target_failed(cfg: dict, hour_utc: int, attempt: int):
+def notify_target_failed(cfg: dict, hour_utc, attempt: int):
+    hour_utc = int(hour_utc)    # FIX: JSON devuelve float, :02d requiere int
     _send(cfg, (
         f"🚨 <b>Price to Beat NO disponible — {hour_utc:02d}:00 UTC</b>\n"
         f"Intento {attempt} fallido. El bot no operará esta hora.\n"
@@ -129,11 +131,12 @@ def notify_signal_eval(cfg: dict, price: float, target: float, dist: float,
 
 # ── Resumen horario ───────────────────────────────────────────────────────────
 
-def notify_hour_summary(cfg: dict, hour_utc: int, wins: int, losses: int,
+def notify_hour_summary(cfg: dict, hour_utc, wins: int, losses: int,
                         ops: int, target: float):
     """Resumen al final de cada hora."""
-    total = wins + losses
-    wr    = int(wins / total * 100) if total > 0 else 0
+    hour_utc = int(hour_utc)    # FIX: JSON devuelve float, :02d requiere int
+    total    = wins + losses
+    wr       = int(wins / total * 100) if total > 0 else 0
     _send(cfg, (
         f"📋 <b>Resumen hora {hour_utc:02d}:00 UTC</b>\n"
         f"Ops    : <code>{ops}</code>\n"
@@ -185,6 +188,8 @@ def notify_stop_loss(cfg: dict, bet: dict, pnl: float):
         f"Entry : <code>${bet.get('entry', 0):,.2f}</code>"
     ))
 
+
+# ── Errores ───────────────────────────────────────────────────────────────────
 
 def notify_error(cfg: dict, msg: str):
     _send(cfg, f"🚨 <b>Error crítico</b>\n<code>{msg[:400]}</code>")
