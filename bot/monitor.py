@@ -294,7 +294,7 @@ def run(cfg: dict):
 
             if market and not prev_market:
                 logger.info(f"[MONITOR] 🟢 Mercado detectado: {market.get('slug', '—')}")
-                notify_market_found(cfg, market)
+                notify_market_found(cfg, market, mins_left)
             elif not market and prev_market:
                 logger.warning(f"[MONITOR] 🔴 Mercado perdido")
                 notify_market_lost(cfg, prev_market)
