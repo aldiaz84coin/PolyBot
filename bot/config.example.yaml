@@ -12,7 +12,7 @@ strategy:
   monitor_intervalo_s: 5  # frecuencia del loop (segundos)
 
 capital:
-  stake_usdc:        50   # USDC por operación
+  stake_usdc:        10   # USDC por operación (por defecto 10)
   max_operaciones_dia: 24
 
 polymarket:
