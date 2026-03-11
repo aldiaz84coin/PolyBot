@@ -48,11 +48,32 @@ def notify_stop(cfg: dict):
     _send(cfg, "🛑 <b>Bot detenido</b>")
 
 
+# ── Resumen de arranque ───────────────────────────────────────────────────────
+
+def notify_startup_summary(cfg: dict, hist_stats: dict):
+    """Envía resumen del historial acumulado al arrancar el bot."""
+    total    = hist_stats.get("total_ops", 0)
+    wins     = hist_stats.get("wins", 0)
+    losses   = hist_stats.get("losses", 0) + hist_stats.get("stops", 0)
+    wr       = round(wins / (wins + losses) * 100) if (wins + losses) > 0 else 0
+    invested = hist_stats.get("total_invested", 0.0)
+    pnl      = hist_stats.get("total_pnl", 0.0)
+    sign     = "+" if pnl >= 0 else ""
+    _send(cfg, (
+        f"📊 <b>Historial acumulado</b>\n"
+        f"Operaciones : <code>{total}</code>\n"
+        f"W / L+STOP  : <code>{wins}W / {losses}L</code>  "
+        f"WR: <code>{wr}%</code>\n"
+        f"Invertido   : <code>${invested:,.2f} USDC</code>\n"
+        f"P&L neto    : <code>{sign}${pnl:,.2f} USDC</code>"
+    ))
+
+
 # ── Price to Beat ─────────────────────────────────────────────────────────────
 
 def notify_target_change(cfg: dict, target: float, hour_utc, is_retry: bool = False):
     """Notifica el nuevo Price to Beat al inicio de cada hora."""
-    hour_utc  = int(hour_utc)   # FIX: JSON devuelve float, :02d requiere int
+    hour_utc  = int(hour_utc)
     retry_tag = "  <i>(reintento exitoso)</i>" if is_retry else ""
     _send(cfg, (
         f"🎯 <b>Nuevo Price to Beat — {hour_utc:02d}:00 UTC</b>{retry_tag}\n"
@@ -63,7 +84,7 @@ def notify_target_change(cfg: dict, target: float, hour_utc, is_retry: bool = Fa
 
 
 def notify_target_failed(cfg: dict, hour_utc, attempt: int):
-    hour_utc = int(hour_utc)    # FIX: JSON devuelve float, :02d requiere int
+    hour_utc = int(hour_utc)
     _send(cfg, (
         f"🚨 <b>Price to Beat NO disponible — {hour_utc:02d}:00 UTC</b>\n"
         f"Intento {attempt} fallido. El bot no operará esta hora.\n"
@@ -109,9 +130,7 @@ def notify_market_lost(cfg: dict, slugs_tried: list):
 
 def notify_signal_eval(cfg: dict, price: float, target: float, dist: float,
                        umbral: float, window: str, direction: str, mins_left: float):
-    """
-    Notificación al entrar en ventana o al cambiar de dirección.
-    """
+    """Notificación al entrar en ventana o al cambiar de dirección."""
     arrow  = "▲" if dist > 0 else "▼"
     action = (
         f"✅ <b>{direction}</b> — señal accionable"
@@ -134,7 +153,7 @@ def notify_signal_eval(cfg: dict, price: float, target: float, dist: float,
 def notify_hour_summary(cfg: dict, hour_utc, wins: int, losses: int,
                         ops: int, target: float):
     """Resumen al final de cada hora."""
-    hour_utc = int(hour_utc)    # FIX: JSON devuelve float, :02d requiere int
+    hour_utc = int(hour_utc)
     total    = wins + losses
     wr       = int(wins / total * 100) if total > 0 else 0
     _send(cfg, (
