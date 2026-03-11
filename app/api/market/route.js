@@ -1,6 +1,13 @@
 // app/api/market/route.js
 // Obtiene el mercado BTC Up/Down activo en Polymarket Gamma API
 //
+// FIX v6 (FALLBACK clobTokenIds):
+//   Cuando Gamma devuelve tokens:[] vacío (ocurre frecuentemente), los precios
+//   quedaban en null y el dashboard mostraba "—".
+//   Solución: si tokens[] está vacío, reconstruir desde clobTokenIds (igual que
+//   el bot Python en market_scanner.py). Los token_id resultantes se usan para
+//   fetchLivePrice() en el CLOB → precio real siempre disponible.
+//
 // FIX v5 (PRECIOS LIVE DESDE CLOB):
 //   La Gamma API devuelve tokens[].price con precios cacheados, no en tiempo real.
 //   Los precios que ve el usuario en polymarket.com vienen del CLOB (orderbook).
@@ -128,6 +135,29 @@ function slugToEndMs(slug, now) {
 }
 
 /**
+ * FIX v6: Fallback para reconstruir tokens desde clobTokenIds cuando
+ * Gamma devuelve tokens:[] vacío. Espeja la lógica de bot/market_scanner.py.
+ * Gamma siempre incluye clobTokenIds aunque omita tokens[].
+ * Índice 0 = YES (UP), índice 1 = NO (DOWN).
+ */
+function rebuildTokensFromClobIds(m) {
+  const clobRaw = m.clobTokenIds;
+  if (!clobRaw) return [];
+
+  try {
+    const clobIds = typeof clobRaw === "string" ? JSON.parse(clobRaw) : clobRaw;
+    if (!Array.isArray(clobIds) || clobIds.length < 2) return [];
+
+    return [
+      { outcome: "Yes", token_id: clobIds[0], price: null },
+      { outcome: "No",  token_id: clobIds[1], price: null },
+    ];
+  } catch {
+    return [];
+  }
+}
+
+/**
  * FIX v5: Obtiene el precio live del token desde el CLOB (midpoint).
  * El midpoint es el precio real que Polymarket muestra en su UI.
  * No requiere autenticación.
@@ -170,10 +200,19 @@ export async function GET() {
         continue;
       }
 
-      const m      = data[0];
-      const tokens = m.tokens || [];
-      const yesT   = tokens.find(t => t.outcome === "Yes");
-      const noT    = tokens.find(t => t.outcome === "No");
+      const m = data[0];
+
+      // ── FIX v6: fallback a clobTokenIds si tokens[] viene vacío ───────
+      let tokens = m.tokens || [];
+      let tokensRebuilt = false;
+      if (tokens.length === 0) {
+        tokens = rebuildTokensFromClobIds(m);
+        tokensRebuilt = tokens.length > 0;
+      }
+
+      const yesT = tokens.find(t => t.outcome === "Yes");
+      const noT  = tokens.find(t => t.outcome === "No");
+      // ── ────────────────────────────────────────────────────────────────
 
       // ── FIX v5: precios live desde CLOB ───────────────────────────────
       // Fetch en paralelo para ambos tokens (más rápido que secuencial)
@@ -183,10 +222,12 @@ export async function GET() {
       ]);
 
       // Precio final: CLOB live si disponible, Gamma como fallback
-      const yesPrice  = yesLivePrice  ?? (yesT ? parseFloat(yesT.price) : null);
-      const noPrice   = noLivePrice   ?? (noT  ? parseFloat(noT.price)  : null);
-      const yesSrc    = yesLivePrice  != null ? "clob" : "gamma";
-      const noSrc     = noLivePrice   != null ? "clob" : "gamma";
+      const yesGammaPrice = yesT?.price != null ? parseFloat(yesT.price) : null;
+      const noGammaPrice  = noT?.price  != null ? parseFloat(noT.price)  : null;
+      const yesPrice = yesLivePrice ?? (yesGammaPrice != null && !isNaN(yesGammaPrice) ? yesGammaPrice : null);
+      const noPrice  = noLivePrice  ?? (noGammaPrice  != null && !isNaN(noGammaPrice)  ? noGammaPrice  : null);
+      const yesSrc   = yesLivePrice != null ? "clob" : (yesGammaPrice != null ? "gamma" : "unavailable");
+      const noSrc    = noLivePrice  != null ? "clob" : (noGammaPrice  != null ? "gamma" : "unavailable");
       // ── ────────────────────────────────────────────────────────────────
 
       let endMs = parseEndMs(m, now);
@@ -215,16 +256,17 @@ export async function GET() {
           now_utc:          now.toISOString(),
           dst_active:       isDST(now),
           et_offset:        isDST(now) ? "UTC-4 (EDT)" : "UTC-5 (EST)",
+          tokens_rebuilt:   tokensRebuilt,  // ← nuevo: indica si se usó fallback
           price_sources:    { yes: yesSrc, no: noSrc },
-          gamma_prices:     {
-            yes: yesT ? parseFloat(yesT.price) : null,
-            no:  noT  ? parseFloat(noT.price)  : null,
-          },
+          gamma_prices:     { yes: yesGammaPrice, no: noGammaPrice },
           clob_prices:      { yes: yesLivePrice, no: noLivePrice },
         },
       };
 
-      return Response.json({ active: true, market, ts: Date.now() });
+      return Response.json(
+        { active: true, market, ts: Date.now() },
+        { headers: { "Cache-Control": "no-store" } },
+      );
 
     } catch (e) {
       errors.push({ slug, error: e.message });
