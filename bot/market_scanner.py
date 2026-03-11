@@ -1,68 +1,80 @@
 """
-bot/market_scanner.py
-Detecta el mercado BTC Up/Down activo en Polymarket y obtiene el Price to Beat.
+market_scanner.py  ·  bot/  (root)
+Detecta el mercado BTC Up/Down activo en Polymarket Gamma API.
+
+FIX v6 (PRECIOS LIVE DESDE CLOB):
+  La Gamma API devuelve precios cacheados en tokens[].price — no son en tiempo real.
+  Los precios dinámicos de Polymarket viven en el CLOB API (midpoint).
+  Ahora se enriquecen SIEMPRE desde CLOB tras obtener los token IDs:
+    GET https://clob.polymarket.com/midpoint?token_id={id} → {"mid": "0.73"}
+  Fallback: precio de Gamma si el CLOB falla.
 
 FIX v5 (TOKENS VACÍOS):
   Polymarket Gamma API a veces devuelve tokens: [] aunque el mercado esté activo.
   En ese caso, se reconstruyen los tokens desde clobTokenIds (índice 0 = YES, 1 = NO).
-  Además, el dict retornado por get_active_market() ahora incluye siempre "tokens"
-  para que strategy.execute_order() pueda encontrar el token_id correcto.
-  Sin este fix, las órdenes fallaban con "Token UP no encontrado en el mercado".
+  Sin este fix, strategy.execute_order() no encuentra el token y aborta la orden.
 
 FIX v4 (BINANCE BLOQUEADO EN RAILWAY):
   Railway despliega en servidores US donde Binance bloquea conexiones.
-  Se añade Kraken OHLC como fuente de fallback automático.
-  Kraken API: https://api.kraken.com/0/public/OHLC?pair=XBTUSD&interval=60
+  Se añade Kraken OHLC como fuente de fallback automático en get_open_1h_binance().
 
-FIX v3 (BUG SLUG HORA):
-  Polymarket nombra cada mercado por la hora de APERTURA de la vela 1H (ET).
-  get_open_1h_binance() usa limit=1 → klines[0] = vela actual en curso.
+FIX previos mantenidos:
+  - get_open_1h_binance() acepta slug opcional para pedir vela exacta por startTime.
+  - Consistente con bot/modules/market_scanner.py y /api/target?slug= del frontend.
 """
 import json
 import logging
 import requests
 from datetime import datetime, timedelta, timezone
 
-logger     = logging.getLogger(__name__)
-_SEPARATOR = "─" * 60
+logger = logging.getLogger(__name__)
 
 GAMMA_API     = "https://gamma-api.polymarket.com/markets"
+CLOB_MIDPOINT = "https://clob.polymarket.com/midpoint"
 BINANCE_KLINE = "https://api.binance.com/api/v3/klines"
 KRAKEN_OHLC   = "https://api.kraken.com/0/public/OHLC"
-TIMEOUT       = 8
+TIMEOUT       = 10
 
 MONTHS = [
     "january", "february", "march", "april", "may", "june",
     "july", "august", "september", "october", "november", "december",
 ]
 
+_last_slug = None
 
-# ── Helpers de timezone ET ────────────────────────────────────────────────────
 
-def _is_dst(utc_date: datetime) -> bool:
-    year      = utc_date.year
+# ── DST helper ────────────────────────────────────────────────────────────────
+
+def _is_dst(utc_dt: datetime) -> bool:
+    year      = utc_dt.year
     march     = datetime(year, 3, 1, tzinfo=timezone.utc)
-    dst_start = datetime(year, 3, 8 + (7 - march.weekday() - 1) % 7, tzinfo=timezone.utc)
+    dst_start = datetime(year, 3, 8 + (6 - march.weekday()) % 7, tzinfo=timezone.utc)
     nov       = datetime(year, 11, 1, tzinfo=timezone.utc)
-    dst_end   = datetime(year, 11, 1 + (7 - nov.weekday() - 1) % 7, tzinfo=timezone.utc)
-    return dst_start <= utc_date < dst_end
+    dst_end   = datetime(year, 11, 1 + (6 - nov.weekday()) % 7, tzinfo=timezone.utc)
+    return dst_start <= utc_dt < dst_end
 
 
-def _to_et(utc_date: datetime) -> datetime:
-    return utc_date + timedelta(hours=-4 if _is_dst(utc_date) else -5)
+def _to_et(utc_dt: datetime) -> datetime:
+    offset_h  = 4 if _is_dst(utc_dt) else 5
+    return utc_dt.replace(tzinfo=None) - timedelta(hours=offset_h)
 
+
+# ── Slug builders ─────────────────────────────────────────────────────────────
 
 def _format_hour_12(h24: int) -> str:
-    if h24 == 0:   return "12am"
-    if h24 == 12:  return "12pm"
+    if h24 == 0:  return "12am"
+    if h24 == 12: return "12pm"
     return f"{h24}am" if h24 < 12 else f"{h24 - 12}pm"
 
 
-def _build_slugs(now: datetime) -> list[str]:
+def _build_slugs(now: datetime | None = None) -> list[str]:
     """
-    Genera los slugs candidatos para el mercado activo.
-    Polymarket usa la hora de APERTURA de la vela 1H (ET) en el slug.
+    Genera slugs candidatos para el mercado activo.
+    El slug usa la hora de APERTURA de la vela 1H en ET.
     """
+    if now is None:
+        now = datetime.now(timezone.utc)
+
     candle_open_now = now.replace(minute=0, second=0, microsecond=0)
     slugs = []
 
@@ -78,7 +90,7 @@ def _build_slugs(now: datetime) -> list[str]:
         if slug not in slugs:
             slugs.append(slug)
 
-    logger.debug(f"[SCANNER] Slugs candidatos (hora apertura ET): {slugs}")
+    logger.debug(f"[SCANNER] Slugs candidatos: {slugs}")
     return slugs
 
 
@@ -137,16 +149,68 @@ def _slug_to_end_ms(slug: str, now: datetime) -> int | None:
         return None
 
 
-# ── Helpers de tokens ──────────────────────────────────────────────────────────
+# ── Helpers de tokens ─────────────────────────────────────────────────────────
+
+def _fetch_live_price(token_id: str) -> float | None:
+    """
+    FIX v6: Obtiene el precio LIVE del token desde el CLOB API (midpoint).
+    El midpoint es el precio justo entre el mejor bid y el mejor ask.
+    Este es el precio real que Polymarket muestra en la UI.
+
+    GET https://clob.polymarket.com/midpoint?token_id={id} → {"mid": "0.73"}
+    No requiere autenticación.
+    """
+    try:
+        r = requests.get(
+            CLOB_MIDPOINT,
+            params={"token_id": token_id},
+            timeout=5,
+        )
+        r.raise_for_status()
+        data  = r.json()
+        mid   = data.get("mid")
+        if mid is not None:
+            return float(mid)
+    except Exception as e:
+        logger.debug(f"[SCANNER] CLOB midpoint error para {str(token_id)[:16]}...: {e}")
+    return None
+
+
+def _enrich_token_prices(tokens: list[dict]) -> list[dict]:
+    """
+    FIX v6: Enriquece los tokens con precios LIVE desde el CLOB.
+    Reemplaza el precio de Gamma (cacheado) por el precio real del orderbook.
+    Si el CLOB falla, conserva el precio de Gamma como fallback.
+    """
+    enriched = []
+    for token in tokens:
+        token_id    = token.get("token_id", "")
+        gamma_price = float(token.get("price", 0.5))
+        live_price  = _fetch_live_price(token_id) if token_id else None
+
+        if live_price is not None:
+            logger.debug(
+                f"[SCANNER] Precio LIVE {token.get('outcome','?')}: "
+                f"{gamma_price:.4f} (Gamma) → {live_price:.4f} (CLOB)"
+            )
+            enriched.append({**token, "price": live_price, "price_source": "clob"})
+        else:
+            logger.debug(
+                f"[SCANNER] Precio FALLBACK {token.get('outcome','?')}: "
+                f"{gamma_price:.4f} (Gamma, CLOB no disponible)"
+            )
+            enriched.append({**token, "price": gamma_price, "price_source": "gamma"})
+
+    return enriched
+
 
 def _rebuild_tokens_from_clob(market_raw: dict) -> list[dict]:
     """
     FIX v5: Reconstruye la lista de tokens desde clobTokenIds cuando tokens[] viene vacío.
+    FIX v6: Los precios ya NO se hardcodean a 0.5 — se obtienen del CLOB en _enrich_token_prices().
 
     Polymarket Gamma API siempre incluye clobTokenIds aunque omita tokens[].
     Formato: JSON string o lista — índice 0 = YES (UP), índice 1 = NO (DOWN).
-    Los precios no están disponibles aquí, se usa 0.5 como placeholder;
-    el CLOB los actualizará en tiempo real al ejecutar la orden.
     """
     clob_raw = market_raw.get("clobTokenIds")
     if not clob_raw:
@@ -158,6 +222,7 @@ def _rebuild_tokens_from_clob(market_raw: dict) -> list[dict]:
             logger.warning(f"[SCANNER] clobTokenIds inesperado: {clob_raw}")
             return []
 
+        # Precio 0.5 es solo temporal — _enrich_token_prices() lo reemplazará con CLOB live
         tokens = [
             {"outcome": "Yes", "token_id": clob_ids[0], "price": 0.5},
             {"outcome": "No",  "token_id": clob_ids[1], "price": 0.5},
@@ -173,9 +238,10 @@ def _rebuild_tokens_from_clob(market_raw: dict) -> list[dict]:
         return []
 
 
-# ── Mercado activo ─────────────────────────────────────────────────────────────
+# ── Mercado activo ────────────────────────────────────────────────────────────
 
 def get_active_market() -> dict | None:
+    global _last_slug
     now   = datetime.now(timezone.utc)
     slugs = _build_slugs(now)
     logger.info(f"[SCANNER] Buscando mercado activo — slugs: {slugs}")
@@ -183,20 +249,31 @@ def get_active_market() -> dict | None:
     for slug in slugs:
         try:
             r = requests.get(GAMMA_API, params={"slug": slug}, timeout=TIMEOUT)
+            logger.debug(f"[SCANNER] HTTP {r.status_code} — slug={slug}")
             r.raise_for_status()
             data = r.json()
+
             if not data:
+                logger.debug(f"[SCANNER] Sin resultados para slug={slug}")
                 continue
 
-            m      = data[0]
-            tokens = m.get("tokens", [])
+            m        = data[0]
+            question = m.get("question", "—")
+            cond_id  = m.get("conditionId", m.get("condition_id", "—"))
+            end_date = m.get("endDateIso", m.get("end_date_iso", m.get("endDate", "—")))
+            tokens   = m.get("tokens", [])
 
-            # ── FIX v5: fallback a clobTokenIds si tokens viene vacío ──────────
+            # FIX v5: fallback a clobTokenIds si tokens viene vacío
             if not tokens:
                 tokens = _rebuild_tokens_from_clob(m)
+                if tokens:
+                    m["tokens"] = tokens
 
-            yes_p  = next((float(t["price"]) for t in tokens if t.get("outcome") == "Yes"), None)
-            no_p   = next((float(t["price"]) for t in tokens if t.get("outcome") == "No"),  None)
+            # FIX v6: enriquecer SIEMPRE con precios live del CLOB
+            tokens = _enrich_token_prices(tokens)
+
+            yes_p = next((t["price"] for t in tokens if t.get("outcome") == "Yes"), None)
+            no_p  = next((t["price"] for t in tokens if t.get("outcome") == "No"),  None)
 
             end_ms = _parse_end_ms(m)
             if not end_ms:
@@ -206,44 +283,59 @@ def get_active_market() -> dict | None:
 
             mins = max(0, (end_ms - int(now.timestamp() * 1000)) / 60_000) if end_ms else None
 
+            if _last_slug is None:
+                logger.info(f"[SCANNER] ✅ Mercado inicial detectado")
+            elif _last_slug != slug:
+                logger.info(
+                    f"[SCANNER] 🔄 CAMBIO DE SLUG:\n"
+                    f"           Anterior : {_last_slug}\n"
+                    f"           Nuevo    : {slug}"
+                )
+            _last_slug = slug
+
+            sources = {t.get("outcome"): t.get("price_source", "?") for t in tokens}
+            logger.info(
+                f"[SCANNER] Mercado activo:\n"
+                f"           Pregunta   : {question}\n"
+                f"           Slug       : {slug}\n"
+                f"           ConditionID: {cond_id}\n"
+                f"           Cierre     : {end_date}\n"
+                f"           YES price  : {yes_p:.4f} ({sources.get('Yes','?')})  "
+                f"NO price: {no_p:.4f} ({sources.get('No','?')})"
+            )
+
             market = {
-                "question":     m.get("question", "—"),
-                "condition_id": m.get("conditionId", m.get("condition_id", "—")),
+                "question":     question,
+                "condition_id": cond_id,
                 "slug":         slug,
                 "end_ms":       end_ms,
                 "yes_price":    yes_p,
                 "no_price":     no_p,
-                "tokens":       tokens,   # ← FIX v5: necesario para execute_order()
-                "volume":       m.get("volume"),
-                "liquidity":    m.get("liquidity"),
-                "url":          f"https://polymarket.com/event/{slug}",
+                "tokens":       tokens,
+                "neg_risk":     m.get("neg_risk", False),
+                "mins_to_close": round(mins, 2) if mins is not None else None,
             }
-
-            logger.info(_SEPARATOR)
-            logger.info(f"[SCANNER] ✅ Mercado encontrado: {market['question']}")
-            if mins is not None:
-                mm, ss = int(mins), int((mins % 1) * 60)
-                logger.info(f"[SCANNER]   Cierre : {mm:02d}:{ss:02d}  ({mins:.1f} min)")
-            logger.info(f"[SCANNER]   Tokens : {len(tokens)} (YES+NO)")
-            if yes_p: logger.info(f"[SCANNER]   YES    : ${yes_p:.4f}  (▲ UP  {yes_p*100:.1f}%)")
-            if no_p:  logger.info(f"[SCANNER]   NO     : ${no_p:.4f}  (▼ DOWN {no_p*100:.1f}%)")
-            logger.info(_SEPARATOR)
             return market
 
+        except requests.exceptions.Timeout:
+            logger.warning(f"[SCANNER] ⚠ Timeout ({TIMEOUT}s) en slug={slug}")
+        except requests.exceptions.ConnectionError as e:
+            logger.error(f"[SCANNER] ❌ Error de conexión para slug={slug}: {e}")
+        except requests.exceptions.HTTPError as e:
+            logger.warning(f"[SCANNER] ⚠ HTTP {r.status_code} para slug={slug}: {e}")
         except Exception as e:
-            logger.debug(f"[SCANNER] slug={slug} error: {e}")
-            continue
+            logger.error(f"[SCANNER] ❌ Error inesperado en slug={slug}: {type(e).__name__}: {e}")
 
-    logger.warning("[SCANNER] ⚠ No se encontró mercado activo")
+    logger.warning(f"[SCANNER] ⚠ Ningún mercado encontrado — slugs probados: {slugs}")
     return None
 
 
-# ── Price to Beat ──────────────────────────────────────────────────────────────
+# ── Price to Beat ─────────────────────────────────────────────────────────────
 
 def _slug_to_candle_start_ms(slug: str, now: datetime) -> int | None:
     """
     Parsea el slug para obtener el startTime UTC (ms) de la vela 1H.
-    ⚠️ El slug contiene la hora de APERTURA en ET → directamente el start.
+    El slug contiene la hora de APERTURA en ET → directamente el start.
     """
     try:
         parts = slug.split("-")
@@ -280,170 +372,59 @@ def _slug_to_candle_start_ms(slug: str, now: datetime) -> int | None:
 
 def _try_binance(slug: str | None, now: datetime) -> float | None:
     """Intenta obtener la vela 1H open desde Binance."""
-    params: dict = {"symbol": "BTCUSDT", "interval": "1h"}
-
+    params: dict = {"symbol": "BTCUSDT", "interval": "1h", "limit": "1"}
     if slug:
         start_ms = _slug_to_candle_start_ms(slug, now)
         if start_ms:
-            params["startTime"] = start_ms
-            params["limit"]     = 1
-            logger.debug(f"[SCANNER] Binance klines — startTime={start_ms} slug={slug}")
-        else:
-            logger.warning(f"[SCANNER] No se pudo parsear startTime del slug={slug}, usando limit=1")
-            params["limit"] = 1
-    else:
-        params["limit"] = 1
+            params["startTime"] = str(start_ms)
+            logger.debug(f"[SCANNER] Binance startTime desde slug: {start_ms}")
 
     try:
         r = requests.get(BINANCE_KLINE, params=params, timeout=TIMEOUT)
         r.raise_for_status()
         klines = r.json()
-
-        if not klines:
-            logger.warning("[SCANNER] ⚠ Binance devolvió lista vacía de klines")
-            return None
-
-        kline      = klines[0]
-        open_price = float(kline[1])
-        open_ts    = datetime.fromtimestamp(kline[0] / 1000, tz=timezone.utc).strftime("%H:%M:%S UTC")
-        close_ts   = datetime.fromtimestamp(kline[6] / 1000, tz=timezone.utc).strftime("%H:%M:%S UTC")
-
-        logger.info(
-            f"[SCANNER] Vela 1H Binance:\n"
-            f"           Open  : ${open_price:,.2f}  ← Price to Beat\n"
-            f"           High  : ${float(kline[2]):,.2f}\n"
-            f"           Low   : ${float(kline[3]):,.2f}\n"
-            f"           Close : ${float(kline[4]):,.2f}\n"
-            f"           Desde : {open_ts}  →  {close_ts}"
-        )
-        return open_price
-
-    except requests.exceptions.Timeout:
-        logger.warning(f"[SCANNER] ⚠ Binance Timeout ({TIMEOUT}s)")
-    except requests.exceptions.ConnectionError as e:
-        logger.warning(f"[SCANNER] ⚠ Binance conexión fallida: {e}")
-    except requests.exceptions.HTTPError as e:
-        logger.warning(f"[SCANNER] ⚠ Binance HTTP error: {e}")
+        if klines:
+            open_price = float(klines[0][1])
+            logger.info(f"[SCANNER] Binance 1H open: ${open_price:,.2f}")
+            return open_price
     except Exception as e:
-        logger.warning(f"[SCANNER] ⚠ Binance error: {type(e).__name__}: {e}")
-
+        logger.warning(f"[SCANNER] Binance no disponible: {e}")
     return None
 
 
-def _try_kraken(slug: str | None, now: datetime) -> float | None:
-    """
-    Fallback: obtiene la vela 1H open desde Kraken OHLC.
-
-    Formato de respuesta Kraken:
-      [time(unix_s), open, high, low, close, vwap, volume, count]
-
-    Si se pasa slug, busca la vela cuyo timestamp coincide con el start
-    derivado del slug. Si no, usa la última vela disponible.
-    """
-    params: dict = {"pair": "XBTUSD", "interval": 60}
-
-    start_s = None
-    if slug:
-        start_ms = _slug_to_candle_start_ms(slug, now)
-        if start_ms:
-            start_s         = start_ms // 1000
-            params["since"] = start_s
-            logger.debug(f"[SCANNER] Kraken OHLC — since={start_s} slug={slug}")
-
+def _try_kraken(now: datetime) -> float | None:
+    """Fallback: obtiene la vela 1H open desde Kraken."""
     try:
-        r = requests.get(KRAKEN_OHLC, params=params, timeout=TIMEOUT)
+        # since = inicio de la hora actual en segundos Unix
+        since = int(now.replace(minute=0, second=0, microsecond=0).timestamp())
+        r = requests.get(
+            KRAKEN_OHLC,
+            params={"pair": "XBTUSD", "interval": 60, "since": since},
+            timeout=TIMEOUT,
+        )
         r.raise_for_status()
-        data = r.json()
-
-        if data.get("error"):
-            logger.error(f"[SCANNER] ❌ Kraken API error: {data['error']}")
-            return None
-
-        result    = data.get("result", {})
-        pair_data = (
-            result.get("XXBTZUSD") or
-            result.get("XBTUSD")   or
-            result.get("XXBTUSDT") or
-            next((v for k, v in result.items() if k != "last"), None)
-        )
-
-        if not pair_data:
-            logger.error("[SCANNER] ❌ Kraken: no se encontraron datos de par")
-            return None
-
-        candle = None
-        if start_s:
-            candle = next((c for c in pair_data if int(c[0]) == start_s), None)
-            if candle is None:
-                candidates = [c for c in pair_data if int(c[0]) >= start_s]
-                candle     = candidates[0] if candidates else pair_data[-1]
-                logger.debug(
-                    f"[SCANNER] Kraken: timestamp exacto no encontrado, "
-                    f"usando vela más próxima (ts={candle[0]})"
-                )
-        else:
-            candle = pair_data[-1]
-
-        open_price = float(candle[1])
-        open_ts    = datetime.fromtimestamp(int(candle[0]), tz=timezone.utc).strftime("%H:%M:%S UTC")
-
-        logger.info(
-            f"[SCANNER] Vela 1H Kraken (fallback):\n"
-            f"           Open  : ${open_price:,.2f}  ← Price to Beat\n"
-            f"           High  : ${float(candle[2]):,.2f}\n"
-            f"           Low   : ${float(candle[3]):,.2f}\n"
-            f"           Close : ${float(candle[4]):,.2f}\n"
-            f"           Desde : {open_ts}"
-        )
-        return open_price
-
-    except requests.exceptions.Timeout:
-        logger.error(f"[SCANNER] ❌ Kraken Timeout ({TIMEOUT}s)")
-    except requests.exceptions.ConnectionError as e:
-        logger.error(f"[SCANNER] ❌ Kraken conexión fallida: {e}")
-    except requests.exceptions.HTTPError as e:
-        logger.error(f"[SCANNER] ❌ Kraken HTTP error: {e}")
+        data  = r.json()
+        ohlc  = data.get("result", {}).get("XXBTZUSD", [])
+        if ohlc:
+            # Kraken devuelve [time, open, high, low, close, vwap, volume, count]
+            open_price = float(ohlc[0][1])
+            logger.info(f"[SCANNER] Kraken 1H open (fallback): ${open_price:,.2f}")
+            return open_price
     except Exception as e:
-        logger.error(f"[SCANNER] ❌ Kraken error: {type(e).__name__}: {e}")
-
+        logger.warning(f"[SCANNER] Kraken no disponible: {e}")
     return None
 
 
 def get_open_1h_binance(slug: str | None = None) -> float | None:
     """
-    Devuelve el precio OPEN de la vela 1H del mercado activo (= Price to Beat).
+    Devuelve el precio de apertura (open) de la vela 1H actual en Binance.
+    Este es el 'Price to Beat' para el mercado BTC Up/Down.
 
-    Fuentes en orden de prioridad:
-      1. Binance klines API  (primario)
-      2. Kraken OHLC API     (fallback — activo cuando Railway bloquea Binance)
-
-    Si se pasa slug, ambas fuentes usan startTime para pedir la vela exacta.
+    Intenta Binance primero; si falla (bloqueado en Railway US), usa Kraken.
     """
-    now = datetime.now(timezone.utc)
-
+    now   = datetime.now(timezone.utc)
     price = _try_binance(slug, now)
-    if price is not None:
+    if price:
         return price
-
-    logger.warning("[SCANNER] ⚠ Binance no disponible — activando fallback Kraken...")
-    price = _try_kraken(slug, now)
-    if price is not None:
-        return price
-
-    logger.error("[SCANNER] ❌ Ambas fuentes fallaron (Binance + Kraken)")
-    return None
-
-
-if __name__ == "__main__":
-    import logging as _log
-    _log.basicConfig(
-        level=_log.DEBUG,
-        format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
-        datefmt="%H:%M:%S",
-    )
-    market = get_active_market()
-    slug   = market.get("slug") if market else None
-    target = get_open_1h_binance(slug=slug)
-    print(f"\nMercado : {market.get('question') if market else 'No encontrado'}")
-    print(f"Slug    : {slug or '—'}")
-    print(f"Target  : ${target:,.2f}" if target else "Target  : No disponible")
+    logger.warning("[SCANNER] Binance bloqueado/no disponible — intentando Kraken...")
+    return _try_kraken(now)
