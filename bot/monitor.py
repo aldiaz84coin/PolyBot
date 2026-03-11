@@ -1,6 +1,13 @@
 """
 monitor.py — Loop principal del bot: ventana horaria, stop loss, resolución
 
+v2.9 — BUG FIX CRÍTICO: señal WAIT ya no dispara execute_order
+  - La condición de entrada ahora incluye `signal.is_actionable`
+  - Antes: `if signal and not active_bet and fired_window != signal.window`
+  - Ahora:  `if signal and signal.is_actionable and not active_bet and fired_window != signal.window`
+  - Sin este check, una señal Direction.WAIT (truthy) pasaba el guard y llamaba
+    a execute_order() aunque la distancia fuera insuficiente.
+
 v2.8 — FIX: _fetch_exit_token_price usa CLOB live en lugar de Gamma cacheado:
   - Al activarse el stop loss, el precio del token ahora se obtiene del CLOB
     midpoint (precio real del orderbook), igual que durante la detección del
@@ -219,13 +226,15 @@ def _fetch_exit_token_price(bet: dict) -> float | None:
     Retorna el precio del token (0.0–1.0) o None si todo falla.
     """
     market    = bet.get("market", {})
-    direction = bet.get("direction", "UP")
-    outcome   = "Yes" if direction == "UP" else "No"
+    direction = bet.get("direction", "")
+    tokens    = market.get("tokens", [])
 
-    # ── Intento 1: CLOB live vía token_id guardado en la apuesta ─────────────
-    tokens   = market.get("tokens", [])
-    tok      = next((t for t in tokens if t.get("outcome") == outcome), None)
-    token_id = tok.get("token_id") if tok else None
+    # ── 1. Intentar CLOB midpoint con token_id ────────────────────────────
+    outcome_target = "Yes" if direction == "UP" else "No"
+    token_id = next(
+        (t.get("token_id") for t in tokens if t.get("outcome") == outcome_target),
+        None,
+    )
 
     if token_id:
         try:
@@ -235,55 +244,44 @@ def _fetch_exit_token_price(bet: dict) -> float | None:
                 timeout=5,
             )
             r.raise_for_status()
-            mid = r.json().get("mid")
-            if mid is not None:
-                live_price = float(mid)
-                logger.info(
-                    f"[MONITOR] 📡 Precio CLOB live al stop ({outcome}): {live_price:.4f}  "
-                    f"(token_id: {str(token_id)[:16]}...)"
-                )
-                return live_price
+            mid = float(r.json().get("mid", 0))
+            logger.info(
+                f"[MONITOR] 💹 Exit token price (CLOB midpoint): {mid:.4f}  "
+                f"token_id={str(token_id)[:16]}…"
+            )
+            return mid
         except Exception as e:
-            logger.debug(f"[MONITOR] CLOB midpoint error al stop: {e}")
+            logger.warning(f"[MONITOR] ⚠ CLOB midpoint falló para token {str(token_id)[:16]}: {e}")
 
-    # ── Intento 2: Gamma API por conditionId (fallback) ───────────────────────
-    condition_id = (
-        market.get("conditionId")
-        or market.get("condition_id")
-        or ""
-    )
+    # ── 2. Fallback: Gamma API por conditionId ────────────────────────────
+    cond_id = market.get("condition_id", "")
+    if cond_id:
+        try:
+            r = requests.get(
+                "https://gamma-api.polymarket.com/markets",
+                params={"conditionId": cond_id},
+                timeout=8,
+            )
+            r.raise_for_status()
+            data = r.json()
+            if data:
+                m_tokens = data[0].get("tokens", [])
+                price_fallback = next(
+                    (float(t.get("price", 0)) for t in m_tokens
+                     if t.get("outcome") == outcome_target),
+                    None,
+                )
+                if price_fallback is not None:
+                    logger.warning(
+                        f"[MONITOR] ⚠ Exit token price (Gamma fallback, puede ser cacheado): "
+                        f"{price_fallback:.4f}"
+                    )
+                    return price_fallback
+        except Exception as e:
+            logger.warning(f"[MONITOR] ⚠ Gamma fallback falló para conditionId={cond_id}: {e}")
 
-    if not condition_id:
-        logger.warning("[MONITOR] ⚠ _fetch_exit_token_price: sin token_id ni condition_id")
-        return None
-
-    try:
-        url = f"https://gamma-api.polymarket.com/markets?conditionIds={condition_id}"
-        resp = requests.get(url, timeout=6)
-        resp.raise_for_status()
-        data = resp.json()
-
-        if not data:
-            return None
-
-        mkt    = data[0] if isinstance(data, list) else data
-        tokens = mkt.get("tokens", [])
-        tok    = next((t for t in tokens if t.get("outcome") == outcome), None)
-        if not tok:
-            logger.warning(f"[MONITOR] ⚠ _fetch_exit_token_price: token '{outcome}' no encontrado en Gamma")
-            return None
-
-        # Gamma price = cacheado, menos preciso — pero mejor que nada
-        gamma_price = float(tok.get("price", 0))
-        logger.info(
-            f"[MONITOR] 📡 Precio Gamma (fallback) al stop ({outcome}): {gamma_price:.4f}  "
-            f"(condition_id: {condition_id[:12]}...)"
-        )
-        return gamma_price
-
-    except Exception as e:
-        logger.warning(f"[MONITOR] ⚠ _fetch_exit_token_price error: {e}")
-        return None
+    logger.error("[MONITOR] ❌ No se pudo obtener exit token price — usando fallback % fijo")
+    return None
 
 
 # ── Target con reintentos ─────────────────────────────────────────────────────
@@ -509,7 +507,8 @@ def run(cfg: dict):
             # ── Evaluación de señal ───────────────────────────────────────
             signal = evaluate(price, target, mins_left, cfg)
 
-            if signal and not active_bet and fired_window != signal.window:
+            # FIX v2.9: se añade signal.is_actionable para no ejecutar con WAIT
+            if signal and signal.is_actionable and not active_bet and fired_window != signal.window:
                 if ops_hoy < max_ops:
                     notify_signal_eval(
                         cfg, price, target,
