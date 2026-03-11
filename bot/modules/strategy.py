@@ -165,7 +165,7 @@ def execute_order(signal: Signal, market: dict, cfg: dict) -> dict | None:
 
     try:
         from py_clob_client.client import ClobClient
-        from py_clob_client.clob_types import ApiCreds, OrderArgs, OrderType
+        from py_clob_client.clob_types import ApiCreds, OrderArgs
 
         host        = "https://clob.polymarket.com"
         private_key = cfg["polymarket"]["private_key"]
@@ -193,7 +193,13 @@ def execute_order(signal: Signal, market: dict, cfg: dict) -> dict | None:
         )
 
         logger.info(f"[ORDER] 📤 Enviando orden FOK al CLOB...")
-        resp = client.create_and_post_order(order_args, OrderType.FOK)
+        try:
+            # py_clob_client >=0.14: segundo arg es CreateOrderOptions, no OrderType
+            from py_clob_client.clob_types import CreateOrderOptions
+            resp = client.create_and_post_order(order_args, CreateOrderOptions(tick_size=None))
+        except (ImportError, TypeError):
+            # Fallback para versiones anteriores o si falla el options
+            resp = client.create_and_post_order(order_args)
 
         order_id = resp.get("orderID", resp.get("id", "—"))
         status   = resp.get("status", "—")
