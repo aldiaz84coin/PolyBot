@@ -329,7 +329,7 @@ def run(cfg: dict):
             slug      = market.get("slug") if market else None
 
             if market and slug != prev_slug:
-                notify_market_found(cfg, market)
+                notify_market_found(cfg, market, mins_left)
                 logger.info(f"[MONITOR] ◈ Mercado: {slug}")
                 target = None   # forzar re-fetch del target con nuevo slug
 
