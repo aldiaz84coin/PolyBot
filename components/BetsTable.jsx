@@ -45,17 +45,15 @@ function fmtTime(iso) {
   } catch { return "—"; }
 }
 
-function calcRetorno(bet) {
-  const stake = bet?.stake ?? 0;
-  const odds  = bet?.odds  ?? 0.5;
-  if (!stake || !odds) return null;
-  return stake / odds;
-}
-
+/**
+ * Calcula el P&L en USD de una operación cerrada.
+ * Usa pnl_usd si está disponible (preferido — valor real).
+ * Fallback: calcula desde pnl% o resultado.
+ */
 function calcPnlUsd(bet) {
   if (!bet) return null;
-  if (bet.pnl_usd != null) return bet.pnl_usd;
-  if (bet.pnl == null)     return null;
+  if (bet.pnl_usd != null) return +bet.pnl_usd;
+  if (bet.pnl == null) return null;
   const stake = bet.stake ?? 0;
   const odds  = bet.odds  ?? 0.5;
   if (bet.result === "WIN")  return +(stake / odds - stake).toFixed(2);
@@ -64,11 +62,37 @@ function calcPnlUsd(bet) {
   return null;
 }
 
+/**
+ * Calcula el retorno total de una operación:
+ * - PENDING → retorno estimado si WIN: stake / odds_entrada
+ * - WIN / LOSS / STOP → retorno REAL = stake + pnl_usd (lo que se recibió)
+ *
+ * Esto evita mostrar siempre "stake * 2" cuando odds defaulteaba a 0.5.
+ */
+function calcRetorno(bet) {
+  const stake = bet?.stake ?? 0;
+  if (!stake) return null;
+
+  const isClosed = bet?.result && bet.result !== "PENDING";
+
+  if (isClosed) {
+    // Retorno real: cuánto dinero total se recibió de vuelta
+    const pnl = calcPnlUsd(bet);
+    return pnl != null ? stake + pnl : null;
+  }
+
+  // PENDING: retorno estimado si gana (stake / odds_entrada)
+  const odds = bet?.odds ?? 0.5;
+  return odds > 0 ? stake / odds : null;
+}
+
 function DetailRow({ bet }) {
-  const retorno = calcRetorno(bet);
-  const pnlUsd  = calcPnlUsd(bet);
-  const odds    = bet?.odds ?? 0.5;
-  const prob    = (odds * 100).toFixed(1);
+  const pnlUsd        = calcPnlUsd(bet);
+  const odds          = bet?.odds ?? 0.5;
+  const prob          = (odds * 100).toFixed(1);
+  const isClosed      = bet?.result && bet.result !== "PENDING";
+  const retornoEst    = odds > 0 ? bet.stake / odds : null;   // siempre estimado
+  const retornoReal   = isClosed && pnlUsd != null ? bet.stake + pnlUsd : null;
 
   return (
     <div style={{
@@ -82,16 +106,19 @@ function DetailRow({ bet }) {
       minWidth: TOTAL_W,
     }}>
       {[
-        ["Mercado slug",     bet.market_slug || "—"],
-        ["Odds de entrada",  `${odds.toFixed(3)}  (${prob}% prob)`],
-        ["Stake invertido",  fmtUSD(bet.stake)],
-        ["Retorno estimado", retorno ? fmtUSD(retorno) : "—"],
-        ["Umbral $",         bet.umbral ? `$${bet.umbral}` : "—"],
-        ["Distancia $",      bet.dist ? `$${Math.abs(+bet.dist).toFixed(0)}` : "—"],
-        ["P&L USD",          pnlUsd != null ? fmtUSD(pnlUsd) : "—"],
-        ["P&L %",            bet.pnl != null ? fmtPct(bet.pnl) : "—"],
-        ["Timestamp",        bet.ts ? new Date(bet.ts).toLocaleString("es-ES") : "—"],
-        ["Simulado",         bet.simulated ? "Sí" : "No"],
+        ["Mercado slug",      bet.market_slug || "—"],
+        ["Odds de entrada",   `${odds.toFixed(3)}  (${prob}% prob)`],
+        ["Stake invertido",   fmtUSD(bet.stake)],
+        ["Retorno estimado",  retornoEst ? fmtUSD(retornoEst) : "—"],
+        ...(isClosed ? [
+          ["Retorno real",    retornoReal != null ? fmtUSD(retornoReal) : "—"],
+        ] : []),
+        ["Umbral $",          bet.umbral ? `$${bet.umbral}` : "—"],
+        ["Distancia $",       bet.dist ? `$${Math.abs(+bet.dist).toFixed(0)}` : "—"],
+        ["P&L USD",           pnlUsd != null ? fmtUSD(pnlUsd) : "—"],
+        ["P&L %",             bet.pnl != null ? fmtPct(bet.pnl) : "—"],
+        ["Timestamp",         bet.ts ? new Date(bet.ts).toLocaleString("es-ES") : "—"],
+        ["Simulado",          bet.simulated ? "Sí" : "No"],
       ].map(([k, v]) => (
         <div key={k}>
           <span style={{ color: "#333", display: "block", marginBottom: 2, letterSpacing: "0.10em" }}>{k.toUpperCase()}</span>
@@ -209,10 +236,11 @@ export default function BetsTable({ bets = [] }) {
             const pnlUsd  = calcPnlUsd(bet);
             const retorno = calcRetorno(bet);
             const isOpen  = expanded === bet.id;
+            const isClosed = bet?.result && bet.result !== "PENDING";
 
             return (
               <div key={bet.id || Math.random()}>
-                {/* Fila principal — grid independiente */}
+                {/* Fila principal */}
                 <div
                   style={{
                     display: "grid",
@@ -242,9 +270,20 @@ export default function BetsTable({ bets = [] }) {
                     {bet.dist ? `${(+bet.dist) > 0 ? "+" : ""}$${Math.abs(+bet.dist).toFixed(0)}` : "—"}
                   </span>
                   <span style={{ color: "#888", fontVariantNumeric: "tabular-nums" }}>{fmtUSD(bet.stake)}</span>
-                  <span style={{ color: "#556", fontVariantNumeric: "tabular-nums", fontSize: 10 }}>
-                    {retorno ? fmtUSD(retorno) : "—"}
+
+                  {/* RETORNO: real para cerradas, estimado para pendientes */}
+                  <span style={{
+                    color: isClosed
+                      ? (retorno != null && retorno > bet.stake ? "var(--green)" : retorno != null && retorno < bet.stake ? "var(--red)" : "#556")
+                      : "#334",
+                    fontVariantNumeric: "tabular-nums",
+                    fontSize: 10,
+                  }}>
+                    {retorno != null
+                      ? (isClosed ? fmtUSD(retorno) : `~${fmtUSD(retorno)}`)
+                      : "—"}
                   </span>
+
                   <ResultBadge result={bet.result} />
                   <span style={{
                     color: pnlUsd == null ? "#444" : pnlUsd > 0 ? "var(--green)" : pnlUsd < 0 ? "var(--red)" : "#888",
@@ -255,7 +294,7 @@ export default function BetsTable({ bets = [] }) {
                   </span>
                 </div>
 
-                {/* Fila expandida — fuera del grid, no interfiere con el layout */}
+                {/* Fila expandida */}
                 {isOpen && <DetailRow bet={bet} />}
               </div>
             );

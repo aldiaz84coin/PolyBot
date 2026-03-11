@@ -246,38 +246,61 @@ export default function Dashboard() {
   }, [running, activeWindow?.key, decision?.signal, decision?.dir]);
 
   // ── Stop Loss ─────────────────────────────────────────────────────────────
+  // FIX v2.7: El P&L del stop ya no usa un porcentaje fijo (stake * stop_pct%).
+  // Ahora usa el precio REAL del token en Polymarket en el momento del stop:
+  //   shares = stake / odds_entrada
+  //   proceeds = shares * precio_actual_del_token
+  //   pnl_usd = proceeds - stake
+  // Esto refleja lo que realmente se recuperaría al vender la posición.
   useEffect(() => {
     if (!running || !activeBet || !price) return;
-    const pnl_pct = activeBet.dir === "UP"
+
+    // Trigger del stop: sigue basado en movimiento de BTC vs entry
+    const pnl_pct_btc = activeBet.dir === "UP"
       ? ((price - activeBet.entry) / activeBet.entry) * 100
       : ((activeBet.entry - price) / activeBet.entry) * 100;
-    if (pnl_pct <= -config.stop_loss_pct) {
-      const pnl_usd = +(activeBet.stake * (-config.stop_loss_pct / 100)).toFixed(2);
+
+    if (pnl_pct_btc <= -config.stop_loss_pct) {
+      // Precio actual del token en Polymarket (refleja la apuesta en tiempo real)
+      const tokenPrice = activeBet.dir === "UP"
+        ? (market?.tokens?.yes?.price ?? 0)
+        : (market?.tokens?.no?.price  ?? 0);
+
+      // Cálculo real: shares comprados × precio actual = lo que se recupera
+      const sharesHeld  = activeBet.stake / Math.max(activeBet.odds ?? 0.5, 0.001);
+      const proceeds    = sharesHeld * tokenPrice;
+      const pnl_usd     = +(proceeds - activeBet.stake).toFixed(2);
+      const pnl_pct_real = +((pnl_usd / activeBet.stake) * 100).toFixed(1);
+
       setBets(b => b.map(bet =>
         bet.id === activeBet.id
-          ? { ...bet, result: "STOP", pnl: -config.stop_loss_pct, pnl_usd }
+          ? { ...bet, result: "STOP", pnl: pnl_pct_real, pnl_usd }
           : bet
       ));
       setActiveBet(null);
-      applyResult(activeBet.stake, false, config.stop_loss_pct);
+      applyResult(activeBet.stake, false, Math.abs(pnl_pct_real));
       addLog(
-        `🛑 STOP LOSS activado — P&L: -${config.stop_loss_pct}% (${fmtUSD(pnl_usd)})`,
+        `🛑 STOP LOSS — P&L real: ${fmtUSD(pnl_usd)} (${pnl_pct_real >= 0 ? "+" : ""}${pnl_pct_real}%)` +
+        ` [token: ${tokenPrice.toFixed(3)} · shares: ${sharesHeld.toFixed(4)}]`,
         "error",
       );
       fetch("/api/bets", {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ id: activeBet.id, result: "STOP", pnl: -config.stop_loss_pct, pnl_usd }),
+        body: JSON.stringify({ id: activeBet.id, result: "STOP", pnl: pnl_pct_real, pnl_usd }),
       }).catch(() => {});
     }
-  }, [price, activeBet, running]);
+  }, [price, activeBet, running, market]);
 
   // ── Resolución al cierre ──────────────────────────────────────────────────
   useEffect(() => {
     if (!running || !activeBet || !price || !target || minsLeft > 0.8) return;
     const won   = activeBet.dir === "UP" ? price > activeBet.target : price < activeBet.target;
+    // odds reales de entrada (corregido desde v2.7 — ya no defaultea a 0.5)
     const odds  = activeBet.odds || 0.5;
     const stake = activeBet.stake;
+    // WIN: cada share resuelve a $1 → retorno real = stake / odds
+    // LOSS: cada share resuelve a $0 → pnl = -stake
     const pnl_usd = won
       ? +(stake / odds - stake).toFixed(2)
       : +(-stake).toFixed(2);
@@ -342,7 +365,7 @@ export default function Dashboard() {
           <span style={{ color: "var(--green)", fontWeight: 700, letterSpacing: "0.12em", fontSize: 14 }}>
             POLYMARKET BTC BOT
           </span>
-          <Tag color="#2a4a3a">v2.5</Tag>
+          <Tag color="#2a4a3a">v2.7</Tag>
           {marketActive
             ? <Tag color="#1a3a2a">MERCADO ACTIVO {marketSlugShort ? `· ${marketSlugShort}` : ""}</Tag>
             : <Tag color="#3a1a1a">SIN MERCADO</Tag>
@@ -401,55 +424,31 @@ export default function Dashboard() {
             <div style={{
               fontSize: 38, fontWeight: 700, lineHeight: 1,
               color: price && prev ? (price >= prev ? "var(--green)" : "var(--red)") : "var(--text)",
-              transition: "color 0.4s",
             }}>
-              {priceLoading ? "CARGANDO..." : price ? `$${fmt(price, 2)}` : "—"}
+              {price ? `$${fmt(price, 2)}` : (priceLoading ? "..." : "—")}
             </div>
-
-            {/* PRICE TO BEAT */}
-            <div style={{ marginTop: 10, fontSize: 11 }}>
-              <span style={{ color: "var(--muted)" }}>PRICE TO BEAT: </span>
-              <span style={{
-                color: targetIsStale ? "var(--red)" : targetError ? "var(--yellow)" : target ? "var(--yellow)" : "#444",
-                fontWeight: 700,
-              }}>
-                {target ? fmtUSD(target) : "—"}
-              </span>
-              {targetIsStale && (
-                <span style={{ fontSize: 9, color: "var(--red)", marginLeft: 6 }}>⚠ STALE</span>
-              )}
-              {!targetIsStale && !targetError && target && (
-                <span style={{ fontSize: 9, color: "#2a3a4a", marginLeft: 6 }}>
-                  ● {targetHourUtc !== null ? `VELA ${targetHourUtc}:00–${(targetHourUtc + 1) % 24}:00 UTC` : "BINANCE 1H"}
-                </span>
-              )}
-            </div>
-
-            <div style={{ marginTop: 4, fontSize: 11 }}>
-              DISTANCIA:{" "}
-              <span style={{
-                color: dist == null ? "var(--muted)" : dist > 0 ? "var(--green)" : "var(--red)",
-                fontWeight: 700,
-              }}>
-                {dist != null ? `${dist > 0 ? "+" : ""}$${Math.abs(dist).toFixed(0)}` : "—"}
-              </span>
-            </div>
-
-            {targetIsStale && (
-              <div style={{
-                marginTop: 8, padding: "5px 8px", fontSize: 10,
-                background: "rgba(255,68,102,0.08)", border: "1px solid rgba(255,68,102,0.3)",
-                borderRadius: 3, color: "var(--red)",
-              }}>
-                ⚠ Target de hora {targetHourUtc}h — refrescando...
+            {prev && price && (
+              <div style={{ fontSize: 11, color: price >= prev ? "var(--green)" : "var(--red)", marginTop: 4 }}>
+                {price >= prev ? "▲" : "▼"} ${Math.abs(price - prev).toFixed(2)}
               </div>
             )}
+            {dist != null && target && (
+              <div style={{ fontSize: 11, color: "#444", marginTop: 4 }}>
+                Dist target: <span style={{ color: dist > 0 ? "#4488ff" : "#ff8800", fontWeight: 700 }}>
+                  {dist > 0 ? "+" : ""}${dist.toFixed(0)}
+                </span>
+              </div>
+            )}
+            {priceError && <div style={{ fontSize: 9, color: "var(--red)", marginTop: 4 }}>{priceError}</div>}
           </div>
 
           {/* VENTANA */}
           <div style={{ background: "var(--bg)", padding: "20px 24px", borderRight: "1px solid var(--border)" }}>
-            <div style={{ fontSize: 9, color: "#444", letterSpacing: "0.15em", marginBottom: 8 }}>VENTANA ACTIVA</div>
-            <div style={{ fontSize: 30, fontWeight: 700, color: activeWindow ? activeWindow.color : "#222" }}>
+            <div style={{ fontSize: 9, color: "#444", letterSpacing: "0.15em", marginBottom: 8 }}>VENTANA</div>
+            <div style={{
+              fontSize: 22, fontWeight: 700,
+              color: activeWindow ? activeWindow.color : "#333",
+            }}>
               {activeWindow ? activeWindow.label : "— ESPERA —"}
             </div>
             {activeWindow && (
