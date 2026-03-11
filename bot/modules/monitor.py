@@ -1,11 +1,17 @@
 """
 monitor.py — Loop principal del bot: ventana horaria, stop loss, resolución
 
+v2.8 — FIX: _fetch_exit_token_price usa CLOB live en lugar de Gamma cacheado:
+  - Al activarse el stop loss, el precio del token ahora se obtiene del CLOB
+    midpoint (precio real del orderbook), igual que durante la detección del
+    mercado. Antes usaba Gamma API que devuelve precios cacheados → incorrecto.
+  - Fallback: Gamma API por conditionId si el CLOB falla o no hay token_id.
+
 v2.7 — Retornos reales desde Polymarket:
   - STOP LOSS: ya no usa porcentaje fijo (stake * stop_pct). Consulta el
-    precio actual del token en Polymarket Gamma API en el momento del stop
-    y calcula: pnl = (shares * exit_price) - stake. Si la consulta falla,
-    usa el porcentaje fijo como fallback.
+    precio actual del token en Polymarket en el momento del stop y calcula:
+    pnl = (shares * exit_price) - stake. Si la consulta falla, usa el
+    porcentaje fijo como fallback.
   - execute_order ahora siempre devuelve "odds" = precio real del token
     en el CLOB, por lo que monitor.py ya no defaultea a 0.5.
 
@@ -43,7 +49,8 @@ _SEPARATOR2 = "·" * 60
 MAX_TARGET_RETRIES = 5
 TARGET_RETRY_WAIT  = 10
 
-_WINDOW_POLL_S = 1
+_WINDOW_POLL_S  = 1
+_CLOB_MIDPOINT  = "https://clob.polymarket.com/midpoint"
 
 
 def _in_any_window(mins_left: float) -> bool:
@@ -141,12 +148,12 @@ def _load_historical_stats(csv_path: str) -> dict:
     Solo cuenta filas con resultado WIN, LOSS o STOP (no PENDING).
     """
     stats = {
-        "total_ops":    0,
-        "wins":         0,
-        "losses":       0,
-        "stops":        0,
+        "total_ops":      0,
+        "wins":           0,
+        "losses":         0,
+        "stops":          0,
         "total_invested": 0.0,
-        "total_pnl":    0.0,
+        "total_pnl":      0.0,
     }
     if not os.path.exists(csv_path):
         return stats
@@ -197,29 +204,60 @@ def _log_accumulated_stats(stats: dict):
 
 def _fetch_exit_token_price(bet: dict) -> float | None:
     """
-    Consulta Polymarket Gamma API para obtener el precio ACTUAL del token
-    en el momento del stop loss.
+    FIX v2.8: obtiene el precio LIVE del token desde el CLOB (midpoint) al
+    momento del stop loss.
+
+    Antes consultaba Gamma API (precios cacheados) — incorrecto e inconsistente
+    con el resto del sistema que ya usa CLOB para todos los precios de tokens.
 
     Lógica:
-      - shares = stake / odds_entrada  (tokens comprados)
-      - proceeds = shares * exit_price (lo que se recuperaría al vender)
-      - pnl_real = proceeds - stake
+      1. Extraer token_id del market guardado en la apuesta (ya enriquecido
+         con CLOB durante get_active_market())
+      2. Consultar CLOB midpoint → precio real del orderbook
+      3. Fallback: Gamma API por conditionId si CLOB falla o no hay token_id
 
-    Retorna el precio del token (0.0–1.0) o None si falla la consulta.
+    Retorna el precio del token (0.0–1.0) o None si todo falla.
     """
+    market    = bet.get("market", {})
+    direction = bet.get("direction", "UP")
+    outcome   = "Yes" if direction == "UP" else "No"
+
+    # ── Intento 1: CLOB live vía token_id guardado en la apuesta ─────────────
+    tokens   = market.get("tokens", [])
+    tok      = next((t for t in tokens if t.get("outcome") == outcome), None)
+    token_id = tok.get("token_id") if tok else None
+
+    if token_id:
+        try:
+            r = requests.get(
+                _CLOB_MIDPOINT,
+                params={"token_id": token_id},
+                timeout=5,
+            )
+            r.raise_for_status()
+            mid = r.json().get("mid")
+            if mid is not None:
+                live_price = float(mid)
+                logger.info(
+                    f"[MONITOR] 📡 Precio CLOB live al stop ({outcome}): {live_price:.4f}  "
+                    f"(token_id: {str(token_id)[:16]}...)"
+                )
+                return live_price
+        except Exception as e:
+            logger.debug(f"[MONITOR] CLOB midpoint error al stop: {e}")
+
+    # ── Intento 2: Gamma API por conditionId (fallback) ───────────────────────
+    condition_id = (
+        market.get("conditionId")
+        or market.get("condition_id")
+        or ""
+    )
+
+    if not condition_id:
+        logger.warning("[MONITOR] ⚠ _fetch_exit_token_price: sin token_id ni condition_id")
+        return None
+
     try:
-        market       = bet.get("market", {})
-        condition_id = (
-            market.get("conditionId")
-            or market.get("condition_id")
-            or ""
-        )
-        direction = bet.get("direction", "UP")
-
-        if not condition_id:
-            logger.warning("[MONITOR] ⚠ _fetch_exit_token_price: sin condition_id en market")
-            return None
-
         url = f"https://gamma-api.polymarket.com/markets?conditionIds={condition_id}"
         resp = requests.get(url, timeout=6)
         resp.raise_for_status()
@@ -230,20 +268,18 @@ def _fetch_exit_token_price(bet: dict) -> float | None:
 
         mkt    = data[0] if isinstance(data, list) else data
         tokens = mkt.get("tokens", [])
-
-        # Buscar el token correspondiente a la dirección
-        outcome = "Yes" if direction == "UP" else "No"
-        tok = next((t for t in tokens if t.get("outcome") == outcome), None)
+        tok    = next((t for t in tokens if t.get("outcome") == outcome), None)
         if not tok:
-            logger.warning(f"[MONITOR] ⚠ _fetch_exit_token_price: token '{outcome}' no encontrado")
+            logger.warning(f"[MONITOR] ⚠ _fetch_exit_token_price: token '{outcome}' no encontrado en Gamma")
             return None
 
-        price = float(tok.get("price", 0))
+        # Gamma price = cacheado, menos preciso — pero mejor que nada
+        gamma_price = float(tok.get("price", 0))
         logger.info(
-            f"[MONITOR] 📡 Precio real Polymarket al stop ({outcome}): {price:.4f}  "
+            f"[MONITOR] 📡 Precio Gamma (fallback) al stop ({outcome}): {gamma_price:.4f}  "
             f"(condition_id: {condition_id[:12]}...)"
         )
-        return price
+        return gamma_price
 
     except Exception as e:
         logger.warning(f"[MONITOR] ⚠ _fetch_exit_token_price error: {e}")
@@ -276,7 +312,7 @@ def run(cfg: dict):
     csv_path   = cfg.get("logging", {}).get("historial_csv", "logs/operaciones.csv")
 
     # ── Cargar y mostrar historial acumulado ──────────────────────────────
-    hist_stats  = _load_historical_stats(csv_path)
+    hist_stats = _load_historical_stats(csv_path)
     _log_accumulated_stats(hist_stats)
 
     # Acumuladores de sesión (se suman al histórico para totales)
@@ -297,9 +333,9 @@ def run(cfg: dict):
     fired_window = None
     last_hour    = -1
 
-    hour_wins    = 0
-    hour_losses  = 0
-    ops_hoy      = 0
+    hour_wins   = 0
+    hour_losses = 0
+    ops_hoy     = 0
 
     logger.info(_SEPARATOR)
     logger.info("[MONITOR] 🚀 Bot iniciado — esperando mercado activo…")
@@ -318,10 +354,10 @@ def run(cfg: dict):
                         hour_wins, hour_losses,
                         session_pnl, hist_stats["total_pnl"] + session_pnl,
                     )
-                hour_wins  = 0
+                hour_wins   = 0
                 hour_losses = 0
-                last_hour  = now_hour
-                ops_hoy    = 0
+                last_hour   = now_hour
+                ops_hoy     = 0
 
             # ── Obtener mercado (primero) ─────────────────────────────────
             prev_slug = slug
@@ -331,7 +367,7 @@ def run(cfg: dict):
             if market and slug != prev_slug:
                 notify_market_found(cfg, market, mins_left)
                 logger.info(f"[MONITOR] ◈ Mercado: {slug}")
-                target = None   # forzar re-fetch del target con nuevo slug
+                target = None  # forzar re-fetch del target con nuevo slug
 
             if not market:
                 if prev_slug:
@@ -344,6 +380,7 @@ def run(cfg: dict):
             if target is None:
                 target = _fetch_target_with_retry(cfg, now_hour, slug=slug)
                 if target:
+                    notify_target_change(cfg, target, now_hour)
                     logger.info(f"[MONITOR] 🎯 Target: ${target:,.2f}")
 
             price = get_btc_price()
@@ -366,18 +403,18 @@ def run(cfg: dict):
 
                 # ── Stop Loss ─────────────────────────────────────────────
                 if pnl_btc <= -stop_pct * 100:
-                    # Consultar precio real del token en Polymarket al momento del stop
+                    # FIX v2.8: precio CLOB live (no Gamma cacheado)
                     exit_token_price = _fetch_exit_token_price(active_bet)
 
                     if exit_token_price is not None:
                         # Cálculo REAL: shares comprados × precio actual del token
-                        entry_odds = active_bet.get("odds", 0.5)
-                        shares     = stake_ / max(entry_odds, 0.001)
-                        proceeds   = round(shares * exit_token_price, 2)
-                        loss_usd   = round(proceeds - stake_, 2)
+                        entry_odds   = active_bet.get("odds", 0.5)
+                        shares       = stake_ / max(entry_odds, 0.001)
+                        proceeds     = round(shares * exit_token_price, 2)
+                        loss_usd     = round(proceeds - stake_, 2)
                         pnl_pct_stop = round((loss_usd / stake_) * 100, 2) if stake_ > 0 else 0
                         logger.warning(
-                            f"[MONITOR] 🛑 STOP LOSS (precio real Polymarket)\n"
+                            f"[MONITOR] 🛑 STOP LOSS (precio real CLOB)\n"
                             f"           Odds entrada  : {entry_odds:.4f}\n"
                             f"           Shares        : {shares:.4f}\n"
                             f"           Exit price    : {exit_token_price:.4f}\n"
@@ -412,7 +449,7 @@ def run(cfg: dict):
                 if mins_left < 0.5:
                     won  = (dir_ == "UP"   and price > active_bet["target"]) or \
                            (dir_ == "DOWN" and price < active_bet["target"])
-                    # Odds reales de entrada (ya corregido desde v2.7)
+                    # Odds reales de entrada (corregido desde v2.7)
                     odds = active_bet.get("odds", 0.5)
 
                     if won:
@@ -483,7 +520,7 @@ def run(cfg: dict):
                     result_order = execute_order(signal, market, cfg)
                     if result_order:
                         ops_hoy += 1
-                        # FIX v2.7: result_order["odds"] ahora siempre contiene el
+                        # FIX v2.7: result_order["odds"] siempre contiene el
                         # precio real del token (no defaultea a 0.5)
                         active_bet = {
                             "id":          result_order.get("id", ""),
