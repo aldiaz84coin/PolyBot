@@ -1,5 +1,10 @@
 """
 strategy.py — Lógica de decisión UP/DOWN y ejecución de órdenes CLOB
+
+FIX v2.7: execute_order siempre devuelve "odds" (precio real del token en
+Polymarket en el momento de la compra). Antes se hacía result.get("odds", 0.5)
+en monitor.py y siempre devolvía 0.5 porque ni la respuesta real del CLOB
+ni la respuesta simulada incluían ese campo. Ahora se inyecta explícitamente.
 """
 import logging
 from dataclasses import dataclass, field
@@ -127,6 +132,9 @@ def execute_order(signal: Signal, market: dict, cfg: dict) -> dict | None:
     """
     Ejecuta una orden Market FOK en el CLOB de Polymarket.
     Devuelve el resultado de la orden o None si falla.
+
+    IMPORTANTE: siempre incluye "odds" = precio real del token en Polymarket
+    en el momento de la compra, para cálculo correcto de retorno/P&L.
     """
     stake    = cfg["capital"]["stake_usdc"]
     tokens   = market.get("tokens", [])
@@ -151,16 +159,19 @@ def execute_order(signal: Signal, market: dict, cfg: dict) -> dict | None:
         )
         return None
 
-    token_id = token["token_id"]
-    price    = float(token.get("price", 0.5))
-    size     = round(stake / price, 4)
+    token_id  = token["token_id"]
+    # ── Precio real del token en Polymarket (odds de entrada) ────────────
+    # Este valor es el precio por share en Polymarket y DEBE propagarse al
+    # caller para calcular el retorno real (shares = stake / odds).
+    entry_odds = float(token.get("price", 0.5))
+    size       = round(stake / entry_odds, 4)
 
     logger.info(
         f"[ORDER] Parámetros CLOB:\n"
         f"         Token ID  : {token_id}\n"
-        f"         Precio    : {price:.4f}  (prob. implícita {price*100:.1f}%)\n"
+        f"         Precio    : {entry_odds:.4f}  (prob. implícita {entry_odds*100:.1f}%)\n"
         f"         Size      : {size:.4f} tokens\n"
-        f"         Coste est.: ${price * size:.2f} USDC"
+        f"         Coste est.: ${entry_odds * size:.2f} USDC"
     )
 
     try:
@@ -208,12 +219,12 @@ def execute_order(signal: Signal, market: dict, cfg: dict) -> dict | None:
             chain_id=chain_id,
             signature_type=sig_type,
             funder=funder,
-            creds=creds,          # ← Level 2 auth
+            creds=creds,
         )
 
         order_args = OrderArgs(
             token_id=token_id,
-            price=price,
+            price=entry_odds,
             size=size,
             side="BUY",
         )
@@ -229,27 +240,40 @@ def execute_order(signal: Signal, market: dict, cfg: dict) -> dict | None:
         status   = resp.get("status", "—")
         filled   = resp.get("sizeFilled", resp.get("size_filled", "—"))
 
+        # ── Intentar obtener el precio real de fill del CLOB ──────────────
+        # Algunos brokers devuelven avgPrice o price en la respuesta.
+        # Si no está disponible, usamos entry_odds (precio de la orden).
+        fill_price = resp.get("avgPrice") or resp.get("price") or resp.get("avg_price")
+        actual_odds = float(fill_price) if fill_price else entry_odds
+
         logger.info(
             f"[ORDER] ✅ Orden ejecutada:\n"
             f"         Order ID  : {order_id}\n"
             f"         Status    : {status}\n"
             f"         Filled    : {filled}\n"
+            f"         Odds real : {actual_odds:.4f}\n"
             f"         Raw resp  : {resp}"
         )
-        return resp
+
+        # FIX: inyectamos "odds" con el precio real de entrada para que
+        # monitor.py pueda calcular retorno/P&L correctamente.
+        return {**resp, "odds": actual_odds}
 
     except ImportError:
         logger.warning(
             f"[ORDER] ⚠ py-clob-client no instalado — ejecutando en modo SIMULACIÓN\n"
-            f"         Orden simulada: {signal.direction.value} ${stake} USDC"
+            f"         Orden simulada: {signal.direction.value} ${stake} USDC  "
+            f"Odds: {entry_odds:.4f}"
         )
+        # FIX: incluir "odds" también en la respuesta simulada
         return {
             "simulated": True,
             "direction": signal.direction.value,
-            "stake": stake,
-            "token_id": token_id,
-            "price": price,
-            "size": size,
+            "stake":     stake,
+            "token_id":  token_id,
+            "price":     entry_odds,
+            "size":      size,
+            "odds":      entry_odds,   # ← clave corregida
         }
 
     except Exception as e:
