@@ -1,17 +1,15 @@
 """
 monitor.py — Loop principal del bot: ventana horaria, stop loss, resolución
 
-v2.5 — Mejoras de consistencia y trazabilidad:
-  - Polling adaptativo: 1s dentro de ventana activa, interval_s fuera
-    → igual frecuencia de evaluación que el dashboard
-  - CSV de operaciones: cada trade se persiste en logs/operaciones.csv
-    (entrada y cierre con todos los detalles monetarios)
-  - Detalles de operación completos en log: stake, odds, retorno estimado
-  - notify_signal_eval() ahora se llama en CADA ciclo dentro de la ventana
-    (no solo al entrar) para que Telegram refleje el estado en tiempo real
+v2.6 — Historial persistente y stats acumuladas:
+  - _load_historical_stats(): lee el CSV al arrancar y muestra el acumulado
+    total (ops, invertido, P&L neto, W/L, win-rate) antes del primer ciclo
+  - notify_startup_summary(): envía las stats acumuladas por Telegram al inicio
+  - notify_hour_summary(): incluye ahora P&L de la sesión + P&L acumulado
+  - Resumen de sesión al detener (Ctrl+C) incluye P&L de la sesión
 
+v2.5 — Polling adaptativo, CSV de operaciones, detalles monetarios.
 FIX: mercado se obtiene ANTES que el target para pasar el slug a Binance.
-     get_open_1h_binance(slug=) usa startTime para pedir la vela exacta.
 """
 import csv
 import logging
@@ -39,14 +37,12 @@ _SEPARATOR  = "─" * 60
 _SEPARATOR2 = "·" * 60
 
 MAX_TARGET_RETRIES = 5
-TARGET_RETRY_WAIT  = 10   # segundos entre reintentos
+TARGET_RETRY_WAIT  = 10
 
-# Intervalo rápido DENTRO de ventana activa — iguala la frecuencia del dashboard
 _WINDOW_POLL_S = 1
 
 
 def _in_any_window(mins_left: float) -> bool:
-    """Devuelve True si mins_left cae dentro de cualquier ventana de operación."""
     for w in WINDOWS:
         if w["min"] <= mins_left < w["max"]:
             return True
@@ -81,16 +77,15 @@ _CSV_HEADERS = [
     "entry_price", "target_price", "distancia",
     "umbral",
     "odds", "stake_usd", "tokens_comprados",
-    "retorno_estimado_usd",  # stake / odds (si gana)
+    "retorno_estimado_usd",
     "pnl_usd", "pnl_pct",
-    "resultado",             # WIN / LOSS / STOP / PENDING
+    "resultado",
     "market_slug",
     "simulado",
 ]
 
 
 def _ensure_csv(path: str):
-    """Crea el archivo CSV con cabecera si no existe."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     if not os.path.exists(path):
         with open(path, "w", newline="", encoding="utf-8") as f:
@@ -99,7 +94,6 @@ def _ensure_csv(path: str):
 
 
 def _csv_write_row(path: str, row: dict):
-    """Añade una fila al CSV (crea cabecera si el archivo es nuevo)."""
     try:
         _ensure_csv(path)
         with open(path, "a", newline="", encoding="utf-8") as f:
@@ -109,18 +103,10 @@ def _csv_write_row(path: str, row: dict):
         logger.warning(f"[MONITOR] ⚠ Error escribiendo CSV: {e}")
 
 
-def _build_trade_row(
-    bet: dict,
-    result: str,
-    ts_cierre: str,
-    pnl_usd: float,
-    pnl_pct: float,
-) -> dict:
-    """Construye el dict para una fila del CSV."""
+def _build_trade_row(bet, result, ts_cierre, pnl_usd, pnl_pct):
     stake   = bet.get("stake", 0)
     odds    = bet.get("odds", 0.5)
     retorno = round(stake / odds, 2) if odds > 0 else 0
-
     return {
         "id":                    bet.get("id", ""),
         "ts_entrada":            bet.get("ts_entrada", ""),
@@ -143,214 +129,255 @@ def _build_trade_row(
     }
 
 
+# ── Historial acumulado ───────────────────────────────────────────────────────
+
+def _load_historical_stats(csv_path: str) -> dict:
+    """
+    Lee el CSV de operaciones cerradas y devuelve las stats acumuladas.
+    Solo cuenta filas con resultado WIN, LOSS o STOP (no PENDING).
+    """
+    stats = {
+        "total_ops":      0,
+        "wins":           0,
+        "losses":         0,
+        "stops":          0,
+        "total_invested": 0.0,
+        "total_pnl":      0.0,
+    }
+    if not os.path.exists(csv_path):
+        return stats
+
+    try:
+        with open(csv_path, "r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                resultado = row.get("resultado", "").upper()
+                if resultado not in ("WIN", "LOSS", "STOP"):
+                    continue
+                stats["total_ops"] += 1
+                try:
+                    stats["total_invested"] += float(row.get("stake_usd") or 0)
+                    stats["total_pnl"]      += float(row.get("pnl_usd")   or 0)
+                except ValueError:
+                    pass
+                if resultado == "WIN":
+                    stats["wins"] += 1
+                elif resultado == "LOSS":
+                    stats["losses"] += 1
+                elif resultado == "STOP":
+                    stats["stops"] += 1
+    except Exception as e:
+        logger.warning(f"[MONITOR] ⚠ Error leyendo historial CSV: {e}")
+
+    return stats
+
+
+def _log_accumulated_stats(stats: dict):
+    """Muestra las stats acumuladas en el log al arrancar el bot."""
+    total    = stats["total_ops"]
+    wins     = stats["wins"]
+    losses   = stats["losses"] + stats["stops"]
+    wr       = round(wins / (wins + losses) * 100) if (wins + losses) > 0 else 0
+    invested = stats["total_invested"]
+    pnl      = stats["total_pnl"]
+    sign     = "+" if pnl >= 0 else ""
+
+    logger.info(_SEPARATOR)
+    logger.info(f"[MONITOR] 📊 HISTORIAL ACUMULADO (CSV)")
+    logger.info(f"[MONITOR]   Operaciones cerradas : {total}")
+    logger.info(f"[MONITOR]   W / L+STOP           : {wins}W / {losses}L")
+    logger.info(f"[MONITOR]   Win Rate              : {wr}%")
+    logger.info(f"[MONITOR]   Total invertido       : ${invested:,.2f} USDC")
+    logger.info(f"[MONITOR]   P&L neto acumulado    : {sign}${pnl:,.2f} USDC")
+    logger.info(_SEPARATOR)
+
+
 # ── Target con reintentos ─────────────────────────────────────────────────────
 
 def _fetch_target_with_retry(cfg: dict, hour_utc: int, slug: str | None = None) -> float | None:
-    """
-    Obtiene el Price to Beat con reintentos y notificación Telegram.
-    Si se pasa slug, get_open_1h_binance() usará startTime para pedir
-    la vela exacta del mercado activo.
-    """
     for attempt in range(1, MAX_TARGET_RETRIES + 1):
-        logger.info(
-            f"[MONITOR] Obteniendo Price to Beat (intento {attempt}/{MAX_TARGET_RETRIES})"
-            + (f" — slug: {slug}" if slug else "") + "..."
-        )
-        target = get_open_1h_binance(slug=slug) if slug else get_open_1h_binance()
-
-        if target is not None:
-            is_retry = attempt > 1
-            logger.info(
-                f"[MONITOR] ✅ Price to Beat fijado: ${target:,.2f}  "
-                f"(hora {hour_utc:02d}:00 UTC)"
-                + ("  ← reintento exitoso" if is_retry else "")
-            )
-            notify_target_change(cfg, target, hour_utc, is_retry=is_retry)
-            return target
-
+        try:
+            t = get_open_1h_binance(slug=slug)
+            if t:
+                return t
+        except Exception as e:
+            logger.warning(f"[MONITOR] ⚠ Target intento {attempt}/{MAX_TARGET_RETRIES}: {e}")
         if attempt < MAX_TARGET_RETRIES:
-            logger.warning(
-                f"[MONITOR] ⚠ Intento {attempt} fallido — reintentando en {TARGET_RETRY_WAIT}s..."
-            )
             time.sleep(TARGET_RETRY_WAIT)
-        else:
-            logger.error(
-                f"[MONITOR] ❌ No se pudo obtener el Price to Beat tras "
-                f"{MAX_TARGET_RETRIES} intentos — el bot no operará esta hora."
-            )
-            notify_target_failed(cfg, hour_utc, MAX_TARGET_RETRIES)
-
+    notify_target_failed(cfg, hour_utc)
     return None
 
 
 # ── Loop principal ────────────────────────────────────────────────────────────
 
 def run(cfg: dict):
-    """Arranca el loop principal del bot."""
-    interval  = cfg["strategy"]["monitor_intervalo_s"]
-    stop_pct  = cfg["strategy"]["stop_loss_pct"]
-    stake     = cfg["capital"]["stake_usdc"]
-    max_ops   = cfg["capital"]["max_operaciones_dia"]
-    csv_path  = cfg.get("logging", {}).get("historial_csv", "logs/operaciones.csv")
+    stake      = cfg["capital"]["stake_usdc"]
+    max_ops    = cfg["capital"]["max_operaciones_dia"]
+    interval   = cfg["strategy"].get("monitor_intervalo_s", 5)
+    stop_pct   = cfg["strategy"].get("stop_loss_pct", 0.5)
+    csv_path   = cfg.get("logging", {}).get("historial_csv", "logs/operaciones.csv")
 
-    logger.info(_SEPARATOR)
-    logger.info(f"[MONITOR] 🤖 POLYMARKET BTC BOT — INICIADO")
-    logger.info(f"[MONITOR] {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
-    logger.info(_SEPARATOR2)
-    logger.info(f"[MONITOR] Configuración:")
-    logger.info(f"[MONITOR]   Stake/op     : ${stake} USDC")
-    logger.info(f"[MONITOR]   Max ops/día  : {max_ops}")
-    logger.info(f"[MONITOR]   Stop loss    : {stop_pct * 100:.0f}%")
-    logger.info(f"[MONITOR]   Intervalo    : {interval}s (ventana activa: {_WINDOW_POLL_S}s)")
-    logger.info(f"[MONITOR]   CSV trades   : {csv_path}")
-    logger.info(f"[MONITOR]   Umbrales     : "
-                f"T-20=${cfg['strategy']['t20_umbral_usd']}  "
-                f"T-15=${cfg['strategy']['t15_umbral_usd']}  "
-                f"T-10=${cfg['strategy']['t10_umbral_usd']}  "
-                f"T-5=${cfg['strategy']['t5_umbral_usd']}")
-    logger.info(_SEPARATOR)
+    # ── Cargar y mostrar historial acumulado ──────────────────────────────
+    hist_stats  = _load_historical_stats(csv_path)
+    _log_accumulated_stats(hist_stats)
 
-    _ensure_csv(csv_path)
-    notify_start(cfg)
+    # Acumuladores de sesión (se suman al histórico para totales)
+    session_pnl      = 0.0
+    session_invested = 0.0
+    session_wins     = 0
+    session_losses   = 0
 
+    # Variables de control
+    target       = None
+    prev_target  = None
+    hour_wins    = 0
+    hour_losses  = 0
     ops_hoy      = 0
     active_bet   = None
     fired_window = None
-    target       = None
-    current_hour = None
-    hour_wins    = 0
-    hour_losses  = 0
-    last_market  = None
-    last_window  = None
-    op_counter   = 0   # ID secuencial de operación
+    prev_hour    = None
+    prev_market  = None
+
+    logger.info(_SEPARATOR)
+    logger.info(f"[MONITOR] 🚀 Bot iniciado — stake=${stake} USDC  max_ops={max_ops}/día")
+    logger.info(f"[MONITOR]    Stop loss: {stop_pct*100:.0f}%  Intervalo: {interval}s")
+    logger.info(_SEPARATOR)
+    notify_start(cfg)
 
     try:
         while True:
-            now  = datetime.now(timezone.utc)
-            hour = now.hour
+            now       = datetime.now(timezone.utc)
+            mins_left = 60 - now.minute - now.second / 60
+            cur_hour  = now.hour
 
-            # ── Cambio de hora ────────────────────────────────────────────────
-            if hour != current_hour:
+            # ── Reinicio horario ──────────────────────────────────────────
+            if prev_hour is not None and cur_hour != prev_hour:
                 logger.info(_SEPARATOR)
-                logger.info(f"[MONITOR] 🕐 NUEVO CICLO HORARIO — {now.strftime('%Y-%m-%d %H:00 UTC')}")
+                logger.info(f"[MONITOR] 🕐 Hora {prev_hour:02d}:00 UTC finalizada")
+                logger.info(f"[MONITOR]    Sesión esta hora: {hour_wins}W / {hour_losses}L")
 
-                if current_hour is not None:
-                    wr = int(hour_wins / (hour_wins + hour_losses) * 100) \
-                         if (hour_wins + hour_losses) > 0 else 0
-                    logger.info(
-                        f"[MONITOR] Resumen hora anterior: "
-                        f"W={hour_wins}  L={hour_losses}  WR={wr}%  Ops={ops_hoy}/{max_ops}"
-                    )
-                    if target:
-                        notify_hour_summary(cfg, current_hour, hour_wins, hour_losses, ops_hoy, target)
-                    hour_wins   = 0
-                    hour_losses = 0
+                # P&L acumulado total (histórico + sesión actual)
+                total_pnl = hist_stats["total_pnl"] + session_pnl
+                sign_t    = "+" if total_pnl >= 0 else ""
+                sign_s    = "+" if session_pnl >= 0 else ""
+                logger.info(
+                    f"[MONITOR]    P&L sesión         : {sign_s}${session_pnl:,.2f} USDC "
+                    f"(invertido ${session_invested:,.2f})"
+                )
+                logger.info(
+                    f"[MONITOR]    P&L acumulado total: {sign_t}${total_pnl:,.2f} USDC"
+                )
+                logger.info(_SEPARATOR)
 
-                current_hour = hour
+                notify_hour_summary(
+                    cfg, prev_hour,
+                    wins=hour_wins,
+                    losses=hour_losses,
+                    ops=hour_wins + hour_losses,
+                    target=target or 0,
+                )
+
+                hour_wins   = 0
+                hour_losses = 0
+                target      = None
+                active_bet  = None
                 fired_window = None
-                last_window  = None
 
-                if active_bet:
-                    logger.warning(
-                        f"[MONITOR] ⚠ Apuesta sin resolver al cambiar de hora — "
-                        f"descartando: {active_bet['direction']} @ ${active_bet['entry']:,.2f}"
-                    )
-                    # Registrar en CSV como PENDIENTE sin cerrar
-                    ts_now = datetime.now(timezone.utc).isoformat()
-                    row = _build_trade_row(active_bet, "ABANDONED", ts_now, 0.0, 0.0)
-                    _csv_write_row(csv_path, row)
-                    active_bet = None
+            prev_hour = cur_hour
 
-                # ── Mercado PRIMERO para obtener el slug ──────────────────────
-                logger.info("[MONITOR] 🔍 Buscando mercado activo...")
-                last_market = get_active_market()
-                slug = last_market.get("slug") if last_market else None
-                if last_market:
-                    notify_market_found(cfg, last_market, _mins_to_close())
-                    logger.info(f"[MONITOR] 📌 Mercado: {slug}")
-                else:
-                    logger.warning("[MONITOR] ⚠ No se encontró mercado activo para la nueva hora.")
-                    notify_market_lost(cfg, [])
+            # ── Mercado activo ────────────────────────────────────────────
+            try:
+                market = get_active_market()
+            except Exception as e:
+                logger.warning(f"[MONITOR] ⚠ Error obteniendo mercado: {e}")
+                market = None
 
-                # ── Target (Price to Beat) ────────────────────────────────────
-                target = _fetch_target_with_retry(cfg, hour, slug=slug)
-                if not target:
-                    logger.warning(
-                        f"[MONITOR] ⚠ Sin Price to Beat — "
-                        f"el bot no operará esta hora."
-                    )
+            if market and not prev_market:
+                logger.info(f"[MONITOR] 🟢 Mercado detectado: {market.get('slug', '—')}")
+                notify_market_found(cfg, market)
+            elif not market and prev_market:
+                logger.warning(f"[MONITOR] 🔴 Mercado perdido")
+                notify_market_lost(cfg, prev_market)
 
-                logger.info(_SEPARATOR)
+            prev_market = market
+            slug = market.get("slug") if market else None
 
-            # ── Sin target → esperar ──────────────────────────────────────────
-            if not target:
-                logger.debug(f"[MONITOR] Sin target — skip ciclo")
+            if not market:
                 time.sleep(interval)
                 continue
 
-            # ── Obtener precio BTC ────────────────────────────────────────────
+            # ── Price to Beat ─────────────────────────────────────────────
+            new_target = _fetch_target_with_retry(cfg, cur_hour, slug=slug)
+            if new_target and new_target != prev_target:
+                if prev_target:
+                    logger.info(
+                        f"[MONITOR] 🎯 Target actualizado: "
+                        f"${prev_target:,.2f} → ${new_target:,.2f}"
+                    )
+                    notify_target_change(cfg, prev_target, new_target)
+                else:
+                    logger.info(f"[MONITOR] 🎯 Price to Beat: ${new_target:,.2f}")
+                target      = new_target
+                prev_target = new_target
+
+            if not target:
+                time.sleep(interval)
+                continue
+
+            # ── Precio BTC ────────────────────────────────────────────────
             try:
                 price = get_btc_price()
             except Exception as e:
-                logger.error(f"[MONITOR] ❌ Error obteniendo precio BTC: {type(e).__name__}: {e}")
+                logger.warning(f"[MONITOR] ⚠ Error obteniendo precio: {e}")
                 time.sleep(interval)
                 continue
 
-            mins_left = _mins_to_close()
             _log_cycle(price, target, mins_left, ops_hoy, max_ops)
 
-            # ── Monitor posición activa ───────────────────────────────────────
+            # ── Stop loss ─────────────────────────────────────────────────
             if active_bet:
-                entry = active_bet["entry"]
-                dir_  = active_bet["direction"]
-                pnl   = (
-                    (price - entry) / entry * 100
-                    if dir_ == "UP"
-                    else (entry - price) / entry * 100
-                )
+                dir_   = active_bet["direction"]
+                stake_ = active_bet["stake"]
+                pnl    = ((price - active_bet["entry"]) / active_bet["entry"] * 100
+                          if dir_ == "UP"
+                          else (active_bet["entry"] - price) / active_bet["entry"] * 100)
 
-                logger.debug(
-                    f"[MONITOR] Posición activa — "
-                    f"{dir_} entry=${entry:,.2f}  "
-                    f"actual=${price:,.2f}  "
-                    f"P&L={pnl:+.2f}%  "
-                    f"stop_loss=-{stop_pct*100:.0f}%"
-                )
-
-                # Stop loss
                 if pnl <= -stop_pct * 100:
-                    loss_usd = -round(stake * stop_pct, 2)
+                    loss_usd = round(stake_ * (-stop_pct), 2)
                     logger.warning(
-                        f"[MONITOR] 🛑 STOP LOSS activado\n"
-                        f"           Dirección : {dir_}\n"
-                        f"           Entry     : ${entry:,.2f}\n"
-                        f"           Actual    : ${price:,.2f}\n"
+                        f"[MONITOR] 🛑 STOP LOSS —\n"
                         f"           P&L       : {pnl:+.2f}%  ({loss_usd:+.2f} USD)"
                     )
                     ts_now = datetime.now(timezone.utc).isoformat()
                     row = _build_trade_row(active_bet, "STOP", ts_now, loss_usd, -stop_pct * 100)
                     _csv_write_row(csv_path, row)
 
+                    session_pnl      += loss_usd
+                    session_invested += stake_
+                    session_losses   += 1
+
                     notify_stop_loss(cfg, active_bet, price, pnl)
                     active_bet   = None
                     fired_window = None
-                    hour_losses += 1
+                    hour_losses  += 1
                     time.sleep(interval)
                     continue
 
-                # Resolución al cierre de vela (< 0.5 min restantes)
+                # Resolución al cierre de vela
                 if mins_left < 0.5:
-                    won     = (dir_ == "UP" and price > active_bet["target"]) or \
-                              (dir_ == "DOWN" and price < active_bet["target"])
-                    odds    = active_bet.get("odds", 0.5)
+                    won  = (dir_ == "UP"   and price > active_bet["target"]) or \
+                           (dir_ == "DOWN" and price < active_bet["target"])
+                    odds = active_bet.get("odds", 0.5)
                     if won:
-                        pnl_usd = round(stake / odds - stake, 2)
-                        pnl_pct = round((pnl_usd / stake) * 100, 2)
+                        pnl_usd = round(stake_ / odds - stake_, 2)
+                        pnl_pct = round((pnl_usd / stake_) * 100, 2)
                         result  = "WIN"
-                        hour_wins   += 1
+                        hour_wins    += 1
+                        session_wins += 1
                         notify_win(cfg, active_bet, price)
                         logger.info(
                             f"[MONITOR] ✅ WIN — "
+                            f"Invertido: ${stake_:.2f}  "
                             f"Retorno: +${pnl_usd:.2f} USD (+{pnl_pct:.1f}%)"
                         )
                         try:
@@ -358,142 +385,113 @@ def run(cfg: dict):
                         except Exception as e:
                             logger.warning(f"[MONITOR] ⚠ Error en claim: {e}")
                     else:
-                        pnl_usd = -stake
+                        pnl_usd = -stake_
                         pnl_pct = -100.0
                         result  = "LOSS"
-                        hour_losses += 1
+                        hour_losses    += 1
+                        session_losses += 1
                         notify_loss(cfg, active_bet, price)
                         logger.info(
                             f"[MONITOR] ❌ LOSS — "
-                            f"Pérdida: -${stake:.2f} USD (-100%)"
+                            f"Invertido: ${stake_:.2f}  "
+                            f"P&L: -${stake_:.2f} (-100%)"
                         )
 
                     ts_now = datetime.now(timezone.utc).isoformat()
                     row = _build_trade_row(active_bet, result, ts_now, pnl_usd, pnl_pct)
                     _csv_write_row(csv_path, row)
+
+                    session_pnl      += pnl_usd
+                    session_invested += stake_
+
+                    # Log de P&L acumulado total tras cada cierre
+                    total_pnl = hist_stats["total_pnl"] + session_pnl
+                    sign_s    = "+" if session_pnl >= 0 else ""
+                    sign_t    = "+" if total_pnl  >= 0 else ""
+                    logger.info(
+                        f"[MONITOR]    P&L sesión         : {sign_s}${session_pnl:,.2f} USDC  "
+                        f"(invertido ${session_invested:,.2f})\n"
+                        f"[MONITOR]    P&L acumulado total: {sign_t}${total_pnl:,.2f} USDC"
+                    )
+
                     active_bet   = None
                     fired_window = None
                     time.sleep(interval)
                     continue
 
-            # ── Evaluación de señal ───────────────────────────────────────────
-            if not active_bet and ops_hoy < max_ops:
-                signal = evaluate(price, target, mins_left, cfg)
+            # ── Evaluación de señal ───────────────────────────────────────
+            signal = evaluate(price, target, mins_left, cfg)
 
-                if signal is None:
-                    if last_window is not None:
-                        last_window = None
-                    # Fuera de ventana → dormir el intervalo largo
-                    time.sleep(interval)
-                    continue
-
-                # Notificar Telegram al entrar en nueva ventana
-                if signal.window != last_window:
-                    last_window = signal.window
-                    logger.info(f"[MONITOR] 🪟 Entrando en ventana {signal.window}")
+            if signal and not active_bet and fired_window != signal.window:
+                if ops_hoy < max_ops:
                     notify_signal_eval(
-                        cfg, price, target, signal.distance,
-                        signal.umbral, signal.window, signal.direction.value, mins_left,
+                        cfg, signal.direction.value, price, target,
+                        signal.distance, signal.umbral, mins_left, signal.window,
                     )
 
-                if not signal.is_actionable:
-                    # Dentro de ventana pero sin señal → polling rápido
-                    time.sleep(_WINDOW_POLL_S)
-                    continue
+                    result = execute_order(signal, market, cfg)
+                    if result:
+                        ops_hoy += 1
+                        active_bet = {
+                            "id":         result.get("id", ""),
+                            "direction":  signal.direction.value,
+                            "window":     signal.window,
+                            "entry":      price,
+                            "target":     target,
+                            "distance":   signal.distance,
+                            "umbral":     signal.umbral,
+                            "stake":      stake,
+                            "odds":       result.get("odds", 0.5),
+                            "tokens":     result.get("tokens", ""),
+                            "market":     market,
+                            "market_slug": slug,
+                            "simulated":  result.get("simulated", False),
+                            "ts_entrada": datetime.now(timezone.utc).isoformat(),
+                        }
+                        fired_window = signal.window
 
-                if fired_window == signal.window:
-                    logger.debug(
-                        f"[MONITOR] Señal {signal.direction.value} en ventana {signal.window} "
-                        f"ya ejecutada — skip"
-                    )
-                    time.sleep(_WINDOW_POLL_S)
-                    continue
+                        # Retorno estimado y P&L estimado
+                        odds_v      = active_bet["odds"]
+                        retorno_est = round(stake / odds_v, 2) if odds_v > 0 else 0
+                        pnl_est     = round(retorno_est - stake, 2)
+                        pct_est     = round((pnl_est / stake) * 100, 1) if stake > 0 else 0
 
-                # Refrescar mercado si no hay uno en caché
-                if not last_market:
-                    logger.info("[MONITOR] 🔍 Buscando mercado activo para ejecutar orden...")
-                    last_market = get_active_market()
-                    if last_market:
-                        notify_market_found(cfg, last_market, mins_left)
-                    else:
-                        logger.warning(
-                            f"[MONITOR] ⚠ Mercado no encontrado — señal {signal.direction.value} "
-                            f"descartada en ventana {signal.window}"
+                        logger.info(
+                            f"[MONITOR] {'🟢' if signal.direction == Direction.UP else '🔴'} "
+                            f"Apuesta {signal.direction.value} ejecutada\n"
+                            f"           Entry     : ${price:,.2f}\n"
+                            f"           Target    : ${target:,.2f}\n"
+                            f"           Ventana   : {signal.window}\n"
+                            f"           Stake     : ${stake:.2f} USDC\n"
+                            f"           Odds      : {odds_v:.3f}\n"
+                            f"           Ret. est. : +${retorno_est:.2f} (+{pct_est:.1f}%)\n"
+                            f"           Simulado  : {active_bet['simulated']}"
                         )
-                        notify_market_lost(cfg, [])
-                        time.sleep(_WINDOW_POLL_S)
-                        continue
-
-                logger.info(
-                    f"[MONITOR] 📊 Ejecutando orden — "
-                    f"{signal.direction.value} | ventana {signal.window} | "
-                    f"dist={signal.distance:+,.0f} | umbral={signal.umbral}"
-                )
-                result = execute_order(signal, last_market, cfg)
-
-                if result:
-                    op_counter += 1
-                    fired_window = signal.window
-                    ops_hoy     += 1
-
-                    # Extraer odds del resultado CLOB (o fallback a 0.5)
-                    odds   = float(result.get("price", 0.5))
-                    tokens = float(result.get("sizeFilled", result.get("size", stake / odds)))
-                    retorno_estimado = round(stake / odds, 2) if odds > 0 else 0
-
-                    active_bet = {
-                        "id":           f"OP{op_counter:04d}",
-                        "direction":    signal.direction.value,
-                        "entry":        price,
-                        "target":       target,
-                        "window":       signal.window,
-                        "umbral":       signal.umbral,
-                        "distance":     signal.distance,
-                        "stake":        stake,
-                        "odds":         odds,
-                        "tokens":       tokens,
-                        "retorno_est":  retorno_estimado,
-                        "market":       last_market,
-                        "market_slug":  last_market.get("slug", ""),
-                        "simulated":    result.get("simulated", False),
-                        "ts_entrada":   datetime.now(timezone.utc).isoformat(),
-                    }
-                    notify_bet(cfg, active_bet, signal)
-                    logger.info(
-                        f"[MONITOR] ✅ Operación #{op_counter} registrada ({ops_hoy}/{max_ops} hoy):\n"
-                        f"           ID        : {active_bet['id']}\n"
-                        f"           Dirección : {signal.direction.value}\n"
-                        f"           Entry     : ${price:,.2f}\n"
-                        f"           Target    : ${target:,.2f}\n"
-                        f"           Distancia : ${abs(signal.distance):,.0f}\n"
-                        f"           Umbral    : ${signal.umbral}\n"
-                        f"           Ventana   : {signal.window}\n"
-                        f"           Stake     : ${stake:.2f} USDC\n"
-                        f"           Odds      : {odds:.3f}  ({odds*100:.1f}% prob)\n"
-                        f"           Tokens    : {tokens:.4f}\n"
-                        f"           Retorno   : ${retorno_estimado:.2f} USDC (si gana)\n"
-                        f"           Simul.    : {active_bet['simulated']}"
-                    )
-                else:
-                    logger.error(
-                        f"[MONITOR] ❌ Orden fallida — señal {signal.direction.value} "
-                        f"en ventana {signal.window} no ejecutada."
-                    )
-                    notify_error(cfg, f"Orden fallida: {signal.direction.value} en {signal.window}")
+                        notify_bet(cfg, active_bet, signal)
+                    else:
+                        logger.error(
+                            f"[MONITOR] ❌ Orden fallida — "
+                            f"{signal.direction.value} en {signal.window}"
+                        )
+                        notify_error(cfg, f"Orden fallida: {signal.direction.value} en {signal.window}")
 
             elif ops_hoy >= max_ops:
-                logger.debug(f"[MONITOR] Límite diario alcanzado ({ops_hoy}/{max_ops}) — en pausa")
+                logger.debug(f"[MONITOR] Límite diario ({ops_hoy}/{max_ops}) — en pausa")
 
-            # ── Sleep adaptativo ──────────────────────────────────────────────
-            # Dentro de ventana: 1s (igual que el dashboard)
-            # Fuera de ventana: interval_s (más eficiente)
             sleep_s = _WINDOW_POLL_S if _in_any_window(mins_left) else interval
             time.sleep(sleep_s)
 
     except KeyboardInterrupt:
+        total_pnl = hist_stats["total_pnl"] + session_pnl
+        sign_s    = "+" if session_pnl >= 0 else ""
+        sign_t    = "+" if total_pnl   >= 0 else ""
         logger.info(_SEPARATOR)
-        logger.info(f"[MONITOR] 🛑 Bot detenido por el usuario (Ctrl+C)")
-        logger.info(f"[MONITOR] Resumen sesión: {ops_hoy} operaciones ejecutadas")
+        logger.info(f"[MONITOR] 🛑 Bot detenido por el usuario")
+        logger.info(f"[MONITOR] ── RESUMEN DE SESIÓN ──────────────────────")
+        logger.info(f"[MONITOR]   Operaciones esta sesión: {ops_hoy}")
+        logger.info(f"[MONITOR]   Invertido esta sesión  : ${session_invested:,.2f} USDC")
+        logger.info(f"[MONITOR]   P&L esta sesión        : {sign_s}${session_pnl:,.2f} USDC")
+        logger.info(f"[MONITOR]   P&L acumulado total    : {sign_t}${total_pnl:,.2f} USDC")
         logger.info(_SEPARATOR)
         notify_stop(cfg)
 
