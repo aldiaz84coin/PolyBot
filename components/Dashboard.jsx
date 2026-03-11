@@ -53,7 +53,6 @@ export default function Dashboard() {
   const { balance, pnlDay, applyBet, applyResult } = useBalance(500);
 
   // ── Persistencia localStorage ────────────────────────────────────────────
-  // Carga al montar — restaura historial de sesiones anteriores
   useEffect(() => {
     try {
       const saved = localStorage.getItem(LS_KEY);
@@ -64,7 +63,6 @@ export default function Dashboard() {
     } catch {}
   }, []);
 
-  // Guarda en cada cambio (últimas 500 ops)
   useEffect(() => {
     try {
       localStorage.setItem(LS_KEY, JSON.stringify(bets.slice(0, 500)));
@@ -166,20 +164,20 @@ export default function Dashboard() {
   }, [price]);
 
   // ── Bot logic ─────────────────────────────────────────────────────────────
-  const firedWindow = useRef(null);
-  useEffect(() => { if (!activeWindow) firedWindow.current = null; }, [activeWindow?.key]);
-
+  // ✅ FIX: activeWindow/umbral/decision declarados ANTES del useEffect que los usa
   const activeWindow = getActiveWindow(minsLeft);
   const umbral       = activeWindow ? config[activeWindow.configKey] : null;
   const decision     = (running && activeWindow && price && target && !targetIsStale)
     ? getDecision(price, target, umbral) : null;
+
+  const firedWindow = useRef(null);
+  useEffect(() => { if (!activeWindow) firedWindow.current = null; }, [activeWindow?.key]);
 
   useEffect(() => {
     if (!running || !activeWindow || !decision?.signal) return;
     if (firedWindow.current === activeWindow.key) return;
     firedWindow.current = activeWindow.key;
 
-    // Obtener odds del mercado activo (precio del token YES o NO)
     const tokens = market?.tokens;
     const odds = tokens
       ? (decision.dir === "UP"
@@ -225,14 +223,12 @@ export default function Dashboard() {
       "success",
     );
 
-    // Persiste en API (best-effort)
     fetch("/api/bets", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(bet),
     }).catch(() => {});
 
-    // Análisis IA
     setAiLoading(true);
     fetch("/api/analysis", {
       method: "POST",
@@ -268,7 +264,6 @@ export default function Dashboard() {
         `🛑 STOP LOSS activado — P&L: -${config.stop_loss_pct}% (${fmtUSD(pnl_usd)})`,
         "error",
       );
-      // Actualizar API
       fetch("/api/bets", {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
@@ -283,73 +278,61 @@ export default function Dashboard() {
     const won   = activeBet.dir === "UP" ? price > activeBet.target : price < activeBet.target;
     const odds  = activeBet.odds || 0.5;
     const stake = activeBet.stake;
-
     const pnl_usd = won
-      ? +(stake / odds - stake).toFixed(2)   // ganancia neta
-      : -stake;                               // pérdida total
-    const pnl_pct = won
-      ? +((pnl_usd / stake) * 100).toFixed(1)
-      : -100;
-    const result  = won ? "WIN" : "LOSS";
+      ? +(stake / odds - stake).toFixed(2)
+      : +(-stake).toFixed(2);
+    const pnl_pct = +((pnl_usd / stake) * 100).toFixed(1);
 
     setBets(b => b.map(bet =>
       bet.id === activeBet.id
-        ? { ...bet, result, pnl: pnl_pct, pnl_usd }
+        ? { ...bet, result: won ? "WIN" : "LOSS", pnl: pnl_pct, pnl_usd }
         : bet
     ));
     setActiveBet(null);
     applyResult(stake, won, config.stop_loss_pct);
     addLog(
-      won
-        ? `✅ WIN — Retorno: +${fmtUSD(pnl_usd)} (+${pnl_pct}%) | Claim automático iniciado.`
-        : `❌ LOSS — Pérdida: ${fmtUSD(pnl_usd)} (-100%)`,
+      `${won ? "✅ WIN" : "❌ LOSS"} — P&L: ${fmtUSD(pnl_usd)} (${pnl_pct > 0 ? "+" : ""}${pnl_pct}%)`,
       won ? "success" : "error",
     );
+
     fetch("/api/bets", {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ id: activeBet.id, result, pnl: pnl_pct, pnl_usd }),
+      body: JSON.stringify({ id: activeBet.id, result: won ? "WIN" : "LOSS", pnl: pnl_pct, pnl_usd }),
     }).catch(() => {});
-  }, [minsLeft, activeBet, price, running]);
+  }, [minsLeft, running]);
 
-  // ── Stats del día ─────────────────────────────────────────────────────────
-  const today     = new Date().toISOString().slice(0, 10);
-  const todayBets = bets.filter(b => b.ts?.startsWith(today));
-  const wins      = todayBets.filter(b => b.result === "WIN").length;
-  const losses    = todayBets.filter(b => ["LOSS", "STOP"].includes(b.result)).length;
-  const winRate   = (wins + losses) > 0 ? Math.round(wins / (wins + losses) * 100) : null;
-  const dist      = price && target ? price - target : null;
-
-  // P&L del día en USD (suma de pnl_usd de las ops cerradas hoy)
-  const pnlDayUsd = todayBets.reduce((s, b) => {
-    if (b.pnl_usd != null) return s + b.pnl_usd;
-    return s;
-  }, 0);
-
-  // Tags de estado
-  const targetTag = targetIsStale
-    ? { label: "TARGET STALE", color: "#4a1a1a" }
-    : targetError
-      ? { label: "TARGET ERR",   color: "#4a2a1a" }
-      : target
-        ? { label: "TARGET OK",   color: "#1a3a2a" }
-        : null;
+  // ── Derived display values ────────────────────────────────────────────────
+  const dist = (price && target) ? price - target : null;
 
   const marketSlugShort = market?.slug
-    ? market.slug.replace("bitcoin-up-or-down-", "").replace("-et", "")
+    ? market.slug.replace("bitcoin-up-or-down-", "")
     : null;
 
+  const targetTag = targetIsStale
+    ? { color: "var(--red)",    label: "TARGET STALE" }
+    : targetError
+    ? { color: "var(--yellow)", label: "TARGET ERR"   }
+    : null;
+
+  // Stats
+  const wins    = bets.filter(b => b.result === "WIN").length;
+  const losses  = bets.filter(b => b.result === "LOSS" || b.result === "STOP").length;
+  const total   = wins + losses;
+  const winrate = total > 0 ? (wins / total) * 100 : null;
+  const pnlTotal = bets.reduce((acc, b) => acc + (b.pnl_usd ?? 0), 0);
+
+  // ── Render ────────────────────────────────────────────────────────────────
   return (
-    <div style={{ minHeight: "100vh", background: "var(--bg)", color: "var(--text)" }}>
+    <div style={{ minHeight: "100vh", background: "var(--bg)", color: "var(--text)", fontFamily: "var(--font-mono)" }}>
 
       {/* ── HEADER ─────────────────────────────────────────────────────────── */}
       <header style={{
-        display: "flex", alignItems: "center", justifyContent: "space-between",
-        height: 52, padding: "0 24px",
-        borderBottom: "1px solid var(--border)",
-        background: "linear-gradient(180deg,#0a0a18 0%,var(--bg) 100%)",
+        display: "flex", justifyContent: "space-between", alignItems: "center",
+        padding: "10px 20px", borderBottom: "1px solid var(--border)",
+        background: "#02020a", position: "sticky", top: 0, zIndex: 100,
       }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+        <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
           <div style={{
             width: 8, height: 8, borderRadius: "50%",
             background: running ? "var(--green)" : "var(--red)",
@@ -370,7 +353,6 @@ export default function Dashboard() {
           )}
         </div>
         <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-          {/* Tabs */}
           {["dashboard", "historial", "config"].map(t => (
             <button
               key={t}
@@ -504,7 +486,6 @@ export default function Dashboard() {
               </div>
             )}
 
-            {/* Posición activa con detalles de dinero */}
             {activeBet && (
               <div style={{
                 marginTop: 12, padding: "8px 10px",
@@ -517,83 +498,76 @@ export default function Dashboard() {
                   <span>Entry: {fmtUSD(activeBet.entry)}</span>
                   <span>Stake: {fmtUSD(activeBet.stake)}</span>
                   <span>Odds: {(activeBet.odds ?? 0.5).toFixed(3)}</span>
-                  <span>Retorno: {fmtUSD(activeBet.retorno_est)}</span>
+                  <span>Ret. est.: {fmtUSD(activeBet.retorno_est)}</span>
                 </div>
               </div>
             )}
           </div>
+        </div>
+      )}
 
-          {/* MARKET INFO */}
-          <div style={{ gridColumn: "1/4" }}>
-            <MarketInfo
-              market={market}
-              minsLeft={minsLeft}
-              activeWindow={activeWindow}
-              error={marketError}
-              apiResponse={apiResponse}
-            />
+      {/* ── STATS BAR ──────────────────────────────────────────────────────── */}
+      {tab === "dashboard" && (
+        <div style={{
+          display: "flex", gap: 32, padding: "14px 24px",
+          borderBottom: "1px solid var(--border)", background: "#02020a",
+          flexWrap: "wrap",
+        }}>
+          <StatBox label="BALANCE" value={fmtUSD(balance)} color={balance >= 500 ? "var(--green)" : "var(--red)"} />
+          <StatBox label="P&L HOY"  value={fmtUSD(pnlDay)}  color={pnlDay >= 0 ? "var(--green)" : "var(--red)"} />
+          <StatBox label="P&L TOTAL" value={fmtUSD(pnlTotal)} color={pnlTotal >= 0 ? "var(--green)" : "var(--red)"} />
+          <StatBox label="WINRATE"  value={winrate != null ? `${winrate.toFixed(0)}%` : "—"} color="var(--yellow)" sub={`${wins}W / ${losses}L`} />
+          <StatBox label="OPS" value={total} color="var(--dim)" />
+        </div>
+      )}
+
+      {/* ── MERCADO + CHART + LOG ───────────────────────────────────────────── */}
+      {tab === "dashboard" && (
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", borderBottom: "1px solid var(--border)" }}>
+          <div style={{ borderRight: "1px solid var(--border)" }}>
+            <MarketInfo market={market} minsLeft={minsLeft} activeWindow={activeWindow} />
           </div>
-
-          {/* STATS */}
-          <div style={{
-            gridColumn: "1/3", background: "var(--bg)", padding: "16px 24px",
-            display: "flex", gap: 32, flexWrap: "wrap",
-            borderTop: "1px solid var(--border)",
-          }}>
-            <StatBox
-              label="P&L HOY"
-              value={fmtUSD(pnlDayUsd)}
-              color={pnlDayUsd >= 0 ? "var(--green)" : "var(--red)"}
-            />
-            <StatBox
-              label="WIN RATE"
-              value={winRate != null ? `${winRate}%` : "—"}
-              color={winRate != null && winRate >= 50 ? "var(--green)" : "var(--red)"}
-            />
-            <StatBox label="WINS"    value={wins}   color="var(--green)" />
-            <StatBox label="LOSSES"  value={losses} color="var(--red)"   />
-            <StatBox label="BALANCE" value={fmtUSD(balance)} color={balance >= 500 ? "var(--green)" : "var(--yellow)"} />
-            <StatBox label="OPS HOY" value={todayBets.length} color="#888" />
-          </div>
-
-          {/* CHART */}
-          <div style={{ background: "var(--bg)", padding: "16px 24px", borderTop: "1px solid var(--border)" }}>
-            <div style={{ fontSize: 9, color: "#444", letterSpacing: "0.15em", marginBottom: 8 }}>PRECIO 1 MIN</div>
-            <PriceChart data={priceHistory} target={target} />
-          </div>
-
-          {/* AI ANALYSIS */}
-          <div style={{
-            gridColumn: "1/4", background: "var(--bg)", padding: "16px 24px",
-            borderTop: "1px solid var(--border)",
-          }}>
-            <div style={{ fontSize: 9, color: "#444", letterSpacing: "0.15em", marginBottom: 8 }}>ANÁLISIS IA</div>
-            <div style={{
-              fontSize: 11, color: aiLoading ? "#333" : "var(--muted)",
-              fontStyle: aiLoading ? "italic" : "normal",
-            }}>
-              {aiLoading ? "Analizando señal..." : aiText}
+          <div>
+            <div style={{ padding: "12px 20px", borderBottom: "1px solid var(--border)" }}>
+              <div style={{ fontSize: 9, color: "#444", letterSpacing: "0.15em", marginBottom: 8 }}>PRECIO BTC — ÚLTIMOS 60s</div>
+              <PriceChart data={priceHistory} target={target} />
+            </div>
+            {/* IA */}
+            <div style={{ padding: "12px 20px" }}>
+              <div style={{ fontSize: 9, color: "#444", letterSpacing: "0.15em", marginBottom: 6 }}>ANÁLISIS IA</div>
+              <div style={{ fontSize: 11, color: aiLoading ? "var(--dim)" : "var(--text)", lineHeight: 1.6 }}>
+                {aiLoading ? "⏳ Analizando señal..." : aiText}
+              </div>
             </div>
           </div>
+        </div>
+      )}
 
-          {/* LOG */}
-          <div style={{ gridColumn: "1/4", background: "var(--bg)", padding: "16px 24px", borderTop: "1px solid var(--border)" }}>
-            <div style={{ fontSize: 9, color: "#444", letterSpacing: "0.15em", marginBottom: 8 }}>LOG DE EVENTOS</div>
-            <div style={{ height: 160, overflowY: "auto", fontFamily: "var(--font)", fontSize: 11 }}>
-              {log.length === 0 && <div style={{ color: "#333" }}>Sin eventos.</div>}
-              {log.map(entry => (
-                <div key={entry.id} style={{
-                  color: entry.type === "success" ? "var(--green)"
-                       : entry.type === "error"   ? "var(--red)"
-                       : entry.type === "warning" ? "var(--yellow)"
-                       : "#555",
-                  marginBottom: 2,
-                }}>
-                  <span style={{ color: "#2a2a3a", marginRight: 8 }}>{entry.ts}</span>
-                  {entry.msg}
-                </div>
-              ))}
-            </div>
+      {/* ── LOG ────────────────────────────────────────────────────────────── */}
+      {tab === "dashboard" && (
+        <div style={{ padding: "12px 20px" }}>
+          <div style={{ fontSize: 9, color: "#444", letterSpacing: "0.15em", marginBottom: 8 }}>LOG DE EVENTOS</div>
+          <div style={{
+            maxHeight: 180, overflowY: "auto",
+            background: "#010108", border: "1px solid var(--border)",
+            borderRadius: 3, padding: "8px 10px",
+          }}>
+            {log.length === 0 && (
+              <div style={{ fontSize: 10, color: "#222" }}>Sin eventos aún...</div>
+            )}
+            {log.map(entry => (
+              <div key={entry.id} style={{
+                fontSize: 10,
+                color: entry.type === "success" ? "var(--green)"
+                     : entry.type === "error"   ? "var(--red)"
+                     : entry.type === "warning" ? "var(--yellow)"
+                     : "#555",
+                marginBottom: 2,
+              }}>
+                <span style={{ color: "#2a2a3a", marginRight: 8 }}>{entry.ts}</span>
+                {entry.msg}
+              </div>
+            ))}
           </div>
         </div>
       )}
@@ -601,7 +575,6 @@ export default function Dashboard() {
       {/* ── HISTORIAL ──────────────────────────────────────────────────────── */}
       {tab === "historial" && (
         <div>
-          {/* Toolbar */}
           <div style={{
             display: "flex", justifyContent: "space-between", alignItems: "center",
             padding: "12px 20px", borderBottom: "1px solid var(--border)",
