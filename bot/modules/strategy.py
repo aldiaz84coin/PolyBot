@@ -1,10 +1,11 @@
 """
 strategy.py — Lógica de decisión UP/DOWN y ejecución de órdenes CLOB
 
-FIX v2.7: execute_order siempre devuelve "odds" (precio real del token en
-Polymarket en el momento de la compra). Antes se hacía result.get("odds", 0.5)
-en monitor.py y siempre devolvía 0.5 porque ni la respuesta real del CLOB
-ni la respuesta simulada incluían ese campo. Ahora se inyecta explícitamente.
+v3.0 cambios:
+  - Modo SIMULADO explícito vía cfg["strategy"]["simulate_mode"] (env SIMULATE_MODE=true).
+    Ya no dependemos de ImportError de py_clob_client para simular.
+  - execute_order siempre devuelve "odds" (precio real del token).
+  - Log claro [SIMULADO] en todas las operaciones simuladas.
 """
 import logging
 from dataclasses import dataclass, field
@@ -131,19 +132,24 @@ def evaluate(price: float, target: float, mins_left: float, cfg: dict) -> "Signa
 def execute_order(signal: Signal, market: dict, cfg: dict) -> dict | None:
     """
     Ejecuta una orden Market FOK en el CLOB de Polymarket.
-    Devuelve el resultado de la orden o None si falla.
 
-    IMPORTANTE: siempre incluye "odds" = precio real del token en Polymarket
-    en el momento de la compra, para cálculo correcto de retorno/P&L.
+    Devuelve el resultado de la orden o None si falla.
+    Siempre incluye "odds" = precio real del token en Polymarket.
+
+    MODO SIMULADO (cfg["strategy"]["simulate_mode"] = True):
+      No se conecta al CLOB. Registra la operación como si fuera real,
+      con la misma estructura de respuesta, marcada con simulated=True.
+      Activar con env var SIMULATE_MODE=true en Railway.
     """
-    stake    = cfg["capital"]["stake_usdc"]
-    tokens   = market.get("tokens", [])
-    yes_tok  = next((t for t in tokens if t.get("outcome") == "Yes"), None)
-    no_tok   = next((t for t in tokens if t.get("outcome") == "No"),  None)
-    token    = yes_tok if signal.direction == Direction.UP else no_tok
+    simulate_mode = cfg.get("strategy", {}).get("simulate_mode", False)
+    stake         = cfg["capital"]["stake_usdc"]
+    tokens        = market.get("tokens", [])
+    yes_tok       = next((t for t in tokens if t.get("outcome") == "Yes"), None)
+    no_tok        = next((t for t in tokens if t.get("outcome") == "No"),  None)
+    token         = yes_tok if signal.direction == Direction.UP else no_tok
 
     logger.info(
-        f"[ORDER] Preparando orden:\n"
+        f"[ORDER] {'[SIMULADO] ' if simulate_mode else ''}Preparando orden:\n"
         f"         Dirección : {signal.direction.value}\n"
         f"         Ventana   : {signal.window}\n"
         f"         Price     : ${signal.price:,.2f}\n"
@@ -159,12 +165,9 @@ def execute_order(signal: Signal, market: dict, cfg: dict) -> dict | None:
         )
         return None
 
-    token_id  = token["token_id"]
-    # ── Precio real del token en Polymarket (odds de entrada) ────────────
-    # Este valor es el precio por share en Polymarket y DEBE propagarse al
-    # caller para calcular el retorno real (shares = stake / odds).
+    token_id   = token["token_id"]
     entry_odds = float(token.get("price", 0.5))
-    size       = round(stake / entry_odds, 4)
+    size       = round(stake / max(entry_odds, 0.001), 4)
 
     logger.info(
         f"[ORDER] Parámetros CLOB:\n"
@@ -174,6 +177,23 @@ def execute_order(signal: Signal, market: dict, cfg: dict) -> dict | None:
         f"         Coste est.: ${entry_odds * size:.2f} USDC"
     )
 
+    # ── MODO SIMULADO: no llamar al CLOB ─────────────────────────────────
+    if simulate_mode:
+        logger.warning(
+            f"[ORDER] 🟡 [SIMULADO] Orden NO enviada al CLOB\n"
+            f"         {signal.direction.value} {size:.4f} tokens × {entry_odds:.4f} = ${stake} USDC"
+        )
+        return {
+            "simulated": True,
+            "direction": signal.direction.value,
+            "stake":     stake,
+            "token_id":  token_id,
+            "price":     entry_odds,
+            "size":      size,
+            "odds":      entry_odds,
+        }
+
+    # ── MODO REAL: ejecutar en CLOB ───────────────────────────────────────
     try:
         from py_clob_client.client import ClobClient
         from py_clob_client.clob_types import ApiCreds, OrderArgs, CreateOrderOptions
@@ -184,7 +204,6 @@ def execute_order(signal: Signal, market: dict, cfg: dict) -> dict | None:
         chain_id    = cfg["polymarket"]["chain_id"]
         sig_type    = cfg["polymarket"]["signature_type"]
 
-        # ── Credenciales Level 2 (necesarias para post_order) ─────────────
         api_key        = cfg["polymarket"].get("api_key", "")
         api_secret     = cfg["polymarket"].get("api_secret", "")
         api_passphrase = cfg["polymarket"].get("api_passphrase", "")
@@ -193,7 +212,7 @@ def execute_order(signal: Signal, market: dict, cfg: dict) -> dict | None:
             logger.error(
                 "[ORDER] ❌ Faltan credenciales Level 2 en config:\n"
                 "         Necesitas polymarket.api_key, api_secret y api_passphrase\n"
-                "         (o las vars de entorno POLY_API_KEY, POLY_API_SECRET, POLY_API_PASSPHRASE)"
+                "         (o las vars POLY_API_KEY, POLY_API_SECRET, POLY_API_PASSPHRASE)"
             )
             return None
 
@@ -203,8 +222,6 @@ def execute_order(signal: Signal, market: dict, cfg: dict) -> dict | None:
             api_passphrase=api_passphrase,
         )
 
-        # neg_risk: los BTC Up/Down son siempre False,
-        # pero lo derivamos dinámicamente por si acaso.
         neg_risk = bool(market.get("neg_risk", False))
 
         logger.debug(
@@ -240,10 +257,7 @@ def execute_order(signal: Signal, market: dict, cfg: dict) -> dict | None:
         status   = resp.get("status", "—")
         filled   = resp.get("sizeFilled", resp.get("size_filled", "—"))
 
-        # ── Intentar obtener el precio real de fill del CLOB ──────────────
-        # Algunos brokers devuelven avgPrice o price en la respuesta.
-        # Si no está disponible, usamos entry_odds (precio de la orden).
-        fill_price = resp.get("avgPrice") or resp.get("price") or resp.get("avg_price")
+        fill_price  = resp.get("avgPrice") or resp.get("price") or resp.get("avg_price")
         actual_odds = float(fill_price) if fill_price else entry_odds
 
         logger.info(
@@ -255,8 +269,6 @@ def execute_order(signal: Signal, market: dict, cfg: dict) -> dict | None:
             f"         Raw resp  : {resp}"
         )
 
-        # FIX: inyectamos "odds" con el precio real de entrada para que
-        # monitor.py pueda calcular retorno/P&L correctamente.
         return {**resp, "odds": actual_odds}
 
     except ImportError:
@@ -265,7 +277,6 @@ def execute_order(signal: Signal, market: dict, cfg: dict) -> dict | None:
             f"         Orden simulada: {signal.direction.value} ${stake} USDC  "
             f"Odds: {entry_odds:.4f}"
         )
-        # FIX: incluir "odds" también en la respuesta simulada
         return {
             "simulated": True,
             "direction": signal.direction.value,
@@ -273,7 +284,7 @@ def execute_order(signal: Signal, market: dict, cfg: dict) -> dict | None:
             "token_id":  token_id,
             "price":     entry_odds,
             "size":      size,
-            "odds":      entry_odds,   # ← clave corregida
+            "odds":      entry_odds,
         }
 
     except Exception as e:

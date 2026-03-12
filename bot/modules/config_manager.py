@@ -48,6 +48,16 @@ def load_config(path: str = "config.yaml") -> dict:
                     pass
             cfg.setdefault(section, {})[key] = val
 
+    # ── SIMULATE_MODE: no ejecutar órdenes reales en el CLOB ────────────────
+    # Activa con: SIMULATE_MODE=true (Railway env var)
+    # En modo simulado: la lógica es idéntica, las órdenes se registran en CSV
+    # marcadas como [SIMULADO], pero NUNCA se envían al CLOB de Polymarket.
+    simulate_env = os.environ.get("SIMULATE_MODE", "").lower()
+    if simulate_env in ("1", "true", "yes", "on"):
+        cfg.setdefault("strategy", {})["simulate_mode"] = True
+    elif "simulate_mode" not in cfg.get("strategy", {}):
+        cfg.setdefault("strategy", {})["simulate_mode"] = False
+
     return cfg
 
 
