@@ -1,22 +1,21 @@
 """
 monitor.py — Loop principal del bot: ventana horaria, stop loss, resolución
 
+v3.2 — FIX NOTIFICACIONES TELEGRAM EN MODO SIMULADO:
+  1. BUG CRÍTICO: notify_bet(cfg, active_bet) llamado sin argumento `signal`
+     → TypeError → crash del loop → ninguna notificación posterior llegaba.
+     FIXED: notify_bet(cfg, active_bet, signal)
+  2. BUG: notify_signal_eval solo se llamaba si señal accionable.
+     → Evaluaciones WAIT (distancia insuficiente) nunca llegaban al chat.
+     FIXED: se llama para CUALQUIER señal en ventana, con tracker de cambio
+     para evitar spam (solo notifica al entrar en ventana o cambiar dirección).
+  3. BUG: notificaciones de apuesta/resultado no etiquetaban [SIMULADO].
+     FIXED: sim_tag añadido a notify_bet, notify_win, notify_loss, notify_stop_loss.
+
 v3.1 — FIX DEPLOY: imports relativos para paquete modules/
-  - `from price_feed import ...`     → `from .price_feed import ...`
-  - `from market_scanner import ...` → `from .market_scanner import ...`
-  - `from strategy import ...`       → `from .strategy import ...`
-  - `from claimer import ...`        → `from .claimer import ...`
-  - `from notifier import ...`       → `from .notifier import ...`
-  Sin este cambio, Python no resuelve los módulos al importar desde main.py
-  con `from modules.monitor import run`.
-
-v3.0 — Pre-producción fixes:
-  1. BUG CRÍTICO STOP LOSS: stop_pct multiplicado innecesariamente × 100.
-  2. STATS NO ACTUALIZADAS: hist_stats se recarga tras cada cierre.
-  3. MODO SIMULADO explícito: SIMULATE_MODE=true en Railway.
-
-v2.9 — BUG FIX: señal WAIT ya no dispara execute_order (signal.is_actionable).
-v2.8 — FIX: _fetch_exit_token_price usa CLOB live en lugar de Gamma cacheado.
+v3.0 — Pre-producción fixes (stop_pct, stats, simulate_mode).
+v2.9 — BUG FIX: señal WAIT ya no dispara execute_order.
+v2.8 — FIX: _fetch_exit_token_price usa CLOB live.
 v2.7 — Retornos reales desde Polymarket + odds reales en active_bet.
 """
 import csv
@@ -39,6 +38,7 @@ from .notifier       import (
     notify_signal_eval,
     notify_hour_summary,
     notify_error,
+    notify_startup_summary,
 )
 
 logger = logging.getLogger(__name__)
@@ -146,7 +146,7 @@ def _load_historical_stats(csv_path: str) -> dict:
     FIX v3.0: se llama tras CADA cierre de operación (no solo al inicio).
     """
     stats = {
-        "total_ops": 0, "total_wins": 0, "total_losses": 0,
+        "total_ops": 0, "wins": 0, "losses": 0, "stops": 0,
         "total_pnl": 0.0, "total_invested": 0.0,
     }
     if not os.path.exists(csv_path):
@@ -154,12 +154,16 @@ def _load_historical_stats(csv_path: str) -> dict:
     try:
         with open(csv_path, newline="", encoding="utf-8") as f:
             for row in csv.DictReader(f):
+                result = row.get("resultado", "").upper()
+                if result not in ("WIN", "LOSS", "STOP"):
+                    continue
                 stats["total_ops"] += 1
-                res = row.get("resultado", "")
-                if res == "WIN":
-                    stats["total_wins"] += 1
-                elif res == "LOSS":
-                    stats["total_losses"] += 1
+                if result == "WIN":
+                    stats["wins"]   += 1
+                elif result == "LOSS":
+                    stats["losses"] += 1
+                elif result == "STOP":
+                    stats["stops"]  += 1
                 try:
                     stats["total_pnl"]      += float(row.get("pnl_usd", 0))
                     stats["total_invested"]  += float(row.get("stake_usd", 0))
@@ -171,16 +175,14 @@ def _load_historical_stats(csv_path: str) -> dict:
 
 
 def _log_accumulated_stats(stats: dict, label: str = "HISTORIAL"):
-    sign = "+" if stats["total_pnl"] >= 0 else ""
-    wr   = (
-        f"{stats['total_wins']/stats['total_ops']*100:.1f}%"
-        if stats["total_ops"] > 0 else "—"
-    )
+    wins     = stats["wins"]
+    losses   = stats["losses"] + stats["stops"]
+    wr       = round(wins / (wins + losses) * 100) if (wins + losses) > 0 else 0
+    sign     = "+" if stats["total_pnl"] >= 0 else ""
     logger.info(
         f"[MONITOR] 📊 {label}: "
         f"{stats['total_ops']} ops  "
-        f"{stats['total_wins']}W/{stats['total_losses']}L  "
-        f"WR={wr}  "
+        f"{wins}W/{losses}L  WR={wr}%  "
         f"P&L={sign}${stats['total_pnl']:,.2f}  "
         f"Invertido=${stats['total_invested']:,.2f}"
     )
@@ -193,12 +195,11 @@ def _fetch_exit_token_price(active_bet: dict, cfg: dict) -> float | None:
     Obtiene el precio actual del token en Polymarket vía CLOB midpoint.
     Fallback: Gamma API por conditionId.
     """
-    market     = active_bet.get("market", {})
-    direction  = active_bet.get("direction", "UP")
-    token_id   = None
+    market         = active_bet.get("market", {})
+    direction      = active_bet.get("direction", "UP")
     outcome_target = "Yes" if direction == "UP" else "No"
+    token_id       = None
 
-    # Intentar obtener token_id del mercado
     tokens = market.get("tokens", [])
     for t in tokens:
         if t.get("outcome") == outcome_target:
@@ -207,11 +208,7 @@ def _fetch_exit_token_price(active_bet: dict, cfg: dict) -> float | None:
 
     if token_id:
         try:
-            r = requests.get(
-                _CLOB_MIDPOINT,
-                params={"token_id": token_id},
-                timeout=8,
-            )
+            r = requests.get(_CLOB_MIDPOINT, params={"token_id": token_id}, timeout=8)
             r.raise_for_status()
             mid = r.json().get("mid")
             if mid is not None:
@@ -274,7 +271,7 @@ def run(cfg: dict):
     stake         = cfg["capital"]["stake_usdc"]
     max_ops       = cfg["capital"]["max_operaciones_dia"]
     interval      = cfg["strategy"].get("monitor_intervalo_s", 5)
-    # FIX v3.0: stop_loss_pct es ya un porcentaje (ej: 5 = 5% de movimiento BTC).
+    # FIX v3.0: stop_loss_pct es ya un porcentaje (ej: 5 = 5%).
     # NO multiplicar × 100 al comparar con pnl_btc.
     stop_pct      = cfg["strategy"].get("stop_loss_pct", 5.0)
     simulate_mode = cfg["strategy"].get("simulate_mode", False)
@@ -291,6 +288,7 @@ def run(cfg: dict):
     session_losses   = 0
 
     notify_start(cfg)
+    notify_startup_summary(cfg, hist_stats)
 
     # ── Estado de mercado/hora ────────────────────────────────────────────
     market       = None
@@ -304,6 +302,10 @@ def run(cfg: dict):
     hour_wins   = 0
     hour_losses = 0
     ops_hoy     = 0
+
+    # FIX v3.2: tracker para notify_signal_eval — evita spam enviando solo
+    # cuando se entra en una ventana nueva o cambia la dirección evaluada.
+    last_notified_signal_key = None   # (window_key, direction_value)
 
     logger.info(_SEPARATOR)
     sim_tag = " [MODO SIMULADO]" if simulate_mode else ""
@@ -323,10 +325,11 @@ def run(cfg: dict):
                         hour_wins, hour_losses,
                         ops_hoy, target,
                     )
-                hour_wins   = 0
-                hour_losses = 0
-                last_hour   = now_hour
-                ops_hoy     = 0
+                hour_wins                = 0
+                hour_losses              = 0
+                last_hour                = now_hour
+                ops_hoy                  = 0
+                last_notified_signal_key = None
 
             # ── Obtener mercado (primero) ─────────────────────────────────
             prev_slug = slug
@@ -341,64 +344,66 @@ def run(cfg: dict):
                 )
                 last_slug = slug
                 target    = None  # forzar re-fetch del target con nuevo slug
+                last_notified_signal_key = None
 
             if not market:
                 if prev_slug:
                     notify_market_lost(cfg)
-                    logger.warning("[MONITOR] ⚠ Sin mercado activo — reintentando...")
-                time.sleep(30)
+                    logger.warning("[MONITOR] ⚠ Mercado perdido — esperando nuevo mercado")
+                time.sleep(interval)
                 continue
 
             # ── Obtener target (después del mercado, con slug) ────────────
             if target is None:
-                logger.info(f"[MONITOR] 📡 Obteniendo target para slug: {slug}")
-                target = _fetch_target_with_retry(cfg, now_hour, slug=slug)
+                hour_utc = datetime.now(timezone.utc).hour
+                target   = _fetch_target_with_retry(cfg, hour_utc, slug=slug)
                 if target:
-                    notify_target_change(cfg, target, now_hour)
-                    logger.info(f"[MONITOR] 🎯 Target: ${target:,.2f}")
+                    notify_target_change(cfg, target, hour_utc)
+                    logger.info(f"[MONITOR] 🎯 Price to Beat: ${target:,.2f}")
+                else:
+                    logger.warning("[MONITOR] ⚠ Target no disponible — reintentando en próximo ciclo")
+                    time.sleep(interval)
+                    continue
 
+            # ── Obtener precio BTC ────────────────────────────────────────
             price = get_btc_price()
             if not price:
+                logger.warning("[MONITOR] ⚠ Precio BTC no disponible")
                 time.sleep(interval)
                 continue
 
             _log_cycle(price, target, mins_left, ops_hoy, max_ops)
 
-            # ── Gestión de apuesta activa ─────────────────────────────────
+            # ── Stop loss en posición abierta ─────────────────────────────
             if active_bet:
-                dir_   = active_bet["direction"]
-                stake_ = active_bet["stake"]
-                sim_   = active_bet.get("simulated", False)
+                sim_ = active_bet.get("simulated", False)
 
-                # P&L BTC-based como proxy del movimiento contra nuestra posición
-                pnl_btc = (
-                    (price - active_bet["entry"]) / active_bet["entry"] * 100
-                    if dir_ == "UP"
-                    else (active_bet["entry"] - price) / active_bet["entry"] * 100
-                )
+                # Calcular P&L de BTC para el stop loss trigger
+                entry_price = active_bet.get("entry", price)
+                pnl_btc = ((price - entry_price) / entry_price) * 100
+                if active_bet["direction"] == "DOWN":
+                    pnl_btc = -pnl_btc
 
-                # ── Stop Loss ─────────────────────────────────────────────
-                # FIX v3.0: stop_pct ya es porcentaje → NO multiplicar × 100
                 if pnl_btc <= -stop_pct:
-                    exit_price = None
-                    if not sim_:
-                        exit_price = _fetch_exit_token_price(active_bet, cfg)
-
+                    exit_price = _fetch_exit_token_price(active_bet, cfg)
+                    stake_     = active_bet.get("stake", stake)
                     if exit_price is not None:
-                        shares  = active_bet.get("tokens", 0)
-                        pnl_usd = (shares * exit_price) - stake_
+                        shares_  = stake_ / max(active_bet.get("odds", 0.5), 0.001)
+                        pnl_usd  = round(shares_ * exit_price - stake_, 2)
+                        pnl_pct  = round((pnl_usd / stake_) * 100, 1) if stake_ > 0 else 0.0
                     else:
-                        pnl_usd = -(stake_ * stop_pct / 100)
+                        pnl_usd = round(-stake_ * (stop_pct / 100), 2)
+                        pnl_pct = -stop_pct
 
-                    pnl_pct = (pnl_usd / stake_) * 100 if stake_ > 0 else 0
-                    result  = "STOP_LOSS"
-
-                    logger.warning(
+                    result = "STOP"
+                    logger.info(
                         f"[MONITOR] {'[SIMULADO] ' if sim_ else ''}🛑 STOP LOSS — "
                         f"BTC movimiento: {pnl_btc:+.2f}%  "
                         f"P&L: ${pnl_usd:+.2f} ({pnl_pct:+.1f}%)"
                     )
-                    notify_stop_loss(cfg, active_bet, price, pnl_usd)
+                    # FIX v3.2: sim_tag en notificación stop loss
+                    notify_stop_loss(cfg, active_bet, price, pnl_usd,
+                                     simulated=sim_)
 
                     ts_now = datetime.now(timezone.utc).isoformat()
                     row    = _build_trade_row(active_bet, result, ts_now, pnl_usd, pnl_pct)
@@ -412,27 +417,32 @@ def run(cfg: dict):
                     hist_stats = _load_historical_stats(csv_path)
                     _log_accumulated_stats(hist_stats, label="TRAS STOP_LOSS")
 
-                    active_bet   = None
-                    fired_window = None
+                    active_bet               = None
+                    fired_window             = None
+                    last_notified_signal_key = None
                     time.sleep(interval)
                     continue
 
                 # ── Resolución al cierre de vela ──────────────────────────
                 if mins_left <= 0:
+                    dir_    = active_bet["direction"]
+                    stake_  = active_bet.get("stake", stake)
+
                     if dir_ == "UP":
                         won = price > active_bet["target"]
                     else:
                         won = price < active_bet["target"]
 
                     if won:
-                        odds_  = active_bet.get("odds", 0.5)
-                        shares = active_bet.get("tokens", stake_ / odds_ if odds_ > 0 else 0)
-                        pnl_usd = shares - stake_
-                        pnl_pct = (pnl_usd / stake_) * 100 if stake_ > 0 else 0
+                        odds_   = active_bet.get("odds", 0.5)
+                        shares  = stake_ / max(odds_, 0.001)
+                        pnl_usd = round(shares - stake_, 2)
+                        pnl_pct = round((pnl_usd / stake_) * 100, 1) if stake_ > 0 else 0
                         result  = "WIN"
                         hour_wins     += 1
                         session_wins  += 1
-                        notify_win(cfg, active_bet, price)
+                        # FIX v3.2: sim_tag en notificación WIN
+                        notify_win(cfg, active_bet, price, simulated=sim_)
                         logger.info(
                             f"[MONITOR] {'[SIMULADO] ' if sim_ else ''}✅ WIN — "
                             f"Invertido: ${stake_:.2f}  "
@@ -451,7 +461,8 @@ def run(cfg: dict):
                         result  = "LOSS"
                         hour_losses    += 1
                         session_losses += 1
-                        notify_loss(cfg, active_bet, price)
+                        # FIX v3.2: sim_tag en notificación LOSS
+                        notify_loss(cfg, active_bet, price, simulated=sim_)
                         logger.info(
                             f"[MONITOR] {'[SIMULADO] ' if sim_ else ''}❌ LOSS — "
                             f"Invertido: ${stake_:.2f}  "
@@ -476,8 +487,9 @@ def run(cfg: dict):
                         f"[MONITOR]    Acumulado  : {'+' if hist_stats['total_pnl'] >= 0 else ''}${hist_stats['total_pnl']:,.2f} USDC"
                     )
 
-                    active_bet   = None
-                    fired_window = None
+                    active_bet               = None
+                    fired_window             = None
+                    last_notified_signal_key = None
                     time.sleep(interval)
                     continue
 
@@ -488,14 +500,22 @@ def run(cfg: dict):
 
             signal = evaluate(price, target, mins_left, cfg)
 
-            if signal and signal.is_actionable and not active_bet and fired_window != signal.window:
-                if ops_hoy < max_ops:
+            # FIX v3.2: notify_signal_eval para CUALQUIER señal en ventana,
+            # no solo accionables. Solo notifica cuando hay cambio real
+            # (nueva ventana o cambio de dirección) para evitar spam.
+            if signal:
+                signal_key = (signal.window, signal.direction.value)
+                if signal_key != last_notified_signal_key:
                     notify_signal_eval(
                         cfg, price, target,
                         signal.distance, signal.umbral, signal.window,
                         signal.direction.value, mins_left,
                     )
+                    last_notified_signal_key = signal_key
 
+            # FIX v2.9 + v3.2: solo ejecutar si accionable
+            if signal and signal.is_actionable and not active_bet and fired_window != signal.window:
+                if ops_hoy < max_ops:
                     result_order = execute_order(signal, market, cfg)
                     if result_order:
                         ops_hoy += 1
@@ -518,7 +538,7 @@ def run(cfg: dict):
                         fired_window = signal.window
 
                         odds_v      = active_bet["odds"]
-                        retorno_est = round(stake / odds_v, 2) if odds_v > 0 else 0
+                        retorno_est = round(stake / max(odds_v, 0.001), 2)
                         pnl_est     = round(retorno_est - stake, 2)
                         pct_est     = round((pnl_est / stake) * 100, 1) if stake > 0 else 0
 
@@ -531,9 +551,12 @@ def run(cfg: dict):
                             f"           Ventana   : {signal.window}\n"
                             f"           Stake     : ${stake:.2f} USDC\n"
                             f"           Odds      : {odds_v:.4f}  ({odds_v*100:.1f}%)\n"
-                            f"           Ret. est. : +${pnl_est:.2f} USD (+{pct_est:.1f}%)"
+                            f"           Ret. est. : ${retorno_est:.2f} USDC  "
+                            f"(+${pnl_est:.2f} / +{pct_est:.1f}%)"
                         )
-                        notify_bet(cfg, active_bet)
+                        # FIX v3.2: CORREGIDO — se pasa `signal` como 3er argumento
+                        notify_bet(cfg, active_bet, signal,
+                                   simulated=active_bet["simulated"])
                     else:
                         logger.error("[MONITOR] ❌ execute_order devolvió None — no se abre apuesta")
                 else:
