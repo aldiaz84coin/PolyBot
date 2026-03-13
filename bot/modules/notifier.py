@@ -1,10 +1,12 @@
 """
 notifier.py — Alertas Telegram para el bot de Polymarket BTC
 
-v4.0 — notify_hour_summary con detalle de operaciones:
-  - Muestra tabla por operación: precio compra, tokens, precio venta, resultado, P&L
-  - Muestra resumen acumulado (historial CSV)
-  - Mensaje más rico e informativo cada hora
+v5.0 — FIXES NOTIFICACIONES:
+  1. _send() ahora loguea ERROR cuando token/chat_id están vacíos
+  2. _send() loguea la respuesta HTTP de Telegram cuando falla (status != 200)
+  3. notify_market_found() enriquecida: muestra YES/NO precios + conditionId
+  4. notify_hour_summary() dispara SIEMPRE al cambio de hora (sin condición)
+  5. notify_new_hour() nueva función: resumen de cambio de hora aunque no haya ops
 """
 import logging
 
@@ -18,14 +20,32 @@ _SEND_URL = "https://api.telegram.org/bot{token}/sendMessage"
 def _send(cfg: dict, text: str):
     token   = cfg.get("telegram", {}).get("bot_token", "")
     chat_id = cfg.get("telegram", {}).get("chat_id", "")
-    if not token or not chat_id:
+
+    # FIX v5.0: loguear error cuando faltan credenciales (antes era silencioso)
+    if not token:
+        logger.error("[NOTIF] ❌ telegram.bot_token vacío — mensaje no enviado")
         return
+    if not chat_id:
+        logger.error("[NOTIF] ❌ telegram.chat_id vacío — mensaje no enviado")
+        return
+
     try:
-        requests.post(
+        resp = requests.post(
             _SEND_URL.format(token=token),
             json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
             timeout=10,
         )
+        # FIX v5.0: loguear respuesta HTTP de Telegram cuando hay error
+        if resp.status_code != 200:
+            logger.error(
+                f"[NOTIF] ❌ Telegram HTTP {resp.status_code}: {resp.text[:300]}"
+            )
+        else:
+            logger.debug("[NOTIF] ✅ Telegram enviado correctamente")
+    except requests.exceptions.Timeout:
+        logger.warning("[NOTIF] ⚠ Telegram timeout (10s) — mensaje no enviado")
+    except requests.exceptions.ConnectionError as e:
+        logger.error(f"[NOTIF] ❌ Telegram sin conexión: {e}")
     except Exception as e:
         logger.warning(f"[NOTIF] ⚠ Telegram error: {e}")
 
@@ -58,11 +78,33 @@ def notify_startup_summary(cfg: dict, hist_stats: dict):
 # ── Mercado ──────────────────────────────────────────────────────────────────
 
 def notify_market_found(cfg: dict, market: dict, mins_left: float):
-    slug = market.get("slug", "—")
+    """
+    FIX v5.0: muestra YES/NO precios + conditionId además del slug.
+    """
+    slug      = market.get("slug", "—")
+    cond_id   = market.get("condition_id", "—")
+    tokens    = market.get("tokens", {})
+
+    # Soporta tanto formato dict {yes: {price}, no: {price}} como lista
+    if isinstance(tokens, dict):
+        yes_p = tokens.get("yes", {}).get("price")
+        no_p  = tokens.get("no",  {}).get("price")
+    elif isinstance(tokens, list):
+        yes_p = next((t.get("price") for t in tokens if t.get("outcome") == "Yes"), None)
+        no_p  = next((t.get("price") for t in tokens if t.get("outcome") == "No"),  None)
+    else:
+        yes_p = no_p = None
+
+    yes_str = f"{yes_p:.4f}" if yes_p is not None else "—"
+    no_str  = f"{no_p:.4f}"  if no_p  is not None else "—"
+
     _send(cfg, (
-        f"🎯 <b>Mercado encontrado</b>\n"
-        f"Slug   : <code>{slug}</code>\n"
-        f"Cierre : <code>{mins_left:.1f} min</code>"
+        f"🎯 <b>Nuevo mercado detectado</b>\n"
+        f"Slug     : <code>{slug}</code>\n"
+        f"Cierre   : <code>{mins_left:.1f} min</code>\n"
+        f"YES      : <code>{yes_str}</code>   "
+        f"NO: <code>{no_str}</code>\n"
+        f"CondID   : <code>{cond_id[:16]}…</code>"
     ))
 
 
@@ -97,9 +139,6 @@ def notify_target_failed(cfg: dict, hour_utc):
 def notify_signal_eval(cfg: dict, price: float, target: float,
                        dist: float, umbral: float, window: str,
                        direction: str, mins_left: float):
-    """
-    FIX v3.2: se llama para CUALQUIER señal en ventana (no solo accionables).
-    """
     arrow  = "▲" if dist > 0 else "▼"
     action = (
         f"✅ <b>{direction}</b> — señal accionable"
@@ -117,6 +156,25 @@ def notify_signal_eval(cfg: dict, price: float, target: float,
     ))
 
 
+# ── Cambio de hora (sin operaciones) ─────────────────────────────────────────
+
+def notify_new_hour(cfg: dict, hour_utc, slug: str, target: float):
+    """
+    FIX v5.0: notificación de cambio de hora aunque no haya habido operaciones.
+    Se llama desde monitor.run() en el bloque reset horario.
+    """
+    try:
+        hour_utc = int(hour_utc)
+    except (TypeError, ValueError):
+        hour_utc = "?"
+    target_str = f"${target:,.2f}" if target else "—"
+    _send(cfg, (
+        f"🕐 <b>Nueva hora: {hour_utc:02d}:00 UTC</b>\n"
+        f"Mercado  : <code>{slug or '—'}</code>\n"
+        f"Target   : <code>{target_str}</code>"
+    ))
+
+
 # ── Resumen horario ───────────────────────────────────────────────────────────
 
 def notify_hour_summary(cfg: dict, hour_utc, hour_wins: int, hour_losses: int,
@@ -124,9 +182,8 @@ def notify_hour_summary(cfg: dict, hour_utc, hour_wins: int, hour_losses: int,
                         hour_ops: list | None = None,
                         hist_stats: dict | None = None):
     """
-    v4.0: Resumen detallado al final de cada hora.
-    - hour_ops: lista de dicts con info por operación cerrada en esa hora.
-    - hist_stats: stats acumuladas del CSV para mostrar el total histórico.
+    v5.0: Resumen al final de cada hora.
+    SIEMPRE se envía (la condición de filtrado está en monitor.py).
 
     Cada entrada de hour_ops debe tener:
       direction, window, entry_btc, entry_odds (precio token compra),
@@ -181,6 +238,8 @@ def notify_hour_summary(cfg: dict, hour_utc, hour_wins: int, hour_losses: int,
                 f"<code>{tokens:.4f} tokens × {exit_odds:.4f}</code>\n"
                 f"   {res_ico} {result}  <b>{pnl_s} USDC</b>"
             )
+    else:
+        lines.append("\n<i>Sin operaciones esta hora</i>")
 
     # ── Acumulado histórico ───────────────────────────────────────────────
     if hist_stats:
@@ -202,9 +261,7 @@ def notify_hour_summary(cfg: dict, hour_utc, hour_wins: int, hour_losses: int,
 
 def notify_bet(cfg: dict, bet: dict, signal, simulated: bool = False):
     """
-    FIX v3.2:
-      - `signal` es ahora un argumento requerido (era omitido → TypeError)
-      - añade etiqueta [SIMULADO] cuando corresponde
+    Notifica apertura de apuesta con todos los detalles.
     """
     sim     = simulated or bet.get("simulated", False)
     sim_tag = "  <i>[SIMULADO]</i>" if sim else ""
@@ -224,7 +281,8 @@ def notify_bet(cfg: dict, bet: dict, signal, simulated: bool = False):
         f"Stake    : <code>${stake:.2f} USDC</code>\n"
         f"Odds     : <code>{odds_v:.4f}</code>  "
         f"Tokens: <code>{tokens:.4f}</code>\n"
-        f"Ret. est.: <code>+${pnl_est:.2f} USDC</code>"
+        f"Ret. est.: <code>${ret_est:.2f} USDC</code>  "
+        f"(+${pnl_est:.2f} / +{round((pnl_est/stake*100) if stake else 0, 1):.1f}%)"
     ))
 
 
