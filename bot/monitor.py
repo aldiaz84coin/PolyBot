@@ -1,17 +1,16 @@
 """
 monitor.py — Loop principal del bot: ventana horaria, stop loss, resolución
 
+v5.0 — FIXES NOTIFICACIONES:
+  1. Import notify_new_hour desde notifier
+  2. notify_hour_summary se llama SIEMPRE al cambio de hora (sin condición)
+  3. notify_new_hour se llama al inicio de cada hora nueva
+
 v4.0 — FIXES:
   1. CRASH 429 CoinGecko: get_btc_price() ya nunca lanza excepción fatal
-     (usa caché interna). Además se añade try/except local alrededor de la
-     llamada en el loop para máxima resiliencia.
-  2. HISTORIAL SIMULADO: se trackea hour_ops con detalle completo por
-     operación: precio BTC compra/venta, tokens comprados, odds entrada/salida,
-     resultado y P&L neto. Se muestra log detallado al cambio de hora y se
-     pasa a notify_hour_summary para Telegram.
+  2. HISTORIAL SIMULADO: hour_ops con detalle completo por operación
 
 v3.2 — FIX NOTIFICACIONES TELEGRAM EN MODO SIMULADO
-v3.1 — FIX DEPLOY: imports relativos para paquete modules/
 v3.0 — Pre-producción fixes (stop_pct, stats, simulate_mode)
 v2.9 — BUG FIX: señal WAIT ya no dispara execute_order
 v2.8 — FIX: _fetch_exit_token_price usa CLOB live
@@ -35,7 +34,7 @@ from notifier       import (
     notify_target_change, notify_target_failed,
     notify_market_found, notify_market_lost,
     notify_signal_eval,
-    notify_hour_summary,
+    notify_hour_summary, notify_new_hour,
     notify_error,
     notify_startup_summary,
 )
@@ -224,7 +223,6 @@ def _log_hour_ops(hour_utc: int, hour_ops: list, hist_stats: dict):
         )
 
     logger.info(_SEPARATOR2)
-    # Acumulado histórico
     hw   = hist_stats.get("wins", 0)
     hl   = hist_stats.get("losses", 0) + hist_stats.get("stops", 0)
     hp   = hist_stats.get("total_pnl", 0.0)
@@ -251,10 +249,15 @@ def _fetch_exit_token_price(active_bet: dict, cfg: dict) -> float | None:
     token_id       = None
 
     tokens = market.get("tokens", [])
-    for t in tokens:
-        if t.get("outcome") == outcome_target:
-            token_id = t.get("token_id")
-            break
+    # Soporta formato lista [{outcome, token_id}] y dict {yes: {token_id}}
+    if isinstance(tokens, dict):
+        t_data   = tokens.get("yes" if direction == "UP" else "no", {})
+        token_id = t_data.get("token_id") if isinstance(t_data, dict) else None
+    elif isinstance(tokens, list):
+        for t in tokens:
+            if t.get("outcome") == outcome_target:
+                token_id = t.get("token_id")
+                break
 
     if token_id:
         try:
@@ -349,7 +352,7 @@ def run(cfg: dict):
     hour_wins   = 0
     hour_losses = 0
     ops_hoy     = 0
-    hour_ops    = []   # v4.0: lista de operaciones cerradas en la hora actual
+    hour_ops    = []
 
     last_notified_signal_key = None
 
@@ -366,16 +369,18 @@ def run(cfg: dict):
             # ── Reset horario ─────────────────────────────────────────────
             if now_hour != last_hour:
                 if last_hour >= 0:
-                    # Mostrar resumen de la hora que termina
+                    # v5.0: resumen SIEMPRE al cambiar de hora (sin condición)
+                    hist_stats = _load_historical_stats(csv_path)
                     _log_hour_ops(last_hour, hour_ops, hist_stats)
-                    if hour_ops or (hour_wins + hour_losses) > 0:
-                        notify_hour_summary(
-                            cfg, last_hour,
-                            hour_wins, hour_losses,
-                            ops_hoy, target or 0.0,
-                            hour_ops=hour_ops,
-                            hist_stats=hist_stats,
-                        )
+                    notify_hour_summary(
+                        cfg, last_hour,
+                        hour_wins, hour_losses,
+                        ops_hoy, target or 0.0,
+                        hour_ops=hour_ops,
+                        hist_stats=hist_stats,
+                    )
+                # v5.0: notificar inicio de nueva hora SIEMPRE
+                notify_new_hour(cfg, now_hour, slug, target or 0.0)
                 # Reset contadores de hora
                 hour_wins                = 0
                 hour_losses              = 0
@@ -418,7 +423,7 @@ def run(cfg: dict):
                     time.sleep(interval)
                     continue
 
-            # ── Obtener precio BTC (v4.0: nunca crashea) ─────────────────
+            # ── Obtener precio BTC (nunca crashea) ────────────────────────
             try:
                 price = get_btc_price()
             except Exception as e:
@@ -437,7 +442,6 @@ def run(cfg: dict):
             if active_bet:
                 sim_ = active_bet.get("simulated", False)
 
-                # P&L de BTC para trigger del stop loss
                 entry_price = active_bet.get("entry", price)
                 if active_bet["direction"] == "UP":
                     pnl_btc = (price - entry_price) / entry_price * 100
@@ -470,7 +474,6 @@ def run(cfg: dict):
                     row    = _build_trade_row(active_bet, result, ts_now, pnl_usd, pnl_pct)
                     _csv_write_row(csv_path, row)
 
-                    # v4.0: registrar en hour_ops para resumen horario
                     hour_ops.append({
                         "direction":  active_bet["direction"],
                         "window":     active_bet["window"],
@@ -510,7 +513,6 @@ def run(cfg: dict):
                           (dir_ == "DOWN" and price < active_bet["target"])
 
                     if won:
-                        # WIN: tokens resuelven a $1.0 cada uno
                         exit_odds = 1.0
                         pnl_usd   = round(tokens_held * exit_odds - stake_, 2)
                         pnl_pct   = round((pnl_usd / stake_) * 100, 1) if stake_ > 0 else 0
@@ -531,7 +533,6 @@ def run(cfg: dict):
                         else:
                             logger.info("[MONITOR] [SIMULADO] Claim omitido en modo simulado")
                     else:
-                        # LOSS: tokens resuelven a $0.0
                         exit_odds = 0.0
                         pnl_usd   = -stake_
                         pnl_pct   = -100.0
@@ -549,7 +550,6 @@ def run(cfg: dict):
                     row    = _build_trade_row(active_bet, result, ts_now, pnl_usd, pnl_pct)
                     _csv_write_row(csv_path, row)
 
-                    # v4.0: registrar en hour_ops para resumen horario
                     hour_ops.append({
                         "direction":  active_bet["direction"],
                         "window":     active_bet["window"],
@@ -591,8 +591,6 @@ def run(cfg: dict):
 
             signal = evaluate(price, target, mins_left, cfg)
 
-            # Notificar cualquier señal en ventana (no solo accionables)
-            # Solo al cambiar de ventana o dirección para evitar spam
             if signal:
                 signal_key = (signal.window, signal.direction.value)
                 if signal_key != last_notified_signal_key:
@@ -609,7 +607,7 @@ def run(cfg: dict):
                     result_order = execute_order(signal, market, cfg)
                     if result_order:
                         ops_hoy += 1
-                        entry_odds = result_order.get("odds", 0.5)
+                        entry_odds    = result_order.get("odds", 0.5)
                         tokens_bought = round(stake / max(entry_odds, 0.001), 4)
 
                         active_bet = {
