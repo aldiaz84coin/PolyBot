@@ -1,22 +1,21 @@
 """
 monitor.py — Loop principal del bot: ventana horaria, stop loss, resolución
 
-v3.2 — FIX NOTIFICACIONES TELEGRAM EN MODO SIMULADO:
-  1. BUG CRÍTICO: notify_bet(cfg, active_bet) llamado sin argumento `signal`
-     → TypeError → crash del loop → ninguna notificación posterior llegaba.
-     FIXED: notify_bet(cfg, active_bet, signal)
-  2. BUG: notify_signal_eval solo se llamaba si señal accionable.
-     → Evaluaciones WAIT (distancia insuficiente) nunca llegaban al chat.
-     FIXED: se llama para CUALQUIER señal en ventana, con tracker de cambio
-     para evitar spam (solo notifica al entrar en ventana o cambiar dirección).
-  3. BUG: notificaciones de apuesta/resultado no etiquetaban [SIMULADO].
-     FIXED: sim_tag añadido a notify_bet, notify_win, notify_loss, notify_stop_loss.
+v4.0 — FIXES:
+  1. CRASH 429 CoinGecko: get_btc_price() ya nunca lanza excepción fatal
+     (usa caché interna). Además se añade try/except local alrededor de la
+     llamada en el loop para máxima resiliencia.
+  2. HISTORIAL SIMULADO: se trackea hour_ops con detalle completo por
+     operación: precio BTC compra/venta, tokens comprados, odds entrada/salida,
+     resultado y P&L neto. Se muestra log detallado al cambio de hora y se
+     pasa a notify_hour_summary para Telegram.
 
+v3.2 — FIX NOTIFICACIONES TELEGRAM EN MODO SIMULADO
 v3.1 — FIX DEPLOY: imports relativos para paquete modules/
-v3.0 — Pre-producción fixes (stop_pct, stats, simulate_mode).
-v2.9 — BUG FIX: señal WAIT ya no dispara execute_order.
-v2.8 — FIX: _fetch_exit_token_price usa CLOB live.
-v2.7 — Retornos reales desde Polymarket + odds reales en active_bet.
+v3.0 — Pre-producción fixes (stop_pct, stats, simulate_mode)
+v2.9 — BUG FIX: señal WAIT ya no dispara execute_order
+v2.8 — FIX: _fetch_exit_token_price usa CLOB live
+v2.7 — Retornos reales desde Polymarket
 """
 import csv
 import logging
@@ -141,10 +140,7 @@ def _build_trade_row(bet, result, ts_cierre, pnl_usd, pnl_pct):
 # ── Historial acumulado ───────────────────────────────────────────────────────
 
 def _load_historical_stats(csv_path: str) -> dict:
-    """
-    Lee el CSV completo y devuelve stats acumuladas.
-    FIX v3.0: se llama tras CADA cierre de operación (no solo al inicio).
-    """
+    """Lee el CSV completo y devuelve stats acumuladas."""
     stats = {
         "total_ops": 0, "wins": 0, "losses": 0, "stops": 0,
         "total_pnl": 0.0, "total_invested": 0.0,
@@ -165,8 +161,8 @@ def _load_historical_stats(csv_path: str) -> dict:
                 elif result == "STOP":
                     stats["stops"]  += 1
                 try:
-                    stats["total_pnl"]      += float(row.get("pnl_usd", 0))
-                    stats["total_invested"]  += float(row.get("stake_usd", 0))
+                    stats["total_pnl"]     += float(row.get("pnl_usd", 0))
+                    stats["total_invested"] += float(row.get("stake_usd", 0))
                 except ValueError:
                     pass
     except Exception as e:
@@ -175,10 +171,10 @@ def _load_historical_stats(csv_path: str) -> dict:
 
 
 def _log_accumulated_stats(stats: dict, label: str = "HISTORIAL"):
-    wins     = stats["wins"]
-    losses   = stats["losses"] + stats["stops"]
-    wr       = round(wins / (wins + losses) * 100) if (wins + losses) > 0 else 0
-    sign     = "+" if stats["total_pnl"] >= 0 else ""
+    wins   = stats["wins"]
+    losses = stats["losses"] + stats["stops"]
+    wr     = round(wins / (wins + losses) * 100) if (wins + losses) > 0 else 0
+    sign   = "+" if stats["total_pnl"] >= 0 else ""
     logger.info(
         f"[MONITOR] 📊 {label}: "
         f"{stats['total_ops']} ops  "
@@ -186,6 +182,60 @@ def _log_accumulated_stats(stats: dict, label: str = "HISTORIAL"):
         f"P&L={sign}${stats['total_pnl']:,.2f}  "
         f"Invertido=${stats['total_invested']:,.2f}"
     )
+
+
+def _log_hour_ops(hour_utc: int, hour_ops: list, hist_stats: dict):
+    """
+    Muestra tabla detallada de operaciones de la hora actual + acumulado.
+    Se imprime al cambio de hora y al finalizar la sesión.
+    """
+    if not hour_ops:
+        return
+
+    logger.info(_SEPARATOR)
+    logger.info(f"[MONITOR] 📋 RESUMEN HORA {hour_utc:02d}:00 UTC — {len(hour_ops)} operación(es)")
+    logger.info(
+        f"[MONITOR] {'#':>2}  {'Dir':<5} {'Ventana':<6}  "
+        f"{'BTC compra':>10}  {'Tokens':>8}  {'Odds E':>6}  "
+        f"{'Odds S':>6}  {'BTC cierre':>10}  {'Resultado':<6}  {'P&L':>10}"
+    )
+    logger.info(_SEPARATOR2)
+
+    total_pnl = 0.0
+    for i, op in enumerate(hour_ops, 1):
+        direction  = op.get("direction", "—")
+        window     = op.get("window", "—")
+        entry_btc  = op.get("entry_btc", 0)
+        entry_odds = op.get("entry_odds", 0)
+        tokens     = op.get("tokens", 0)
+        exit_odds  = op.get("exit_odds", 0)
+        exit_btc   = op.get("exit_btc", 0)
+        result     = op.get("result", "—")
+        pnl        = op.get("pnl_usd", 0)
+        sim        = " [SIM]" if op.get("simulated") else ""
+        total_pnl += pnl
+
+        pnl_str = f"{'+' if pnl >= 0 else ''}{pnl:,.2f}"
+        logger.info(
+            f"[MONITOR] {i:>2}.{sim}  {direction:<5} {window:<6}  "
+            f"${entry_btc:>9,.2f}  {tokens:>8.4f}  {entry_odds:>6.4f}  "
+            f"{exit_odds:>6.4f}  ${exit_btc:>9,.2f}  {result:<6}  "
+            f"${pnl_str:>9}"
+        )
+
+    logger.info(_SEPARATOR2)
+    # Acumulado histórico
+    hw   = hist_stats.get("wins", 0)
+    hl   = hist_stats.get("losses", 0) + hist_stats.get("stops", 0)
+    hp   = hist_stats.get("total_pnl", 0.0)
+    hr   = round(hw / (hw + hl) * 100) if (hw + hl) > 0 else 0
+    hs   = "+" if hp >= 0 else ""
+    ht   = f"{'+' if total_pnl >= 0 else ''}{total_pnl:,.2f}"
+    logger.info(
+        f"[MONITOR] Hora: P&L ${ht}  |  "
+        f"Acumulado: {hw}W/{hl}L WR={hr}%  P&L neto {hs}${hp:,.2f}"
+    )
+    logger.info(_SEPARATOR)
 
 
 # ── Exit token price (stop loss) ──────────────────────────────────────────────
@@ -218,7 +268,7 @@ def _fetch_exit_token_price(active_bet: dict, cfg: dict) -> float | None:
         except Exception as e:
             logger.warning(f"[MONITOR] ⚠ CLOB midpoint falló: {e}")
 
-    # Fallback: Gamma API
+    # Fallback: Gamma API por conditionId
     cond_id = market.get("condition_id", "")
     if cond_id:
         try:
@@ -243,7 +293,7 @@ def _fetch_exit_token_price(active_bet: dict, cfg: dict) -> float | None:
                     )
                     return price_fallback
         except Exception as e:
-            logger.warning(f"[MONITOR] ⚠ Gamma fallback falló para conditionId={cond_id}: {e}")
+            logger.warning(f"[MONITOR] ⚠ Gamma fallback falló: {e}")
 
     logger.error("[MONITOR] ❌ No se pudo obtener exit token price — usando fallback % fijo")
     return None
@@ -271,17 +321,14 @@ def run(cfg: dict):
     stake         = cfg["capital"]["stake_usdc"]
     max_ops       = cfg["capital"]["max_operaciones_dia"]
     interval      = cfg["strategy"].get("monitor_intervalo_s", 5)
-    # FIX v3.0: stop_loss_pct es ya un porcentaje (ej: 5 = 5%).
-    # NO multiplicar × 100 al comparar con pnl_btc.
     stop_pct      = cfg["strategy"].get("stop_loss_pct", 5.0)
-    simulate_mode = cfg["strategy"].get("simulate_mode", False)
+    simulate_mode = cfg.get("strategy", {}).get("simulate_mode", False)
     csv_path      = cfg.get("logging", {}).get("historial_csv", "logs/operaciones.csv")
 
     # ── Cargar y mostrar historial acumulado ──────────────────────────────
     hist_stats = _load_historical_stats(csv_path)
     _log_accumulated_stats(hist_stats)
 
-    # Acumuladores de sesión
     session_pnl      = 0.0
     session_invested = 0.0
     session_wins     = 0
@@ -293,19 +340,18 @@ def run(cfg: dict):
     # ── Estado de mercado/hora ────────────────────────────────────────────
     market       = None
     slug         = None
-    last_slug    = None
     target       = None
     active_bet   = None
     fired_window = None
     last_hour    = -1
+    last_slug    = None
 
     hour_wins   = 0
     hour_losses = 0
     ops_hoy     = 0
+    hour_ops    = []   # v4.0: lista de operaciones cerradas en la hora actual
 
-    # FIX v3.2: tracker para notify_signal_eval — evita spam enviando solo
-    # cuando se entra en una ventana nueva o cambia la dirección evaluada.
-    last_notified_signal_key = None   # (window_key, direction_value)
+    last_notified_signal_key = None
 
     logger.info(_SEPARATOR)
     sim_tag = " [MODO SIMULADO]" if simulate_mode else ""
@@ -319,16 +365,23 @@ def run(cfg: dict):
 
             # ── Reset horario ─────────────────────────────────────────────
             if now_hour != last_hour:
-                if last_hour >= 0 and (hour_wins + hour_losses) > 0:
-                    notify_hour_summary(
-                        cfg, last_hour,
-                        hour_wins, hour_losses,
-                        ops_hoy, target,
-                    )
+                if last_hour >= 0:
+                    # Mostrar resumen de la hora que termina
+                    _log_hour_ops(last_hour, hour_ops, hist_stats)
+                    if hour_ops or (hour_wins + hour_losses) > 0:
+                        notify_hour_summary(
+                            cfg, last_hour,
+                            hour_wins, hour_losses,
+                            ops_hoy, target or 0.0,
+                            hour_ops=hour_ops,
+                            hist_stats=hist_stats,
+                        )
+                # Reset contadores de hora
                 hour_wins                = 0
                 hour_losses              = 0
                 last_hour                = now_hour
                 ops_hoy                  = 0
+                hour_ops                 = []
                 last_notified_signal_key = None
 
             # ── Obtener mercado (primero) ─────────────────────────────────
@@ -343,7 +396,7 @@ def run(cfg: dict):
                     f"           conditionId: {market.get('condition_id', '—')}"
                 )
                 last_slug = slug
-                target    = None  # forzar re-fetch del target con nuevo slug
+                target    = None
                 last_notified_signal_key = None
 
             if not market:
@@ -365,10 +418,16 @@ def run(cfg: dict):
                     time.sleep(interval)
                     continue
 
-            # ── Obtener precio BTC ────────────────────────────────────────
-            price = get_btc_price()
+            # ── Obtener precio BTC (v4.0: nunca crashea) ─────────────────
+            try:
+                price = get_btc_price()
+            except Exception as e:
+                logger.warning(f"[MONITOR] ⚠ Precio BTC no disponible: {e} — saltando ciclo")
+                time.sleep(interval)
+                continue
+
             if not price:
-                logger.warning("[MONITOR] ⚠ Precio BTC no disponible")
+                logger.warning("[MONITOR] ⚠ Precio BTC = None — saltando ciclo")
                 time.sleep(interval)
                 continue
 
@@ -378,22 +437,26 @@ def run(cfg: dict):
             if active_bet:
                 sim_ = active_bet.get("simulated", False)
 
-                # Calcular P&L de BTC para el stop loss trigger
+                # P&L de BTC para trigger del stop loss
                 entry_price = active_bet.get("entry", price)
-                pnl_btc = ((price - entry_price) / entry_price) * 100
-                if active_bet["direction"] == "DOWN":
-                    pnl_btc = -pnl_btc
+                if active_bet["direction"] == "UP":
+                    pnl_btc = (price - entry_price) / entry_price * 100
+                else:
+                    pnl_btc = (entry_price - price) / entry_price * 100
 
                 if pnl_btc <= -stop_pct:
-                    exit_price = _fetch_exit_token_price(active_bet, cfg)
-                    stake_     = active_bet.get("stake", stake)
-                    if exit_price is not None:
-                        shares_  = stake_ / max(active_bet.get("odds", 0.5), 0.001)
-                        pnl_usd  = round(shares_ * exit_price - stake_, 2)
+                    exit_token_price = _fetch_exit_token_price(active_bet, cfg)
+                    stake_           = active_bet.get("stake", stake)
+                    entry_odds       = active_bet.get("odds", 0.5)
+                    tokens_held      = round(stake_ / max(entry_odds, 0.001), 4)
+
+                    if exit_token_price is not None:
+                        pnl_usd  = round(tokens_held * exit_token_price - stake_, 2)
                         pnl_pct  = round((pnl_usd / stake_) * 100, 1) if stake_ > 0 else 0.0
                     else:
-                        pnl_usd = round(-stake_ * (stop_pct / 100), 2)
-                        pnl_pct = -stop_pct
+                        pnl_usd  = round(-stake_ * (stop_pct / 100), 2)
+                        pnl_pct  = -stop_pct
+                        exit_token_price = max(entry_odds + pnl_usd / tokens_held, 0.0) if tokens_held else 0.0
 
                     result = "STOP"
                     logger.info(
@@ -401,13 +464,26 @@ def run(cfg: dict):
                         f"BTC movimiento: {pnl_btc:+.2f}%  "
                         f"P&L: ${pnl_usd:+.2f} ({pnl_pct:+.1f}%)"
                     )
-                    # FIX v3.2: sim_tag en notificación stop loss
-                    notify_stop_loss(cfg, active_bet, price, pnl_usd,
-                                     simulated=sim_)
+                    notify_stop_loss(cfg, active_bet, price, pnl_usd, simulated=sim_)
 
                     ts_now = datetime.now(timezone.utc).isoformat()
                     row    = _build_trade_row(active_bet, result, ts_now, pnl_usd, pnl_pct)
                     _csv_write_row(csv_path, row)
+
+                    # v4.0: registrar en hour_ops para resumen horario
+                    hour_ops.append({
+                        "direction":  active_bet["direction"],
+                        "window":     active_bet["window"],
+                        "entry_btc":  active_bet["entry"],
+                        "entry_odds": entry_odds,
+                        "stake":      stake_,
+                        "tokens":     tokens_held,
+                        "exit_odds":  exit_token_price,
+                        "exit_btc":   price,
+                        "result":     result,
+                        "pnl_usd":    pnl_usd,
+                        "simulated":  sim_,
+                    })
 
                     session_pnl      += pnl_usd
                     session_invested += stake_
@@ -425,27 +501,26 @@ def run(cfg: dict):
 
                 # ── Resolución al cierre de vela ──────────────────────────
                 if mins_left <= 0:
-                    dir_    = active_bet["direction"]
-                    stake_  = active_bet.get("stake", stake)
+                    dir_   = active_bet["direction"]
+                    stake_ = active_bet.get("stake", stake)
+                    odds_  = active_bet.get("odds", 0.5)
+                    tokens_held = round(stake_ / max(odds_, 0.001), 4)
 
-                    if dir_ == "UP":
-                        won = price > active_bet["target"]
-                    else:
-                        won = price < active_bet["target"]
+                    won = (dir_ == "UP" and price > active_bet["target"]) or \
+                          (dir_ == "DOWN" and price < active_bet["target"])
 
                     if won:
-                        odds_   = active_bet.get("odds", 0.5)
-                        shares  = stake_ / max(odds_, 0.001)
-                        pnl_usd = round(shares - stake_, 2)
-                        pnl_pct = round((pnl_usd / stake_) * 100, 1) if stake_ > 0 else 0
-                        result  = "WIN"
-                        hour_wins     += 1
-                        session_wins  += 1
-                        # FIX v3.2: sim_tag en notificación WIN
+                        # WIN: tokens resuelven a $1.0 cada uno
+                        exit_odds = 1.0
+                        pnl_usd   = round(tokens_held * exit_odds - stake_, 2)
+                        pnl_pct   = round((pnl_usd / stake_) * 100, 1) if stake_ > 0 else 0
+                        result    = "WIN"
+                        hour_wins    += 1
+                        session_wins += 1
                         notify_win(cfg, active_bet, price, simulated=sim_)
                         logger.info(
                             f"[MONITOR] {'[SIMULADO] ' if sim_ else ''}✅ WIN — "
-                            f"Invertido: ${stake_:.2f}  "
+                            f"Tokens: {tokens_held:.4f} × {exit_odds:.4f} = ${tokens_held:.2f}  "
                             f"P&L: +${pnl_usd:.2f} (+{pnl_pct:.1f}%)"
                         )
                         if not sim_:
@@ -456,16 +531,17 @@ def run(cfg: dict):
                         else:
                             logger.info("[MONITOR] [SIMULADO] Claim omitido en modo simulado")
                     else:
-                        pnl_usd = -stake_
-                        pnl_pct = -100.0
-                        result  = "LOSS"
+                        # LOSS: tokens resuelven a $0.0
+                        exit_odds = 0.0
+                        pnl_usd   = -stake_
+                        pnl_pct   = -100.0
+                        result    = "LOSS"
                         hour_losses    += 1
                         session_losses += 1
-                        # FIX v3.2: sim_tag en notificación LOSS
                         notify_loss(cfg, active_bet, price, simulated=sim_)
                         logger.info(
                             f"[MONITOR] {'[SIMULADO] ' if sim_ else ''}❌ LOSS — "
-                            f"Invertido: ${stake_:.2f}  "
+                            f"Tokens: {tokens_held:.4f} × {exit_odds:.4f} = $0.00  "
                             f"P&L: -${stake_:.2f} (-100%)"
                         )
 
@@ -473,10 +549,24 @@ def run(cfg: dict):
                     row    = _build_trade_row(active_bet, result, ts_now, pnl_usd, pnl_pct)
                     _csv_write_row(csv_path, row)
 
+                    # v4.0: registrar en hour_ops para resumen horario
+                    hour_ops.append({
+                        "direction":  active_bet["direction"],
+                        "window":     active_bet["window"],
+                        "entry_btc":  active_bet["entry"],
+                        "entry_odds": odds_,
+                        "stake":      stake_,
+                        "tokens":     tokens_held,
+                        "exit_odds":  exit_odds,
+                        "exit_btc":   price,
+                        "result":     result,
+                        "pnl_usd":    pnl_usd,
+                        "simulated":  sim_,
+                    })
+
                     session_pnl      += pnl_usd
                     session_invested += stake_
 
-                    # FIX v3.0: Recargar CSV y mostrar resumen real
                     hist_stats = _load_historical_stats(csv_path)
                     _log_accumulated_stats(hist_stats, label=f"TRAS {result}")
 
@@ -484,7 +574,8 @@ def run(cfg: dict):
                     logger.info(
                         f"[MONITOR]    P&L sesión : {sign_s}${session_pnl:,.2f} USDC  "
                         f"(invertido ${session_invested:,.2f})\n"
-                        f"[MONITOR]    Acumulado  : {'+' if hist_stats['total_pnl'] >= 0 else ''}${hist_stats['total_pnl']:,.2f} USDC"
+                        f"[MONITOR]    Acumulado  : "
+                        f"{'+' if hist_stats['total_pnl'] >= 0 else ''}${hist_stats['total_pnl']:,.2f} USDC"
                     )
 
                     active_bet               = None
@@ -500,9 +591,8 @@ def run(cfg: dict):
 
             signal = evaluate(price, target, mins_left, cfg)
 
-            # FIX v3.2: notify_signal_eval para CUALQUIER señal en ventana,
-            # no solo accionables. Solo notifica cuando hay cambio real
-            # (nueva ventana o cambio de dirección) para evitar spam.
+            # Notificar cualquier señal en ventana (no solo accionables)
+            # Solo al cambiar de ventana o dirección para evitar spam
             if signal:
                 signal_key = (signal.window, signal.direction.value)
                 if signal_key != last_notified_signal_key:
@@ -513,12 +603,15 @@ def run(cfg: dict):
                     )
                     last_notified_signal_key = signal_key
 
-            # FIX v2.9 + v3.2: solo ejecutar si accionable
+            # Ejecutar solo si señal accionable
             if signal and signal.is_actionable and not active_bet and fired_window != signal.window:
                 if ops_hoy < max_ops:
                     result_order = execute_order(signal, market, cfg)
                     if result_order:
                         ops_hoy += 1
+                        entry_odds = result_order.get("odds", 0.5)
+                        tokens_bought = round(stake / max(entry_odds, 0.001), 4)
+
                         active_bet = {
                             "id":          result_order.get("id", ""),
                             "direction":   signal.direction.value,
@@ -528,8 +621,8 @@ def run(cfg: dict):
                             "distance":    signal.distance,
                             "umbral":      signal.umbral,
                             "stake":       stake,
-                            "odds":        result_order.get("odds", 0.5),
-                            "tokens":      result_order.get("tokens", ""),
+                            "odds":        entry_odds,
+                            "tokens":      tokens_bought,
                             "market":      market,
                             "market_slug": slug,
                             "simulated":   result_order.get("simulated", False),
@@ -537,26 +630,24 @@ def run(cfg: dict):
                         }
                         fired_window = signal.window
 
-                        odds_v      = active_bet["odds"]
-                        retorno_est = round(stake / max(odds_v, 0.001), 2)
+                        retorno_est = round(tokens_bought, 2)
                         pnl_est     = round(retorno_est - stake, 2)
                         pct_est     = round((pnl_est / stake) * 100, 1) if stake > 0 else 0
 
-                        sim_tag = " [SIMULADO]" if active_bet["simulated"] else ""
+                        sim_tag_log = " [SIMULADO]" if active_bet["simulated"] else ""
                         logger.info(
                             f"[MONITOR] {'🟢' if signal.direction == Direction.UP else '🔴'}"
-                            f"{sim_tag} Apuesta {signal.direction.value} ejecutada\n"
+                            f"{sim_tag_log} Apuesta {signal.direction.value} ejecutada\n"
                             f"           Entry     : ${price:,.2f}\n"
                             f"           Target    : ${target:,.2f}\n"
                             f"           Ventana   : {signal.window}\n"
                             f"           Stake     : ${stake:.2f} USDC\n"
-                            f"           Odds      : {odds_v:.4f}  ({odds_v*100:.1f}%)\n"
+                            f"           Odds      : {entry_odds:.4f}  ({entry_odds*100:.1f}%)\n"
+                            f"           Tokens    : {tokens_bought:.4f}\n"
                             f"           Ret. est. : ${retorno_est:.2f} USDC  "
                             f"(+${pnl_est:.2f} / +{pct_est:.1f}%)"
                         )
-                        # FIX v3.2: CORREGIDO — se pasa `signal` como 3er argumento
-                        notify_bet(cfg, active_bet, signal,
-                                   simulated=active_bet["simulated"])
+                        notify_bet(cfg, active_bet, signal, simulated=active_bet["simulated"])
                     else:
                         logger.error("[MONITOR] ❌ execute_order devolvió None — no se abre apuesta")
                 else:
@@ -574,6 +665,7 @@ def run(cfg: dict):
     finally:
         notify_stop(cfg)
         final_stats = _load_historical_stats(csv_path)
+        _log_hour_ops(last_hour, hour_ops, final_stats)
         _log_accumulated_stats(final_stats, label="FINAL DE SESIÓN")
         logger.info(
             f"[MONITOR] Sesión: {session_wins}W {session_losses}L  "
