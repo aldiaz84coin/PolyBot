@@ -35,7 +35,7 @@ try:
         notify_market_found, notify_market_lost,
         notify_target_change, notify_target_failed,
         notify_signal_eval,
-        notify_bet, notify_bet_failed,
+        notify_bet,
         notify_win, notify_loss, notify_stop_loss,
         notify_order_failed,
     )
