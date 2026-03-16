@@ -2,6 +2,12 @@
 market_scanner.py  ·  bot/modules/
 Detecta el mercado BTC Up/Down activo en Polymarket Gamma API.
 
+FIX v6.1 (FALLBACK LISTA ACTIVA):
+  La Gamma API a veces devuelve [] para ?slug= aunque el slug sea correcto.
+  Nuevo fallback: cuando todos los slugs devuelven vacío, se consulta la lista
+  de mercados activos (?active=true&closed=false&limit=50) y se filtra por slug.
+  Esto hace el bot inmune a cambios de comportamiento del endpoint de Gamma.
+
 FIX v6 (PRECIOS LIVE DESDE CLOB):
   La Gamma API devuelve precios cacheados en tokens[].price — no son en tiempo real.
   Los precios dinámicos de Polymarket viven en el CLOB API (midpoint).
@@ -156,57 +162,42 @@ def _fetch_live_price(token_id: str) -> float | None:
     FIX v6: Obtiene el precio LIVE del token desde el CLOB API (midpoint).
     El midpoint es el precio justo entre el mejor bid y el mejor ask.
     Este es el precio real que Polymarket muestra en la UI.
-
-    GET https://clob.polymarket.com/midpoint?token_id={id} → {"mid": "0.73"}
-    No requiere autenticación.
     """
     try:
         r = requests.get(
             CLOB_MIDPOINT,
             params={"token_id": token_id},
-            timeout=5,
+            timeout=TIMEOUT,
         )
         r.raise_for_status()
-        data  = r.json()
-        mid   = data.get("mid")
+        mid = r.json().get("mid")
         if mid is not None:
             return float(mid)
     except Exception as e:
-        logger.debug(f"[SCANNER] CLOB midpoint error para {str(token_id)[:16]}...: {e}")
+        logger.debug(f"[SCANNER] CLOB midpoint error para token {str(token_id)[:16]}...: {e}")
     return None
 
 
-def _enrich_token_prices(tokens: list[dict]) -> list[dict]:
+def _enrich_token_prices(tokens: list) -> list:
     """
-    FIX v6: Enriquece los tokens con precios LIVE desde el CLOB.
-    Reemplaza el precio de Gamma (cacheado) por el precio real del orderbook.
-    Si el CLOB falla, conserva el precio de Gamma como fallback.
+    FIX v6: Reemplaza los precios de Gamma (cacheados) por precios live del CLOB.
+    Fallback: mantiene precio de Gamma si el CLOB no responde.
     """
-    enriched = []
-    for token in tokens:
-        token_id    = token.get("token_id", "")
-        gamma_price = float(token.get("price", 0.5))
-        live_price  = _fetch_live_price(token_id) if token_id else None
-
-        if live_price is not None:
-            logger.debug(
-                f"[SCANNER] Precio LIVE {token.get('outcome','?')}: "
-                f"{gamma_price:.4f} (Gamma) → {live_price:.4f} (CLOB)"
-            )
-            enriched.append({**token, "price": live_price, "price_source": "clob"})
+    for t in tokens:
+        token_id = t.get("token_id")
+        if not token_id:
+            continue
+        live = _fetch_live_price(token_id)
+        if live is not None:
+            t["price"]        = live
+            t["price_source"] = "clob"
         else:
-            logger.debug(
-                f"[SCANNER] Precio FALLBACK {token.get('outcome','?')}: "
-                f"{gamma_price:.4f} (Gamma, CLOB no disponible)"
-            )
-            enriched.append({**token, "price": gamma_price, "price_source": "gamma"})
-
-    return enriched
+            t["price_source"] = "gamma"
+    return tokens
 
 
-def _rebuild_tokens_from_clob(market_raw: dict) -> list[dict]:
+def _rebuild_tokens_from_clob(market_raw: dict) -> list:
     """
-    FIX v5: Reconstruye la lista de tokens desde clobTokenIds cuando tokens[] viene vacío.
     FIX v6: Los precios ya NO se hardcodean a 0.5 — se obtienen del CLOB en _enrich_token_prices().
 
     Polymarket Gamma API siempre incluye clobTokenIds aunque omita tokens[].
@@ -238,6 +229,39 @@ def _rebuild_tokens_from_clob(market_raw: dict) -> list[dict]:
         return []
 
 
+# ── Fallback: búsqueda por lista activa (FIX v6.1) ───────────────────────────
+
+def _find_market_in_active_list(slugs: list[str]) -> dict | None:
+    """
+    FIX v6.1: La Gamma API a veces devuelve [] para ?slug= aunque el slug sea correcto.
+    Fallback: consulta la lista de mercados activos y filtra por slug coincidente.
+    """
+    slug_set = set(slugs)
+    urls = [
+        f"{GAMMA_API}?active=true&closed=false&limit=50&tag=bitcoin",
+        f"{GAMMA_API}?active=true&closed=false&limit=100",
+    ]
+
+    for url in urls:
+        try:
+            r = requests.get(url, timeout=TIMEOUT)
+            r.raise_for_status()
+            markets = r.json()
+            if not isinstance(markets, list):
+                markets = markets.get("markets", [])
+
+            for m in markets:
+                m_slug = m.get("slug", "")
+                if m_slug in slug_set:
+                    logger.info(f"[SCANNER] ✅ Mercado encontrado via fallback lista activa — slug={m_slug}")
+                    return m
+
+        except Exception as e:
+            logger.warning(f"[SCANNER] ⚠ Fallback lista activa error ({url}): {e}")
+
+    return None
+
+
 # ── Mercado activo ────────────────────────────────────────────────────────────
 
 def get_active_market() -> dict | None:
@@ -246,6 +270,10 @@ def get_active_market() -> dict | None:
     slugs = _build_slugs(now)
     logger.info(f"[SCANNER] Buscando mercado activo — slugs: {slugs}")
 
+    raw_market = None
+    found_slug = None
+
+    # ── Intento 1: búsqueda directa por slug ─────────────────────────────────
     for slug in slugs:
         try:
             r = requests.get(GAMMA_API, params={"slug": slug}, timeout=TIMEOUT)
@@ -257,65 +285,9 @@ def get_active_market() -> dict | None:
                 logger.debug(f"[SCANNER] Sin resultados para slug={slug}")
                 continue
 
-            m        = data[0]
-            question = m.get("question", "—")
-            cond_id  = m.get("conditionId", m.get("condition_id", "—"))
-            end_date = m.get("endDateIso", m.get("end_date_iso", m.get("endDate", "—")))
-            tokens   = m.get("tokens", [])
-
-            # FIX v5: fallback a clobTokenIds si tokens viene vacío
-            if not tokens:
-                tokens = _rebuild_tokens_from_clob(m)
-                if tokens:
-                    m["tokens"] = tokens
-
-            # FIX v6: enriquecer SIEMPRE con precios live del CLOB
-            tokens = _enrich_token_prices(tokens)
-
-            yes_p = next((t["price"] for t in tokens if t.get("outcome") == "Yes"), None)
-            no_p  = next((t["price"] for t in tokens if t.get("outcome") == "No"),  None)
-
-            end_ms = _parse_end_ms(m)
-            if not end_ms:
-                end_ms = _slug_to_end_ms(slug, now)
-                if end_ms:
-                    logger.debug(f"[SCANNER] end_ms derivado del slug (fallback): {end_ms}")
-
-            mins = max(0, (end_ms - int(now.timestamp() * 1000)) / 60_000) if end_ms else None
-
-            if _last_slug is None:
-                logger.info(f"[SCANNER] ✅ Mercado inicial detectado")
-            elif _last_slug != slug:
-                logger.info(
-                    f"[SCANNER] 🔄 CAMBIO DE SLUG:\n"
-                    f"           Anterior : {_last_slug}\n"
-                    f"           Nuevo    : {slug}"
-                )
-            _last_slug = slug
-
-            sources = {t.get("outcome"): t.get("price_source", "?") for t in tokens}
-            logger.info(
-                f"[SCANNER] Mercado activo:\n"
-                f"           Pregunta   : {question}\n"
-                f"           Slug       : {slug}\n"
-                f"           ConditionID: {cond_id}\n"
-                f"           Cierre     : {end_date}\n"
-                f"           YES price  : {yes_p:.4f} ({sources.get('Yes','?')})  "
-                f"NO price: {no_p:.4f} ({sources.get('No','?')})"
-            )
-
-            market = {
-                "question":     question,
-                "condition_id": cond_id,
-                "slug":         slug,
-                "end_ms":       end_ms,
-                "yes_price":    yes_p,
-                "no_price":     no_p,
-                "tokens":       tokens,
-                "neg_risk":     m.get("neg_risk", False),
-                "mins_to_close": round(mins, 2) if mins is not None else None,
-            }
-            return market
+            raw_market = data[0]
+            found_slug = slug
+            break
 
         except requests.exceptions.Timeout:
             logger.warning(f"[SCANNER] ⚠ Timeout ({TIMEOUT}s) en slug={slug}")
@@ -326,8 +298,77 @@ def get_active_market() -> dict | None:
         except Exception as e:
             logger.error(f"[SCANNER] ❌ Error inesperado en slug={slug}: {type(e).__name__}: {e}")
 
-    logger.warning(f"[SCANNER] ⚠ Ningún mercado encontrado — slugs probados: {slugs}")
-    return None
+    # ── Intento 2: fallback por lista activa (FIX v6.1) ──────────────────────
+    if raw_market is None:
+        logger.warning("[SCANNER] ⚠ Slug search vacío — activando fallback por lista activa")
+        raw_market = _find_market_in_active_list(slugs)
+        if raw_market:
+            found_slug = raw_market.get("slug", slugs[0])
+
+    if raw_market is None:
+        logger.warning(f"[SCANNER] ⚠ Ningún mercado encontrado — slugs probados: {slugs}")
+        return None
+
+    # ── Procesar el mercado encontrado ────────────────────────────────────────
+    m        = raw_market
+    slug     = found_slug
+    question = m.get("question", "—")
+    cond_id  = m.get("conditionId", m.get("condition_id", "—"))
+    end_date = m.get("endDateIso", m.get("end_date_iso", m.get("endDate", "—")))
+    tokens   = m.get("tokens", [])
+
+    # FIX v5: fallback a clobTokenIds si tokens viene vacío
+    if not tokens:
+        tokens = _rebuild_tokens_from_clob(m)
+        if tokens:
+            m["tokens"] = tokens
+
+    # FIX v6: enriquecer SIEMPRE con precios live del CLOB
+    tokens = _enrich_token_prices(tokens)
+
+    yes_p = next((t["price"] for t in tokens if t.get("outcome") == "Yes"), None)
+    no_p  = next((t["price"] for t in tokens if t.get("outcome") == "No"),  None)
+
+    end_ms = _parse_end_ms(m)
+    if not end_ms:
+        end_ms = _slug_to_end_ms(slug, now)
+        if end_ms:
+            logger.debug(f"[SCANNER] end_ms derivado del slug (fallback): {end_ms}")
+
+    mins = max(0, (end_ms - int(now.timestamp() * 1000)) / 60_000) if end_ms else None
+
+    if _last_slug is None:
+        logger.info(f"[SCANNER] ✅ Mercado inicial detectado")
+    elif _last_slug != slug:
+        logger.info(
+            f"[SCANNER] 🔄 CAMBIO DE SLUG:\n"
+            f"           Anterior : {_last_slug}\n"
+            f"           Nuevo    : {slug}"
+        )
+    _last_slug = slug
+
+    sources = {t.get("outcome"): t.get("price_source", "?") for t in tokens}
+    logger.info(
+        f"[SCANNER] Mercado activo:\n"
+        f"           Pregunta   : {question}\n"
+        f"           Slug       : {slug}\n"
+        f"           ConditionID: {cond_id}\n"
+        f"           Cierre     : {end_date}\n"
+        f"           YES price  : {yes_p:.4f} ({sources.get('Yes','?')})  "
+        f"NO price: {no_p:.4f} ({sources.get('No','?')})"
+    )
+
+    return {
+        "question":      question,
+        "condition_id":  cond_id,
+        "slug":          slug,
+        "end_ms":        end_ms,
+        "yes_price":     yes_p,
+        "no_price":      no_p,
+        "tokens":        tokens,
+        "neg_risk":      m.get("neg_risk", False),
+        "mins_to_close": round(mins, 2) if mins is not None else None,
+    }
 
 
 # ── Price to Beat ─────────────────────────────────────────────────────────────
