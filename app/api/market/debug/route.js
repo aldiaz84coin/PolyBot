@@ -2,7 +2,7 @@
 // Diagnóstico: muestra qué devuelve la Gamma API y los slugs ET generados
 // Acceder en: /api/market/debug
 //
-// FIX v3: Slug usa hora de APERTURA ET (no cierre).
+// v6.2 — FIX SLUG AÑO: incluye año en formato → {month}-{day}-{year}-{hour}-et
 
 export const runtime = "edge";
 export const revalidate = 0;
@@ -53,6 +53,7 @@ export async function GET() {
   candleOpenNow.setUTCMinutes(0, 0, 0);
 
   // Slugs candidatos: ±1h usando hora de APERTURA ET
+  // FIX v6.2: incluye año en el slug
   const slugs = [];
   for (const offset of [-1, 0, 1]) {
     const candleOpen = new Date(candleOpenNow.getTime() + offset * 3600 * 1000);
@@ -61,7 +62,7 @@ export async function GET() {
       offset,
       candle_open_utc: candleOpen.toISOString(),
       et_open:         et.toISOString(),
-      slug: `bitcoin-up-or-down-${MONTHS[et.getUTCMonth()]}-${et.getUTCDate()}-${formatHour12(et.getUTCHours())}-et`,
+      slug: `bitcoin-up-or-down-${MONTHS[et.getUTCMonth()]}-${et.getUTCDate()}-${et.getUTCFullYear()}-${formatHour12(et.getUTCHours())}-et`, // ← FIX v6.2
     });
   }
 
@@ -82,32 +83,29 @@ export async function GET() {
       if (!q.includes("btc") && !q.includes("bitcoin") && !q.includes("up-or-down")) continue;
       if (allBTC.find(x => x.slug === m.slug)) continue;
       const endIso   = m.endDateIso || m.end_date_iso || m.endDate;
-      const minsLeft = endIso ? (new Date(endIso).getTime() - now.getTime()) / 60000 : null;
-      allBTC.push({
-        slug:          m.slug,
-        question:      m.question || m.title,
-        end_utc:       endIso,
-        mins_to_close: minsLeft?.toFixed(1),
-        tokens:        (m.tokens||[]).map(t => ({ outcome: t.outcome, price: t.price })),
-      });
+      const minsLeft = endIso
+        ? Math.round((new Date(endIso).getTime() - now.getTime()) / 60000)
+        : null;
+      allBTC.push({ slug: m.slug, question: m.question, endIso, minsLeft, active: m.active });
     }
   }
-  allBTC.sort((a, b) => parseFloat(a.mins_to_close ?? 999) - parseFloat(b.mins_to_close ?? 999));
 
   return Response.json({
-    now_utc:         now.toISOString(),
-    now_et:          etNow.toISOString(),
-    dst_active:      isDST(now),
-    et_offset:       isDST(now) ? "UTC-4 (EDT)" : "UTC-5 (EST)",
-    slugs_generated: slugs,
-    slug_exact_test: {
-      slug:  slugs[1].slug,
-      found: Array.isArray(slug0Result.data) && slug0Result.data.length > 0,
-      data:  slug0Result.data,
+    now_utc:    now.toISOString(),
+    et_now:     etNow.toISOString(),
+    dst_active: isDST(now),
+    et_offset:  isDST(now) ? "UTC-4 (EDT)" : "UTC-5 (EST)",
+    slugs_generados: slugs,
+    slug_directo: {
+      slug:   slugs[1].slug,
+      status: slug0Result.status,
+      count:  Array.isArray(slug0Result.data) ? slug0Result.data.length : 0,
+      data:   slug0Result.data,
     },
-    btc_markets_found:  allBTC,
-    hourly_candidate:   allBTC.find(m =>
-      parseFloat(m.mins_to_close) > 0 && parseFloat(m.mins_to_close) <= 62
-    ) ?? null,
+    mercados_btc_activos: allBTC,
+    raw: {
+      tag:      tagResult,
+      upcoming: upcomingResult,
+    },
   });
 }
