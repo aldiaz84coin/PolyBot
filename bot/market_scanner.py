@@ -1,32 +1,26 @@
 """
-market_scanner.py  ·  bot/  (root)
-Detecta el mercado BTC Up/Down activo en Polymarket Gamma API.
+market_scanner.py — Descubrimiento de mercado activo y Price to Beat
 
-FIX v6.1 (FALLBACK LISTA ACTIVA):
-  La Gamma API a veces devuelve [] para ?slug= aunque el slug sea correcto.
-  Nuevo fallback: cuando todos los slugs devuelven vacío, se consulta la lista
-  de mercados activos (?active=true&closed=false&limit=50) y se filtra por slug.
-  Esto hace el bot inmune a cambios de comportamiento del endpoint de Gamma.
+v6.2 — FIX SLUG AÑO:
+  Polymarket cambió el formato del slug para incluir el año:
+    Antes : bitcoin-up-or-down-march-16-12pm-et
+    Ahora : bitcoin-up-or-down-march-16-2026-12pm-et
+  - _build_slugs()          → añade {et_open.year} entre día y hora
+  - _slug_to_end_ms()       → lee año del slug (month+2), hora en month+3
+  - _slug_to_candle_start_ms() → ídem
 
-FIX v6 (PRECIOS LIVE DESDE CLOB):
-  La Gamma API devuelve precios cacheados en tokens[].price — no son en tiempo real.
-  Los precios dinámicos de Polymarket viven en el CLOB API (midpoint).
-  Ahora se enriquecen SIEMPRE desde CLOB tras obtener los token IDs:
-    GET https://clob.polymarket.com/midpoint?token_id={id} → {"mid": "0.73"}
-  Fallback: precio de Gamma si el CLOB falla.
+v6.1 — FALLBACK LISTA ACTIVA:
+  Gamma devuelve [] para ?slug= aunque el slug sea correcto.
+  Fallback: busca en lista de mercados activos filtrada por slug.
 
-FIX v5 (TOKENS VACÍOS):
-  Polymarket Gamma API a veces devuelve tokens: [] aunque el mercado esté activo.
-  En ese caso, se reconstruyen los tokens desde clobTokenIds (índice 0 = YES, 1 = NO).
-  Sin este fix, strategy.execute_order() no encuentra el token y aborta la orden.
+v6.0 — PRECIOS LIVE CLOB:
+  Precios siempre desde CLOB midpoint; Gamma solo como fallback.
 
-FIX v4 (BINANCE BLOQUEADO EN RAILWAY):
-  Railway despliega en servidores US donde Binance bloquea conexiones.
-  Se añade Kraken OHLC como fuente de fallback automático en get_open_1h_binance().
+v5.0 — TOKENS REBUILD:
+  Si Gamma devuelve tokens:[] vacío, se reconstruyen desde clobTokenIds.
 
-FIX previos mantenidos:
-  - get_open_1h_binance() acepta slug opcional para pedir vela exacta por startTime.
-  - Consistente con bot/modules/market_scanner.py y /api/target?slug= del frontend.
+v4.0 — BINANCE FALLBACK:
+  Kraken OHLC como fuente alternativa cuando Binance está bloqueado en Railway.
 """
 import json
 import logging
@@ -61,7 +55,7 @@ def _is_dst(utc_dt: datetime) -> bool:
 
 
 def _to_et(utc_dt: datetime) -> datetime:
-    offset_h  = 4 if _is_dst(utc_dt) else 5
+    offset_h = 4 if _is_dst(utc_dt) else 5
     return utc_dt.replace(tzinfo=None) - timedelta(hours=offset_h)
 
 
@@ -76,7 +70,7 @@ def _format_hour_12(h24: int) -> str:
 def _build_slugs(now: datetime | None = None) -> list[str]:
     """
     Genera slugs candidatos para el mercado activo.
-    El slug usa la hora de APERTURA de la vela 1H en ET.
+    FIX v6.2: slug incluye año → bitcoin-up-or-down-{month}-{day}-{year}-{hour}-et
     """
     if now is None:
         now = datetime.now(timezone.utc)
@@ -91,6 +85,7 @@ def _build_slugs(now: datetime | None = None) -> list[str]:
         slug = (
             f"bitcoin-up-or-down-"
             f"{MONTHS[et_open.month - 1]}-{et_open.day}-"
+            f"{et_open.year}-"                        # ← FIX v6.2
             f"{_format_hour_12(et_open.hour)}-et"
         )
         if slug not in slugs:
@@ -118,7 +113,10 @@ def _parse_end_ms(raw: dict) -> int | None:
 
 
 def _slug_to_end_ms(slug: str, now: datetime) -> int | None:
-    """Fallback: deriva el timestamp de CIERRE del mercado desde el slug."""
+    """
+    Fallback: deriva el timestamp de CIERRE del mercado desde el slug.
+    FIX v6.2: nuevo formato → month+1=día, month+2=año, month+3=hora
+    """
     try:
         parts = slug.split("-")
         month_idx, month_part_idx = -1, -1
@@ -130,7 +128,8 @@ def _slug_to_end_ms(slug: str, now: datetime) -> int | None:
             return None
 
         day      = int(parts[month_part_idx + 1])
-        hour_str = parts[month_part_idx + 2]
+        year     = int(parts[month_part_idx + 2])   # ← FIX v6.2
+        hour_str = parts[month_part_idx + 3]         # ← FIX v6.2 (era +2)
 
         if hour_str == "12am":        open_hour_et = 0
         elif hour_str == "12pm":      open_hour_et = 12
@@ -141,7 +140,6 @@ def _slug_to_end_ms(slug: str, now: datetime) -> int | None:
         close_hour_et = (open_hour_et + 1) % 24
         close_day     = day + 1 if open_hour_et == 23 else day
 
-        year      = now.year
         candidate = datetime(year, month_idx + 1, close_day, 12, 0, 0, tzinfo=timezone.utc)
         et_offset = 4 if _is_dst(candidate) else 5
 
@@ -198,10 +196,8 @@ def _enrich_token_prices(tokens: list) -> list:
 
 def _rebuild_tokens_from_clob(market_raw: dict) -> list:
     """
-    FIX v6: Los precios ya NO se hardcodean a 0.5 — se obtienen del CLOB en _enrich_token_prices().
-
-    Polymarket Gamma API siempre incluye clobTokenIds aunque omita tokens[].
-    Formato: JSON string o lista — índice 0 = YES (UP), índice 1 = NO (DOWN).
+    FIX v6: Reconstruye tokens desde clobTokenIds cuando Gamma devuelve tokens:[].
+    Índice 0 = YES (UP), índice 1 = NO (DOWN).
     """
     clob_raw = market_raw.get("clobTokenIds")
     if not clob_raw:
@@ -213,7 +209,6 @@ def _rebuild_tokens_from_clob(market_raw: dict) -> list:
             logger.warning(f"[SCANNER] clobTokenIds inesperado: {clob_raw}")
             return []
 
-        # Precio 0.5 es solo temporal — _enrich_token_prices() lo reemplazará con CLOB live
         tokens = [
             {"outcome": "Yes", "token_id": clob_ids[0], "price": 0.5},
             {"outcome": "No",  "token_id": clob_ids[1], "price": 0.5},
@@ -238,8 +233,10 @@ def _find_market_in_active_list(slugs: list[str]) -> dict | None:
     """
     slug_set = set(slugs)
     urls = [
+        f"{GAMMA_API}?active=true&closed=false&limit=50&order=endDate&ascending=true",
         f"{GAMMA_API}?active=true&closed=false&limit=50&tag=bitcoin",
         f"{GAMMA_API}?active=true&closed=false&limit=100",
+        f"{GAMMA_API}?active=true&closed=false&limit=300",
     ]
 
     for url in urls:
@@ -376,7 +373,7 @@ def get_active_market() -> dict | None:
 def _slug_to_candle_start_ms(slug: str, now: datetime) -> int | None:
     """
     Parsea el slug para obtener el startTime UTC (ms) de la vela 1H.
-    El slug contiene la hora de APERTURA en ET → directamente el start.
+    FIX v6.2: nuevo formato → month+1=día, month+2=año, month+3=hora
     """
     try:
         parts = slug.split("-")
@@ -389,7 +386,8 @@ def _slug_to_candle_start_ms(slug: str, now: datetime) -> int | None:
             return None
 
         day      = int(parts[month_part_idx + 1])
-        hour_str = parts[month_part_idx + 2]
+        year     = int(parts[month_part_idx + 2])   # ← FIX v6.2
+        hour_str = parts[month_part_idx + 3]         # ← FIX v6.2 (era +2)
 
         if hour_str == "12am":        open_hour_et = 0
         elif hour_str == "12pm":      open_hour_et = 12
@@ -397,7 +395,6 @@ def _slug_to_candle_start_ms(slug: str, now: datetime) -> int | None:
         elif hour_str.endswith("pm"): open_hour_et = int(hour_str[:-2]) + 12
         else: return None
 
-        year      = now.year
         candidate = datetime(year, month_idx + 1, day, 12, 0, 0, tzinfo=timezone.utc)
         et_offset = 4 if _is_dst(candidate) else 5
 
@@ -420,35 +417,49 @@ def _try_binance(slug: str | None, now: datetime) -> float | None:
             params["startTime"] = str(start_ms)
             logger.debug(f"[SCANNER] Binance startTime desde slug: {start_ms}")
 
-    try:
-        r = requests.get(BINANCE_KLINE, params=params, timeout=TIMEOUT)
-        r.raise_for_status()
-        klines = r.json()
-        if klines:
-            open_price = float(klines[0][1])
-            logger.info(f"[SCANNER] Binance 1H open: ${open_price:,.2f}")
-            return open_price
-    except Exception as e:
-        logger.warning(f"[SCANNER] Binance no disponible: {e}")
+    hosts = [
+        "https://api.binance.com/api/v3/klines",
+        "https://api1.binance.com/api/v3/klines",
+        "https://api2.binance.com/api/v3/klines",
+        "https://api3.binance.com/api/v3/klines",
+    ]
+    for host in hosts:
+        try:
+            r = requests.get(host, params=params, timeout=TIMEOUT)
+            r.raise_for_status()
+            klines = r.json()
+            if klines:
+                open_price = float(klines[0][1])
+                logger.info(f"[SCANNER] Binance 1H open: ${open_price:,.2f} ({host})")
+                return open_price
+        except Exception as e:
+            logger.warning(f"[SCANNER] Binance no disponible ({host}): {e}")
     return None
 
 
 def _try_kraken(now: datetime) -> float | None:
     """Fallback: obtiene la vela 1H open desde Kraken."""
     try:
-        # since = inicio de la hora actual en segundos Unix
         since = int(now.replace(minute=0, second=0, microsecond=0).timestamp())
         r = requests.get(
             KRAKEN_OHLC,
-            params={"pair": "XBTUSD", "interval": 60, "since": since},
+            params={"pair": "XBTUSD", "interval": 60, "since": since - 60},
             timeout=TIMEOUT,
         )
         r.raise_for_status()
-        data  = r.json()
-        ohlc  = data.get("result", {}).get("XXBTZUSD", [])
-        if ohlc:
-            # Kraken devuelve [time, open, high, low, close, vwap, volume, count]
-            open_price = float(ohlc[0][1])
+        data = r.json()
+        if data.get("error"):
+            logger.warning(f"[SCANNER] Kraken error: {data['error']}")
+            return None
+
+        result = data.get("result", {})
+        pair_key = next((k for k in result if k != "last"), None)
+        if not pair_key:
+            return None
+
+        candles = result[pair_key]
+        if candles:
+            open_price = float(candles[0][1])
             logger.info(f"[SCANNER] Kraken 1H open (fallback): ${open_price:,.2f}")
             return open_price
     except Exception as e:
@@ -458,14 +469,19 @@ def _try_kraken(now: datetime) -> float | None:
 
 def get_open_1h_binance(slug: str | None = None) -> float | None:
     """
-    Devuelve el precio de apertura (open) de la vela 1H actual en Binance.
-    Este es el 'Price to Beat' para el mercado BTC Up/Down.
-
-    Intenta Binance primero; si falla (bloqueado en Railway US), usa Kraken.
+    Obtiene el precio OPEN de la vela 1H actual de BTC.
+    Intenta Binance primero (varios hosts), luego Kraken como fallback.
     """
-    now   = datetime.now(timezone.utc)
+    now = datetime.now(timezone.utc)
+
     price = _try_binance(slug, now)
-    if price:
+    if price is not None:
         return price
-    logger.warning("[SCANNER] Binance bloqueado/no disponible — intentando Kraken...")
-    return _try_kraken(now)
+
+    logger.warning("[SCANNER] Binance no disponible — intentando Kraken")
+    price = _try_kraken(now)
+    if price is not None:
+        return price
+
+    logger.error("[SCANNER] ❌ No se pudo obtener Price to Beat (Binance + Kraken fallidos)")
+    return None
