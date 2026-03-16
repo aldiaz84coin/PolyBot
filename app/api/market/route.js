@@ -1,6 +1,12 @@
 // app/api/market/route.js
 // Obtiene el mercado BTC Up/Down activo en Polymarket Gamma API
 //
+// FIX v6.1 (FALLBACK LISTA ACTIVA):
+//   La Gamma API a veces devuelve [] para ?slug= aunque el slug sea correcto.
+//   Nuevo fallback: cuando todos los slugs devuelven vacío, se consulta la lista
+//   de mercados activos (?active=true&closed=false&limit=50) y se filtra por slug.
+//   Esto hace el dashboard inmune a cambios de comportamiento del endpoint de Gamma.
+//
 // FIX v6 (FALLBACK clobTokenIds):
 //   Cuando Gamma devuelve tokens:[] vacío (ocurre frecuentemente), los precios
 //   quedaban en null y el dashboard mostraba "—".
@@ -177,12 +183,107 @@ async function fetchLivePrice(tokenId) {
   }
 }
 
+/**
+ * FIX v6.1: Fallback cuando slug search devuelve [] — busca en lista activa.
+ * Consulta mercados activos y filtra por slug coincidente.
+ */
+async function findMarketInActiveList(slugs) {
+  const slugSet = new Set(slugs);
+  const urls = [
+    `${GAMMA}/markets?active=true&closed=false&limit=50&tag=bitcoin`,
+    `${GAMMA}/markets?active=true&closed=false&limit=100`,
+  ];
+
+  for (const url of urls) {
+    try {
+      const res = await fetch(url, { cache: "no-store" });
+      if (!res.ok) continue;
+      let markets = await res.json();
+      if (!Array.isArray(markets)) markets = markets?.markets ?? [];
+
+      for (const m of markets) {
+        const mSlug = m.slug || "";
+        if (slugSet.has(mSlug)) return m;
+      }
+    } catch (_) { /* continúa con siguiente URL */ }
+  }
+  return null;
+}
+
+/**
+ * Procesa un mercado raw (de Gamma) y devuelve el objeto de respuesta final.
+ */
+async function processMarket(m, slug, now, tried, slugs) {
+  // ── FIX v6: fallback a clobTokenIds si tokens[] viene vacío ───────────
+  let tokens = m.tokens || [];
+  let tokensRebuilt = false;
+  if (tokens.length === 0) {
+    tokens = rebuildTokensFromClobIds(m);
+    tokensRebuilt = tokens.length > 0;
+  }
+
+  const yesT = tokens.find(t => t.outcome === "Yes");
+  const noT  = tokens.find(t => t.outcome === "No");
+
+  // ── FIX v5: precios live desde CLOB ───────────────────────────────────
+  const [yesLivePrice, noLivePrice] = await Promise.all([
+    fetchLivePrice(yesT?.token_id ?? null),
+    fetchLivePrice(noT?.token_id  ?? null),
+  ]);
+
+  const yesGammaPrice = yesT?.price != null ? parseFloat(yesT.price) : null;
+  const noGammaPrice  = noT?.price  != null ? parseFloat(noT.price)  : null;
+  const yesPrice = yesLivePrice ?? (yesGammaPrice != null && !isNaN(yesGammaPrice) ? yesGammaPrice : null);
+  const noPrice  = noLivePrice  ?? (noGammaPrice  != null && !isNaN(noGammaPrice)  ? noGammaPrice  : null);
+  const yesSrc   = yesLivePrice != null ? "clob" : (yesGammaPrice != null ? "gamma" : "unavailable");
+  const noSrc    = noLivePrice  != null ? "clob" : (noGammaPrice  != null ? "gamma" : "unavailable");
+
+  let endMs = parseEndMs(m, now);
+  const endIso      = m.endDateIso || m.end_date_iso || m.endDate || null;
+  const endMsSource = endMs ? "polymarket" : "slug_fallback";
+  if (!endMs) endMs = slugToEndMs(slug, now);
+
+  const market = {
+    question:     m.question || m.title || slug,
+    condition_id: m.conditionId || m.condition_id || null,
+    slug,
+    end_ms:       endMs,
+    end_date_iso: endIso,
+    tokens: {
+      yes: yesT ? { price: yesPrice, token_id: yesT.token_id, price_source: yesSrc } : null,
+      no:  noT  ? { price: noPrice,  token_id: noT.token_id,  price_source: noSrc  } : null,
+    },
+    volume:    m.volume    ?? null,
+    liquidity: m.liquidity ?? null,
+    url:       `https://polymarket.com/event/${slug}`,
+    _debug: {
+      slugs_tried:      tried,
+      slugs_all:        slugs,
+      found_slug:       slug,
+      end_ms_source:    endMsSource,
+      now_utc:          now.toISOString(),
+      dst_active:       isDST(now),
+      et_offset:        isDST(now) ? "UTC-4 (EDT)" : "UTC-5 (EST)",
+      tokens_rebuilt:   tokensRebuilt,
+      price_sources:    { yes: yesSrc, no: noSrc },
+      gamma_prices:     { yes: yesGammaPrice, no: noGammaPrice },
+      clob_prices:      { yes: yesLivePrice, no: noLivePrice },
+    },
+  };
+
+  return Response.json(
+    { active: true, market, ts: Date.now() },
+    { headers: { "Cache-Control": "no-store" } },
+  );
+}
+
 export async function GET() {
   const now    = new Date();
   const slugs  = buildSlugs(now);
   const tried  = [];
   const errors = [];
 
+  // ── Intento 1: búsqueda directa por slug ─────────────────────────────────
   for (const slug of slugs) {
     tried.push(slug);
     try {
@@ -200,77 +301,22 @@ export async function GET() {
         continue;
       }
 
-      const m = data[0];
-
-      // ── FIX v6: fallback a clobTokenIds si tokens[] viene vacío ───────
-      let tokens = m.tokens || [];
-      let tokensRebuilt = false;
-      if (tokens.length === 0) {
-        tokens = rebuildTokensFromClobIds(m);
-        tokensRebuilt = tokens.length > 0;
-      }
-
-      const yesT = tokens.find(t => t.outcome === "Yes");
-      const noT  = tokens.find(t => t.outcome === "No");
-      // ── ────────────────────────────────────────────────────────────────
-
-      // ── FIX v5: precios live desde CLOB ───────────────────────────────
-      // Fetch en paralelo para ambos tokens (más rápido que secuencial)
-      const [yesLivePrice, noLivePrice] = await Promise.all([
-        fetchLivePrice(yesT?.token_id ?? null),
-        fetchLivePrice(noT?.token_id  ?? null),
-      ]);
-
-      // Precio final: CLOB live si disponible, Gamma como fallback
-      const yesGammaPrice = yesT?.price != null ? parseFloat(yesT.price) : null;
-      const noGammaPrice  = noT?.price  != null ? parseFloat(noT.price)  : null;
-      const yesPrice = yesLivePrice ?? (yesGammaPrice != null && !isNaN(yesGammaPrice) ? yesGammaPrice : null);
-      const noPrice  = noLivePrice  ?? (noGammaPrice  != null && !isNaN(noGammaPrice)  ? noGammaPrice  : null);
-      const yesSrc   = yesLivePrice != null ? "clob" : (yesGammaPrice != null ? "gamma" : "unavailable");
-      const noSrc    = noLivePrice  != null ? "clob" : (noGammaPrice  != null ? "gamma" : "unavailable");
-      // ── ────────────────────────────────────────────────────────────────
-
-      let endMs = parseEndMs(m, now);
-      const endIso      = m.endDateIso || m.end_date_iso || m.endDate || null;
-      const endMsSource = endMs ? "polymarket" : "slug_fallback";
-      if (!endMs) endMs = slugToEndMs(slug, now);
-
-      const market = {
-        question:     m.question || m.title || slug,
-        condition_id: m.conditionId || m.condition_id || null,
-        slug,
-        end_ms:       endMs,
-        end_date_iso: endIso,
-        tokens: {
-          yes: yesT ? { price: yesPrice, token_id: yesT.token_id, price_source: yesSrc } : null,
-          no:  noT  ? { price: noPrice,  token_id: noT.token_id,  price_source: noSrc  } : null,
-        },
-        volume:    m.volume    ?? null,
-        liquidity: m.liquidity ?? null,
-        url:       `https://polymarket.com/event/${slug}`,
-        _debug: {
-          slugs_tried:      tried,
-          slugs_all:        slugs,
-          found_slug:       slug,
-          end_ms_source:    endMsSource,
-          now_utc:          now.toISOString(),
-          dst_active:       isDST(now),
-          et_offset:        isDST(now) ? "UTC-4 (EDT)" : "UTC-5 (EST)",
-          tokens_rebuilt:   tokensRebuilt,  // ← nuevo: indica si se usó fallback
-          price_sources:    { yes: yesSrc, no: noSrc },
-          gamma_prices:     { yes: yesGammaPrice, no: noGammaPrice },
-          clob_prices:      { yes: yesLivePrice, no: noLivePrice },
-        },
-      };
-
-      return Response.json(
-        { active: true, market, ts: Date.now() },
-        { headers: { "Cache-Control": "no-store" } },
-      );
+      return await processMarket(data[0], slug, now, tried, slugs);
 
     } catch (e) {
       errors.push({ slug, error: e.message });
     }
+  }
+
+  // ── Intento 2: fallback por lista activa (FIX v6.1) ──────────────────────
+  try {
+    const fallbackMarket = await findMarketInActiveList(slugs);
+    if (fallbackMarket) {
+      const fallbackSlug = fallbackMarket.slug ?? slugs[0];
+      return await processMarket(fallbackMarket, fallbackSlug, now, tried, slugs);
+    }
+  } catch (e) {
+    errors.push({ slug: "fallback_list", error: e.message });
   }
 
   return Response.json({
