@@ -1,37 +1,21 @@
 // app/api/market/route.js
-// Obtiene el mercado BTC Up/Down activo en Polymarket Gamma API
+// Descubrimiento del mercado BTC Up/Down activo en Polymarket.
 //
-// FIX v6.1 (FALLBACK LISTA ACTIVA):
-//   La Gamma API a veces devuelve [] para ?slug= aunque el slug sea correcto.
-//   Nuevo fallback: cuando todos los slugs devuelven vacío, se consulta la lista
-//   de mercados activos (?active=true&closed=false&limit=50) y se filtra por slug.
-//   Esto hace el dashboard inmune a cambios de comportamiento del endpoint de Gamma.
+// v6.2 — FIX SLUG AÑO:
+//   Polymarket cambió el formato del slug para incluir el año:
+//     Antes : bitcoin-up-or-down-march-16-12pm-et
+//     Ahora : bitcoin-up-or-down-march-16-2026-12pm-et
+//   - buildSlugs()   → añade year entre día y hora
+//   - slugToEndMs()  → lee año del slug (monthPart+2), hora en monthPart+3
 //
-// FIX v6 (FALLBACK clobTokenIds):
-//   Cuando Gamma devuelve tokens:[] vacío (ocurre frecuentemente), los precios
-//   quedaban en null y el dashboard mostraba "—".
-//   Solución: si tokens[] está vacío, reconstruir desde clobTokenIds (igual que
-//   el bot Python en market_scanner.py). Los token_id resultantes se usan para
-//   fetchLivePrice() en el CLOB → precio real siempre disponible.
-//
-// FIX v5 (PRECIOS LIVE DESDE CLOB):
-//   La Gamma API devuelve tokens[].price con precios cacheados, no en tiempo real.
-//   Los precios que ve el usuario en polymarket.com vienen del CLOB (orderbook).
-//   Ahora se enriquecen SIEMPRE desde el CLOB tras obtener los token IDs:
-//     GET https://clob.polymarket.com/midpoint?token_id={id} → {"mid": "0.73"}
-//   Fallback: precio de Gamma si el CLOB no responde para ese token.
-//
-// FIX v4 (BUG TIEMPO RESTANTE 00:00):
-//   parseEndMs() podía devolver un timestamp del mercado ANTERIOR (ya expirado).
-//   Solución: si endMs < now, ignorarlo y usar slugToEndMs() como fuente de verdad.
-//
-// FIX v3 (BUG SLUG HORA):
-//   La hora del slug es la APERTURA de la vela 1H en ET (no el cierre).
+// v6.1 — Fallback lista activa cuando slug search devuelve []
+// v6.0 — Precios live siempre desde CLOB midpoint
+// v5.0 — Rebuild tokens desde clobTokenIds si tokens[] vacío
 
 export const runtime = "edge";
 export const revalidate = 0;
 
-const GAMMA         = "https://gamma-api.polymarket.com";
+const GAMMA        = "https://gamma-api.polymarket.com";
 const CLOB_MIDPOINT = "https://clob.polymarket.com/midpoint";
 
 const MONTHS = [
@@ -39,6 +23,7 @@ const MONTHS = [
   "july","august","september","october","november","december",
 ];
 
+// ── DST helper ────────────────────────────────────────────────────────────────
 function isDST(utcDate) {
   const year     = utcDate.getUTCFullYear();
   const march    = new Date(Date.UTC(year, 2, 1));
@@ -61,7 +46,7 @@ function formatHour12(h24) {
 
 /**
  * Genera slugs candidatos.
- * Polymarket usa la hora de APERTURA de la vela 1H en ET para el slug.
+ * FIX v6.2: incluye año → bitcoin-up-or-down-{month}-{day}-{year}-{hour}-et
  */
 function buildSlugs(now) {
   const candleOpenNow = new Date(now);
@@ -71,7 +56,7 @@ function buildSlugs(now) {
   for (const offset of [0, -1, 1]) {
     const candleOpen = new Date(candleOpenNow.getTime() + offset * 3600 * 1000);
     const etOpen     = toET(candleOpen);
-    const slug = `bitcoin-up-or-down-${MONTHS[etOpen.getUTCMonth()]}-${etOpen.getUTCDate()}-${formatHour12(etOpen.getUTCHours())}-et`;
+    const slug = `bitcoin-up-or-down-${MONTHS[etOpen.getUTCMonth()]}-${etOpen.getUTCDate()}-${etOpen.getUTCFullYear()}-${formatHour12(etOpen.getUTCHours())}-et`; // ← FIX v6.2
     if (!slugs.includes(slug)) slugs.push(slug);
   }
   return slugs;
@@ -79,7 +64,7 @@ function buildSlugs(now) {
 
 /**
  * Parsea el campo de fecha de cierre de la respuesta de Polymarket.
- * FIX v4: si endMs ya está en el pasado, devuelve null para usar slugToEndMs().
+ * Si endMs ya está en el pasado, devuelve null para usar slugToEndMs().
  */
 function parseEndMs(m, now) {
   const raw = m.endDateIso || m.end_date_iso || m.endDate || m.end_date || null;
@@ -101,6 +86,7 @@ function parseEndMs(m, now) {
 
 /**
  * Fallback: deriva end_ms del slug cuando Polymarket no devuelve fecha parseable.
+ * FIX v6.2: monthPart+1=día, monthPart+2=año, monthPart+3=hora
  */
 function slugToEndMs(slug, now) {
   try {
@@ -113,8 +99,9 @@ function slugToEndMs(slug, now) {
     if (monthIdx === -1) return null;
 
     const day     = parseInt(parts[monthPartIdx + 1], 10);
-    const hourStr = parts[monthPartIdx + 2];
-    if (!day || !hourStr) return null;
+    const year    = parseInt(parts[monthPartIdx + 2], 10); // ← FIX v6.2
+    const hourStr = parts[monthPartIdx + 3];               // ← FIX v6.2 (era +2)
+    if (!day || !year || !hourStr) return null;
 
     let openHourET;
     if (hourStr === "12am")          openHourET = 0;
@@ -126,7 +113,6 @@ function slugToEndMs(slug, now) {
     const closeHourET = (openHourET + 1) % 24;
     const closeDay    = openHourET === 23 ? day + 1 : day;
 
-    const year         = now.getUTCFullYear();
     const candidateUtc = new Date(Date.UTC(year, monthIdx, closeDay, 12, 0, 0));
     const etOffset     = isDST(candidateUtc) ? 4 : 5;
     const closeUtcMs   = Date.UTC(year, monthIdx, closeDay, closeHourET + etOffset, 0, 0, 0);
@@ -141,9 +127,7 @@ function slugToEndMs(slug, now) {
 }
 
 /**
- * FIX v6: Fallback para reconstruir tokens desde clobTokenIds cuando
- * Gamma devuelve tokens:[] vacío. Espeja la lógica de bot/market_scanner.py.
- * Gamma siempre incluye clobTokenIds aunque omita tokens[].
+ * Reconstruye tokens desde clobTokenIds cuando Gamma devuelve tokens:[].
  * Índice 0 = YES (UP), índice 1 = NO (DOWN).
  */
 function rebuildTokensFromClobIds(m) {
@@ -164,10 +148,8 @@ function rebuildTokensFromClobIds(m) {
 }
 
 /**
- * FIX v5: Obtiene el precio live del token desde el CLOB (midpoint).
- * El midpoint es el precio real que Polymarket muestra en su UI.
+ * Obtiene el precio live del token desde el CLOB (midpoint).
  * No requiere autenticación.
- * Devuelve null si el CLOB no responde o falla.
  */
 async function fetchLivePrice(tokenId) {
   if (!tokenId) return null;
@@ -184,14 +166,15 @@ async function fetchLivePrice(tokenId) {
 }
 
 /**
- * FIX v6.1: Fallback cuando slug search devuelve [] — busca en lista activa.
- * Consulta mercados activos y filtra por slug coincidente.
+ * Fallback cuando slug search devuelve [] — busca en lista activa.
  */
 async function findMarketInActiveList(slugs) {
   const slugSet = new Set(slugs);
   const urls = [
+    `${GAMMA}/markets?active=true&closed=false&limit=50&order=endDate&ascending=true`,
     `${GAMMA}/markets?active=true&closed=false&limit=50&tag=bitcoin`,
     `${GAMMA}/markets?active=true&closed=false&limit=100`,
+    `${GAMMA}/markets?active=true&closed=false&limit=300`,
   ];
 
   for (const url of urls) {
@@ -205,7 +188,7 @@ async function findMarketInActiveList(slugs) {
         const mSlug = m.slug || "";
         if (slugSet.has(mSlug)) return m;
       }
-    } catch (_) { /* continúa con siguiente URL */ }
+    } catch (_) { /* continúa */ }
   }
   return null;
 }
@@ -214,7 +197,6 @@ async function findMarketInActiveList(slugs) {
  * Procesa un mercado raw (de Gamma) y devuelve el objeto de respuesta final.
  */
 async function processMarket(m, slug, now, tried, slugs) {
-  // ── FIX v6: fallback a clobTokenIds si tokens[] viene vacío ───────────
   let tokens = m.tokens || [];
   let tokensRebuilt = false;
   if (tokens.length === 0) {
@@ -225,7 +207,6 @@ async function processMarket(m, slug, now, tried, slugs) {
   const yesT = tokens.find(t => t.outcome === "Yes");
   const noT  = tokens.find(t => t.outcome === "No");
 
-  // ── FIX v5: precios live desde CLOB ───────────────────────────────────
   const [yesLivePrice, noLivePrice] = await Promise.all([
     fetchLivePrice(yesT?.token_id ?? null),
     fetchLivePrice(noT?.token_id  ?? null),
@@ -308,7 +289,7 @@ export async function GET() {
     }
   }
 
-  // ── Intento 2: fallback por lista activa (FIX v6.1) ──────────────────────
+  // ── Intento 2: fallback por lista activa ──────────────────────────────────
   try {
     const fallbackMarket = await findMarketInActiveList(slugs);
     if (fallbackMarket) {
