@@ -1,13 +1,13 @@
 // app/api/target/route.js
 // Obtiene el precio OPEN de la vela 1H de Binance correspondiente al mercado activo.
 //
-// FIX v3 (BUG SLUG HORA):
-//   La hora del slug es la APERTURA de la vela en ET (no el cierre).
-//   parseCandleStartFromSlug() ya NO resta 1h: el slug hour ES el openHourET.
+// v6.2 — FIX SLUG AÑO:
+//   Polymarket cambió el formato del slug para incluir el año:
+//     Antes : bitcoin-up-or-down-march-16-12pm-et
+//     Ahora : bitcoin-up-or-down-march-16-2026-12pm-et
+//   parseCandleStartFromSlug(): monthPart+1=día, monthPart+2=año, monthPart+3=hora
 //
-//   Ejemplo: "bitcoin-up-or-down-march-6-7am-et" (7 Marzo 2025, EDT)
-//     openHourET = 7  (directamente del slug)
-//     Con EDT (UTC-4): openHourUTC = 7 + 4 = 11 → startTime = 2025-03-06T11:00:00Z
+// v3 — La hora del slug = hora de APERTURA en ET (no el cierre).
 
 export const runtime = "edge";
 export const revalidate = 0;
@@ -19,7 +19,7 @@ const MONTHS = [
   "july","august","september","october","november","december",
 ];
 
-// ── DST helper ─────────────────────────────────────────────────────────────
+// ── DST helper ────────────────────────────────────────────────────────────────
 function isDST(utcDate) {
   const year     = utcDate.getUTCFullYear();
   const march    = new Date(Date.UTC(year, 2, 1));
@@ -32,14 +32,18 @@ function isDST(utcDate) {
 /**
  * Parsea el slug para obtener el startTime UTC (ms) de la vela 1H.
  *
- * Slug: "bitcoin-up-or-down-{month}-{day}-{hour}-et"
- * ⚠️ La hora del slug = hora de APERTURA de la vela en ET.
- *   → openHourET = hora del slug (directamente, sin restar 1)
- *   → openHourUTC = openHourET + |ET offset| (4 con EDT, 5 con EST)
+ * FIX v6.2: nuevo formato incluye año
+ *   Slug: "bitcoin-up-or-down-{month}-{day}-{year}-{hour}-et"
+ *   → monthPart+1 = día
+ *   → monthPart+2 = año  (NUEVO — era la hora)
+ *   → monthPart+3 = hora (NUEVO — era +2)
  *
- * Ejemplo: "bitcoin-up-or-down-march-6-7am-et"
- *   openHourET = 7
- *   Con EDT (UTC-4): openHourUTC = 7 + 4 = 11 → startTime = 2025-03-06T11:00:00Z
+ * La hora del slug = hora de APERTURA de la vela en ET (directamente).
+ *   openHourUTC = openHourET + etOffset (4 con EDT, 5 con EST)
+ *
+ * Ejemplo: "bitcoin-up-or-down-march-16-2026-12pm-et"
+ *   openHourET = 12
+ *   Con EDT (UTC-4): openHourUTC = 16 → startTime = 2026-03-16T16:00:00Z
  */
 function parseCandleStartFromSlug(slug) {
   try {
@@ -54,8 +58,9 @@ function parseCandleStartFromSlug(slug) {
     if (monthIdx === -1) return null;
 
     const day     = parseInt(parts[monthPartIdx + 1], 10);
-    const hourStr = parts[monthPartIdx + 2];
-    if (!day || !hourStr) return null;
+    const year    = parseInt(parts[monthPartIdx + 2], 10); // ← FIX v6.2
+    const hourStr = parts[monthPartIdx + 3];               // ← FIX v6.2 (era +2)
+    if (!day || !year || !hourStr) return null;
 
     // La hora del slug = hora de APERTURA en ET (directamente)
     let openHourET;
@@ -64,9 +69,6 @@ function parseCandleStartFromSlug(slug) {
     else if (hourStr.endsWith("am")) openHourET = parseInt(hourStr, 10);
     else if (hourStr.endsWith("pm")) openHourET = parseInt(hourStr, 10) + 12;
     else return null;
-
-    const now  = new Date();
-    const year = now.getUTCFullYear();
 
     const candidateUtc  = new Date(Date.UTC(year, monthIdx, day, 12, 0, 0));
     const etOffsetHours = isDST(candidateUtc) ? 4 : 5;
