@@ -762,7 +762,7 @@ def run(cfg: dict):
                             f"{'+'if pnl_est>=0 else ''}${pnl_est:.2f} ({pct_est:+.1f}%)"
                         )
 
-                        notify_bet(cfg, active_bet, retorno_est, pnl_est, pct_est)
+                        notify_bet(cfg, active_bet, signal)
 
                         db.upsert_operation({
                             "id":                   active_bet["id"],
