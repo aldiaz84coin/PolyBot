@@ -561,7 +561,7 @@ def run(cfg: dict):
             new_market = get_active_market()
             if new_market:
                 if not market or new_market.get("slug") != slug:
-                    notify_market_found(cfg, new_market)
+                    notify_market_found(cfg, new_market, mins_left)
                     slug = new_market.get("slug")
                 market = new_market
             elif market:
