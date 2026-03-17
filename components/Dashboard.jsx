@@ -1,6 +1,14 @@
 "use client";
 /**
- * Dashboard.jsx — v3.1
+ * Dashboard.jsx — v3.2
+ *
+ * CAMBIOS v3.2:
+ *   - Stats bar: eliminado "BALANCE $500" hardcodeado — no tenía relación
+ *     con config.stake_usdc ni con ningún balance real.
+ *   - Nueva stat "STAKE/OP" muestra config.stake_usdc (el valor operativo real).
+ *   - pnlDay ahora se calcula desde el array `bets` filtrado por la fecha
+ *     de hoy: persiste entre recargas y es siempre coherente con Supabase.
+ *   - useBalance ya no expone `balance`/`pnlDay` (simplificado en hooks.js v3.2).
  *
  * CAMBIOS v3.1:
  *   - Import de ModeSelector añadido.
@@ -25,7 +33,7 @@ import MarketInfo   from "./MarketInfo";
 import BetsTable    from "./BetsTable";
 import ConfigPanel  from "./ConfigPanel";
 import StatsPanel   from "./StatsPanel";
-import ModeSelector from "./ModeSelector"; // v3.1
+import ModeSelector from "./ModeSelector";
 
 const LS_KEY = "polymarket_bets_v2";
 
@@ -64,7 +72,8 @@ export default function Dashboard() {
   const { market, endMs, active: marketActive, error: marketError, apiResponse } = useMarket();
   const now    = useClock();
   const { log, add: addLog } = useLog();
-  const { balance, pnlDay, applyBet, applyResult } = useBalance(500);
+  // v3.2: useBalance ya no expone balance/pnlDay — solo applyBet/applyResult
+  const { applyBet, applyResult } = useBalance();
 
   // ── v3.0 Persistencia: Supabase (vía /api/bets) + localStorage ──────────
   useEffect(() => {
@@ -105,21 +114,21 @@ export default function Dashboard() {
     try { localStorage.setItem(LS_KEY, JSON.stringify(bets.slice(0, 500))); } catch {}
   }, [bets]);
 
- // ── Precio history ────────────────────────────────────────────────────
-useEffect(() => {
-  if (!price) return;
-  setPriceHistory(h => {
-    const ts = new Date().toLocaleTimeString("es-ES", {
-      hour: "2-digit", minute: "2-digit", second: "2-digit",
+  // ── Precio history ────────────────────────────────────────────────────
+  useEffect(() => {
+    if (!price) return;
+    setPriceHistory(h => {
+      const ts = new Date().toLocaleTimeString("es-ES", {
+        hour: "2-digit", minute: "2-digit", second: "2-digit",
+      });
+      const next = [...h, { ts, price }];
+      return next.slice(-60);
     });
-    const next = [...h, { ts, price }];
-    return next.slice(-60);
-  });
-}, [price]);
+  }, [price]);
 
   // ── Target (Price to Beat) ─────────────────────────────────────────────
-  const [target, setTarget]           = useState(null);
-  const [targetError, setTargetError] = useState(null);
+  const [target, setTarget]               = useState(null);
+  const [targetError, setTargetError]     = useState(null);
   const [targetHourUtc, setTargetHourUtc] = useState(null);
   const [targetSource, setTargetSource]   = useState(null);
   const [targetIsStale, setTargetIsStale] = useState(false);
@@ -163,11 +172,11 @@ useEffect(() => {
   }, []);
 
   // ── Derived timing ────────────────────────────────────────────────────
-  const minsLeft    = getMinsLeft(endMs, now);
+  const minsLeft     = getMinsLeft(endMs, now);
   const activeWindow = running ? getActiveWindow(minsLeft) : null;
 
   // ── Señal / decisión ──────────────────────────────────────────────────
-  const umbral  = activeWindow ? config[activeWindow.configKey] : 0;
+  const umbral   = activeWindow ? config[activeWindow.configKey] : 0;
   const decision = (running && price && target && activeWindow)
     ? getDecision(price, target, umbral, activeWindow)
     : null;
@@ -179,8 +188,8 @@ useEffect(() => {
     if (lastBetWindow.current === activeWindow.key) return;
     lastBetWindow.current = activeWindow.key;
 
-    const odds = 0.5;
-    const stake = config.stake_usdc;
+    const odds        = 0.5;
+    const stake       = config.stake_usdc;
     const retorno_est = stake * (1 / odds - 1);
     const newBet = {
       id: genId(), dir: decision.dir, entry: price,
@@ -204,8 +213,8 @@ useEffect(() => {
   // ── Auto-resolve ──────────────────────────────────────────────────────
   useEffect(() => {
     if (!activeBet || minsLeft > 0 || !price) return;
-    const won = activeBet.dir === "UP" ? price > activeBet.entry : price < activeBet.entry;
-    const stake = activeBet.stake;
+    const won     = activeBet.dir === "UP" ? price > activeBet.entry : price < activeBet.entry;
+    const stake   = activeBet.stake;
     const pnl_usd = won ? stake * (1 / activeBet.odds - 1) : -stake;
     const pnl_pct = parseFloat(((pnl_usd / stake) * 100).toFixed(1));
 
@@ -215,7 +224,7 @@ useEffect(() => {
         : bet
     ));
     setActiveBet(null);
-    applyResult(stake, won, config.stop_loss_pct);
+    applyResult(stake, won);
     addLog(
       `${won ? "✅ WIN" : "❌ LOSS"} — P&L: ${fmtUSD(pnl_usd)} (${pnl_pct > 0 ? "+" : ""}${pnl_pct}%)`,
       won ? "success" : "error",
@@ -247,6 +256,12 @@ useEffect(() => {
   const winrate  = total > 0 ? (wins / total) * 100 : null;
   const pnlTotal = bets.reduce((acc, b) => acc + (b.pnl_usd ?? 0), 0);
 
+  // v3.2: pnlDay calculado desde bets del día de hoy (persiste entre recargas)
+  const today  = new Date().toISOString().slice(0, 10);  // "YYYY-MM-DD"
+  const pnlDay = bets
+    .filter(b => b.ts?.startsWith(today) && b.result && b.result !== "PENDING")
+    .reduce((acc, b) => acc + (b.pnl_usd ?? 0), 0);
+
   // ── Render ─────────────────────────────────────────────────────────────
   return (
     <div style={{ minHeight: "100vh", background: "var(--bg)", color: "var(--text)", fontFamily: "var(--font-mono)" }}>
@@ -267,8 +282,7 @@ useEffect(() => {
           <span style={{ color: "var(--green)", fontWeight: 700, letterSpacing: "0.12em", fontSize: 14 }}>
             POLYMARKET BTC BOT
           </span>
-          {/* v3.1 — bumped */}
-          <Tag color="#2a4a3a">v3.1</Tag>
+          <Tag color="#2a4a3a">v3.2</Tag>
           {marketActive
             ? <Tag color="#1a3a2a">MERCADO ACTIVO {marketSlugShort ? `· ${marketSlugShort}` : ""}</Tag>
             : <Tag color="#3a1a1a">SIN MERCADO</Tag>
@@ -426,9 +440,20 @@ useEffect(() => {
           borderBottom: "1px solid var(--border)", background: "#02020a",
           flexWrap: "wrap",
         }}>
-          <StatBox label="BALANCE"   value={fmtUSD(balance)}  color={balance >= 500 ? "var(--green)" : "var(--red)"} />
-          <StatBox label="P&L HOY"   value={fmtUSD(pnlDay)}   color={pnlDay   >= 0  ? "var(--green)" : "var(--red)"} />
-          <StatBox label="P&L TOTAL" value={fmtUSD(pnlTotal)} color={pnlTotal >= 0  ? "var(--green)" : "var(--red)"} />
+          {/*
+           * v3.2: "BALANCE $500" eliminado — era un número ficticio hardcodeado
+           * sin relación con el stake real ni con el wallet on-chain.
+           * Reemplazado por "STAKE/OP" que muestra config.stake_usdc (el valor
+           * real que usa el bot para cada operación).
+           */}
+          <StatBox
+            label="STAKE/OP"
+            value={fmtUSD(config.stake_usdc)}
+            color="var(--yellow)"
+            sub="por operación"
+          />
+          <StatBox label="P&L HOY"   value={fmtUSD(pnlDay)}   color={pnlDay   >= 0 ? "var(--green)" : "var(--red)"} />
+          <StatBox label="P&L TOTAL" value={fmtUSD(pnlTotal)} color={pnlTotal >= 0 ? "var(--green)" : "var(--red)"} />
           <StatBox label="WINRATE"   value={winrate != null ? `${winrate.toFixed(0)}%` : "—"} color="var(--yellow)" sub={`${wins}W / ${losses}L`} />
           <StatBox label="OPS"       value={total}             color="var(--dim)" />
         </div>
