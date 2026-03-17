@@ -8,23 +8,23 @@ strategy:
   t15_umbral_usd: 300     # umbral ventana T-15min
   t10_umbral_usd: 200     # umbral ventana T-10min
   t5_umbral_usd:  150     # umbral ventana T-5min
-  stop_loss_pct:  0.50    # stop loss: salir si pierde el 50%
-  monitor_intervalo_s: 5  # frecuencia del loop (segundos)
+  stop_loss_pct:  0.50    # stop loss: salir si el movimiento BTC supera este %
+  monitor_intervalo_s: 5  # frecuencia del loop fuera de ventana T-5 (segundos)
+  t5_sl_intervalo_s:   1  # v8.0: frecuencia en T-5 con posición abierta (segundos)
+  min_retorno_pct:  20.0  # v8.0: retorno mínimo estimado para entrar (0 = desactivado)
+                          #   retorno = (1/odds - 1) * 100
+                          #   ej: odds=0.60 → retorno 66.7%  ✅ (si min=20)
+                          #       odds=0.85 → retorno 17.6%  ❌ (si min=20)
 
 capital:
-  stake_usdc:        10   # USDC por operación (por defecto 10)
+  stake_usdc:        10   # USDC por operación
   max_operaciones_dia: 24
 
 polymarket:
-  private_key:    "0x..."       # ⚠ nunca compartir — wallet privada del bot
+  private_key:    "0x..."       # ⚠ nunca compartir
   funder:         "0x..."       # dirección proxy de Polymarket
-  signature_type: 2             # 2 = MetaMask / EOA
+  signature_type: 2             # 2 = MetaMask
   chain_id:       137           # Polygon mainnet
-  # ── Credenciales CLOB API (Level 2) ───────────────────────────────────
-  # Obtenlas en https://clob.polymarket.com con tu wallet conectada,
-  # o ejecutando: python -c "from py_clob_client.client import ClobClient; ..."
-  # También pueden inyectarse como env vars en Railway:
-  #   POLY_API_KEY / POLY_API_SECRET / POLY_API_PASSPHRASE
   api_key:        "..."
   api_secret:     "..."
   api_passphrase: "..."
@@ -37,6 +37,6 @@ telegram:
   notificar_stop_loss: true
 
 logging:
-  nivel:          "INFO"
+  nivel:          "DEBUG"
   archivo:        "logs/bot.log"
   historial_csv:  "logs/operaciones.csv"
