@@ -118,17 +118,17 @@ def notify_market_lost(cfg: dict):
 
 # ── Target ───────────────────────────────────────────────────────────────────
 
-def notify_target_change(cfg: dict, target: float, hour_utc):
-    try:
-        hour_utc = int(hour_utc)
-    except (TypeError, ValueError):
-        hour_utc = "?"
+def notify_target_change(cfg: dict, old_target: float, new_target: float, mins_left: float = 0):
+    delta = new_target - old_target
+    sign  = "+" if delta >= 0 else ""
+    mm    = int(mins_left)
     _send(cfg, (
-        f"🎯 <b>Price to Beat actualizado</b>\n"
-        f"Hora   : <code>{hour_utc:02d}:00 UTC</code>\n"
-        f"Target : <code>${target:,.2f}</code>"
+        f"🔄 <b>Target cambiado</b>\n"
+        f"Anterior : <code>${old_target:,.2f}</code>\n"
+        f"Nuevo    : <code>${new_target:,.2f}</code>\n"
+        f"Δ        : <code>{sign}${delta:,.2f}</code>\n"
+        f"⏱ Quedan : <code>{mm} min</code>"
     ))
-
 
 def notify_target_failed(cfg: dict, hour_utc):
     try:
