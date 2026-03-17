@@ -1,23 +1,35 @@
 "use client";
 /**
- * Dashboard.jsx — v3.2
+ * Dashboard.jsx — v3.3
+ *
+ * CAMBIOS v3.3 — ARQUITECTURA: Dashboard = solo lector, Bot = único escritor
+ * ─────────────────────────────────────────────────────────────────────────
+ *  PROBLEMA ANTERIOR:
+ *    El dashboard tenía lógica de "auto-bet" (creaba operaciones con odds=0.5
+ *    hardcodeado) y "auto-resolve" (resolvía WIN/LOSS comparando precio BTC
+ *    local) y las escribía en Supabase. El bot hacía lo mismo con datos
+ *    reales del CLOB. Resultado: operaciones duplicadas y P&L incorrecto.
+ *
+ *  SOLUCIÓN:
+ *    - Eliminados auto-bet y auto-resolve por completo.
+ *    - El bot (Railway) es la ÚNICA fuente de escritura en Supabase.
+ *    - Dashboard solo lee /api/bets (Supabase) cada 10s.
+ *    - activeBet se deriva de bets: la primera operación con result=PENDING.
+ *    - stake_usdc se lee de /api/config?key=stake_usdc (escrito por el bot
+ *      al arrancar). Fallback: DEFAULT_CONFIG.stake_usdc.
+ *    - running se lee de /api/bot-state (el bot reporta su estado cada ciclo).
+ *    - pnlDay calculado desde bets del día (persiste entre recargas).
  *
  * CAMBIOS v3.2:
- *   - Stats bar: eliminado "BALANCE $500" hardcodeado — no tenía relación
- *     con config.stake_usdc ni con ningún balance real.
- *   - Nueva stat "STAKE/OP" muestra config.stake_usdc (el valor operativo real).
- *   - pnlDay ahora se calcula desde el array `bets` filtrado por la fecha
- *     de hoy: persiste entre recargas y es siempre coherente con Supabase.
- *   - useBalance ya no expone `balance`/`pnlDay` (simplificado en hooks.js v3.2).
+ *   - useBalance simplificado, balance/pnlDay movidos a Dashboard.
+ *   - Stats bar: BALANCE $500 reemplazado por STAKE/OP desde config.
  *
  * CAMBIOS v3.1:
- *   - Import de ModeSelector añadido.
- *   - ModeSelector renderizado al inicio de la pestaña "config".
+ *   - ModeSelector en pestaña config.
  *
  * CAMBIOS v3.0 (Supabase):
- *   - Persistencia real: carga historial desde /api/bets (Supabase) al montar.
- *   - localStorage como caché rápida de sesión; la fuente canónica es la BD.
- *   - Nueva pestaña "análisis" → <StatsPanel /> con métricas de rendimiento.
+ *   - Persistencia real via /api/bets.
+ *   - Nueva pestaña "análisis" → StatsPanel.
  */
 
 import { useState, useEffect, useRef, useCallback } from "react";
@@ -26,7 +38,7 @@ import {
   getDecision, getActiveWindow, getMinsLeft,
   fmt, fmtUSD, fmtPct, genId,
 } from "../lib/constants";
-import { useBTCPrice, useMarket, useClock, useLog, useBalance } from "../lib/hooks";
+import { useBTCPrice, useMarket, useClock, useLog } from "../lib/hooks";
 import PriceChart   from "./PriceChart";
 import WindowBar    from "./WindowBar";
 import MarketInfo   from "./MarketInfo";
@@ -35,7 +47,9 @@ import ConfigPanel  from "./ConfigPanel";
 import StatsPanel   from "./StatsPanel";
 import ModeSelector from "./ModeSelector";
 
-const LS_KEY = "polymarket_bets_v2";
+const LS_KEY          = "polymarket_bets_v2";
+const BETS_POLL_MS    = 10_000;   // refresco bets desde Supabase cada 10s
+const BOTSTATE_POLL_MS = 5_000;   // refresco estado del bot cada 5s
 
 function Tag({ children, color = "#555" }) {
   return (
@@ -59,60 +73,94 @@ function StatBox({ label, value, color = "#c8c8d8", sub }) {
 }
 
 export default function Dashboard() {
-  const [running, setRunning]     = useState(false);
+  // ── Config local (umbrales y stake — stake se sobreescribe desde bot_config)
   const [config, setConfig]       = useState(DEFAULT_CONFIG);
   const [tab, setTab]             = useState("dashboard");
   const [bets, setBets]           = useState([]);
-  const [activeBet, setActiveBet] = useState(null);
-  const [aiText, setAiText]       = useState("Inicia el bot para obtener análisis IA en tiempo real.");
+  const [aiText, setAiText]       = useState("El bot debe estar activo para generar análisis IA.");
   const [aiLoading, setAiLoading] = useState(false);
   const [priceHistory, setPriceHistory] = useState([]);
 
+  // ── Estado del bot leído desde /api/bot-state ─────────────────────────
+  // running = true si el bot reportó estado hace < 90s
+  const [botState, setBotState] = useState(null);
+  const running    = botState?.status === "running" && !botState?.stale;
+  const botStale   = botState?.stale ?? true;
+
   const { price, prev, source, error: priceError, loading: priceLoading } = useBTCPrice(true);
-  const { market, endMs, active: marketActive, error: marketError, apiResponse } = useMarket();
-  const now    = useClock();
+  const { market, endMs, active: marketActive, error: marketError } = useMarket();
+  const now = useClock();
   const { log, add: addLog } = useLog();
-  // v3.2: useBalance ya no expone balance/pnlDay — solo applyBet/applyResult
-  const { applyBet, applyResult } = useBalance();
 
-  // ── v3.0 Persistencia: Supabase (vía /api/bets) + localStorage ──────────
-  useEffect(() => {
-    let cancelled = false;
-
-    async function loadHistory() {
-      // 1. Mostrar localStorage de inmediato como caché rápida
-      try {
-        const saved = localStorage.getItem(LS_KEY);
-        if (saved) {
-          const parsed = JSON.parse(saved);
-          if (Array.isArray(parsed) && parsed.length > 0) setBets(parsed);
-        }
-      } catch {}
-
-      // 2. Cargar desde Supabase (fuente canónica)
-      try {
-        const res = await fetch("/api/bets?limit=500");
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const data = await res.json();
-        const rows = data.bets ?? [];
-        if (!cancelled && rows.length > 0) {
-          setBets(rows);
-          try { localStorage.setItem(LS_KEY, JSON.stringify(rows.slice(0, 500))); } catch {}
-        }
-      } catch (e) {
-        console.warn("[Dashboard] Supabase load failed:", e.message);
+  // ── 1. Cargar bets desde Supabase (fuente canónica — escritas por el bot) ─
+  const loadBets = useCallback(async () => {
+    try {
+      const res = await fetch("/api/bets?limit=500");
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      const rows = data.bets ?? [];
+      if (rows.length > 0) {
+        setBets(rows);
+        try { localStorage.setItem(LS_KEY, JSON.stringify(rows.slice(0, 500))); } catch {}
       }
+    } catch (e) {
+      console.warn("[Dashboard] Error cargando bets:", e.message);
     }
-
-    loadHistory();
-    return () => { cancelled = true; };
   }, []);
 
-  // ── Persistir bets en localStorage cuando cambian ─────────────────────
   useEffect(() => {
-    if (bets.length === 0) return;
-    try { localStorage.setItem(LS_KEY, JSON.stringify(bets.slice(0, 500))); } catch {}
-  }, [bets]);
+    // Cache rápida de localStorage al montar
+    try {
+      const saved = localStorage.getItem(LS_KEY);
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed) && parsed.length > 0) setBets(parsed);
+      }
+    } catch {}
+
+    loadBets();
+    const id = setInterval(loadBets, BETS_POLL_MS);
+    return () => clearInterval(id);
+  }, [loadBets]);
+
+  // ── 2. Estado del bot desde /api/bot-state ────────────────────────────
+  useEffect(() => {
+    async function fetchBotState() {
+      try {
+        const res = await fetch("/api/bot-state");
+        if (!res.ok) return;
+        const data = await res.json();
+        setBotState(data);
+
+        // Sincronizar stake_usdc si el bot lo reporta
+        if (data.stake_usdc) {
+          setConfig(c => ({ ...c, stake_usdc: parseFloat(data.stake_usdc) }));
+        }
+      } catch {}
+    }
+    fetchBotState();
+    const id = setInterval(fetchBotState, BOTSTATE_POLL_MS);
+    return () => clearInterval(id);
+  }, []);
+
+  // ── 3. Leer stake_usdc del bot desde bot_config en Supabase ─────────
+  //    El bot escribe set_config("stake_usdc", ...) al arrancar.
+  useEffect(() => {
+    async function fetchStake() {
+      try {
+        const res = await fetch("/api/config?key=stake_usdc");
+        if (!res.ok) return;
+        const data = await res.json();
+        if (data.value) {
+          const v = parseFloat(data.value);
+          if (!isNaN(v) && v > 0) {
+            setConfig(c => ({ ...c, stake_usdc: v }));
+          }
+        }
+      } catch {}
+    }
+    fetchStake();
+  }, []);
 
   // ── Precio history ────────────────────────────────────────────────────
   useEffect(() => {
@@ -121,8 +169,7 @@ export default function Dashboard() {
       const ts = new Date().toLocaleTimeString("es-ES", {
         hour: "2-digit", minute: "2-digit", second: "2-digit",
       });
-      const next = [...h, { ts, price }];
-      return next.slice(-60);
+      return [...h, { ts, price }].slice(-60);
     });
   }, [price]);
 
@@ -161,7 +208,6 @@ export default function Dashboard() {
     return () => { cancelled = true; clearInterval(iv); };
   }, []);
 
-  // Marcar stale si target > 75 min sin actualizar
   useEffect(() => {
     const iv = setInterval(() => {
       if (targetRef.current && Date.now() - targetRef.current > 75 * 60_000) {
@@ -171,73 +217,32 @@ export default function Dashboard() {
     return () => clearInterval(iv);
   }, []);
 
-  // ── Derived timing ────────────────────────────────────────────────────
+  // ── Timing ────────────────────────────────────────────────────────────
   const minsLeft     = getMinsLeft(endMs, now);
-  const activeWindow = running ? getActiveWindow(minsLeft) : null;
+  // activeWindow solo sirve para mostrar señal visual, no para entrar órdenes
+  const activeWindow = getActiveWindow(minsLeft);
 
-  // ── Señal / decisión ──────────────────────────────────────────────────
+  // ── Señal visual (solo display — el bot decide si entra o no) ─────────
   const umbral   = activeWindow ? config[activeWindow.configKey] : 0;
-  const decision = (running && price && target && activeWindow)
+  const decision = (price && target && activeWindow)
     ? getDecision(price, target, umbral, activeWindow)
     : null;
 
-  // ── Auto-bet ──────────────────────────────────────────────────────────
-  const lastBetWindow = useRef(null);
-  useEffect(() => {
-    if (!running || !decision?.signal || !activeWindow) return;
-    if (lastBetWindow.current === activeWindow.key) return;
-    lastBetWindow.current = activeWindow.key;
+  // ── activeBet: primera operación PENDING en Supabase (escrita por el bot)
+  const activeBet = bets.find(b => b.result === "PENDING") ?? null;
 
-    const odds        = 0.5;
-    const stake       = config.stake_usdc;
-    const retorno_est = stake * (1 / odds - 1);
-    const newBet = {
-      id: genId(), dir: decision.dir, entry: price,
-      stake, odds, retorno_est,
-      window: activeWindow.key, result: "PENDING",
-      pnl: null, pnl_usd: null,
-      ts: new Date().toISOString(),
-    };
-    setActiveBet(newBet);
-    setBets(prev => [newBet, ...prev]);
-    applyBet(stake);
-    addLog(`📍 ${decision.dir} @ $${fmt(price, 2)} · ventana ${activeWindow.key}`, "success");
+  // ── Stats derivadas de bets (fuente: Supabase) ─────────────────────────
+  const wins     = bets.filter(b => b.result === "WIN").length;
+  const losses   = bets.filter(b => b.result === "LOSS" || b.result === "STOP").length;
+  const total    = wins + losses;
+  const winrate  = total > 0 ? (wins / total) * 100 : null;
+  const pnlTotal = bets.reduce((acc, b) => acc + (b.pnl_usd ?? 0), 0);
 
-    fetch("/api/bets", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(newBet),
-    }).catch(() => {});
-  }, [decision, activeWindow, running]);
+  const today  = new Date().toISOString().slice(0, 10);
+  const pnlDay = bets
+    .filter(b => b.ts?.startsWith(today) && b.result && b.result !== "PENDING")
+    .reduce((acc, b) => acc + (b.pnl_usd ?? 0), 0);
 
-  // ── Auto-resolve ──────────────────────────────────────────────────────
-  useEffect(() => {
-    if (!activeBet || minsLeft > 0 || !price) return;
-    const won     = activeBet.dir === "UP" ? price > activeBet.entry : price < activeBet.entry;
-    const stake   = activeBet.stake;
-    const pnl_usd = won ? stake * (1 / activeBet.odds - 1) : -stake;
-    const pnl_pct = parseFloat(((pnl_usd / stake) * 100).toFixed(1));
-
-    setBets(prev => prev.map(bet =>
-      bet.id === activeBet.id
-        ? { ...bet, result: won ? "WIN" : "LOSS", pnl: pnl_pct, pnl_usd }
-        : bet
-    ));
-    setActiveBet(null);
-    applyResult(stake, won);
-    addLog(
-      `${won ? "✅ WIN" : "❌ LOSS"} — P&L: ${fmtUSD(pnl_usd)} (${pnl_pct > 0 ? "+" : ""}${pnl_pct}%)`,
-      won ? "success" : "error",
-    );
-
-    fetch("/api/bets", {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ id: activeBet.id, result: won ? "WIN" : "LOSS", pnl: pnl_pct, pnl_usd }),
-    }).catch(() => {});
-  }, [minsLeft, running, activeBet, price, target]);
-
-  // ── Derived display values ─────────────────────────────────────────────
   const dist = (price && target) ? price - target : null;
 
   const marketSlugShort = market?.slug
@@ -250,23 +255,11 @@ export default function Dashboard() {
     ? { color: "var(--yellow)", label: "TARGET ERR"   }
     : null;
 
-  const wins     = bets.filter(b => b.result === "WIN").length;
-  const losses   = bets.filter(b => b.result === "LOSS" || b.result === "STOP").length;
-  const total    = wins + losses;
-  const winrate  = total > 0 ? (wins / total) * 100 : null;
-  const pnlTotal = bets.reduce((acc, b) => acc + (b.pnl_usd ?? 0), 0);
-
-  // v3.2: pnlDay calculado desde bets del día de hoy (persiste entre recargas)
-  const today  = new Date().toISOString().slice(0, 10);  // "YYYY-MM-DD"
-  const pnlDay = bets
-    .filter(b => b.ts?.startsWith(today) && b.result && b.result !== "PENDING")
-    .reduce((acc, b) => acc + (b.pnl_usd ?? 0), 0);
-
   // ── Render ─────────────────────────────────────────────────────────────
   return (
     <div style={{ minHeight: "100vh", background: "var(--bg)", color: "var(--text)", fontFamily: "var(--font-mono)" }}>
 
-      {/* ── HEADER ─────────────────────────────────────────────────────────── */}
+      {/* ── HEADER ───────────────────────────────────────────────────────── */}
       <header style={{
         display: "flex", justifyContent: "space-between", alignItems: "center",
         padding: "10px 20px", borderBottom: "1px solid var(--border)",
@@ -282,14 +275,24 @@ export default function Dashboard() {
           <span style={{ color: "var(--green)", fontWeight: 700, letterSpacing: "0.12em", fontSize: 14 }}>
             POLYMARKET BTC BOT
           </span>
-          <Tag color="#2a4a3a">v3.2</Tag>
+          <Tag color="#2a4a3a">v3.3</Tag>
+          {/* Estado del bot real (Railway) */}
+          {running
+            ? <Tag color="#1a3a2a">BOT ACTIVO</Tag>
+            : botStale
+            ? <Tag color="#3a1a1a">BOT OFFLINE</Tag>
+            : <Tag color="#2a2a1a">BOT DETENIDO</Tag>
+          }
           {marketActive
-            ? <Tag color="#1a3a2a">MERCADO ACTIVO {marketSlugShort ? `· ${marketSlugShort}` : ""}</Tag>
+            ? <Tag color="#1a3a2a">MERCADO {marketSlugShort ? `· ${marketSlugShort}` : ""}</Tag>
             : <Tag color="#3a1a1a">SIN MERCADO</Tag>
           }
           {targetTag && <Tag color={targetTag.color}>{targetTag.label}</Tag>}
           {target && !targetIsStale && (
             <Tag color="#1a2a3a">TARGET ${fmt(target, 0)}</Tag>
+          )}
+          {activeBet && (
+            <Tag color="#3a2a1a">● {activeBet.dir ?? activeBet.direction} PENDING</Tag>
           )}
         </div>
         <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
@@ -309,22 +312,21 @@ export default function Dashboard() {
               {t}
             </button>
           ))}
-          <button
-            onClick={() => setRunning(r => !r)}
-            style={{
-              background: running ? "rgba(255,68,102,0.15)" : "rgba(0,255,136,0.12)",
-              border: `1px solid ${running ? "rgba(255,68,102,0.4)" : "rgba(0,255,136,0.3)"}`,
-              color: running ? "var(--red)" : "var(--green)",
-              padding: "5px 16px", borderRadius: 3,
-              fontSize: 10, letterSpacing: "0.14em", cursor: "pointer",
-              fontWeight: 700,
-            }}>
-            {running ? "■ DETENER" : "▶ INICIAR"}
-          </button>
+          {/* Botón solo muestra estado real del bot — no lo controla */}
+          <div style={{
+            background: running ? "rgba(0,255,136,0.08)" : "rgba(255,68,102,0.08)",
+            border: `1px solid ${running ? "rgba(0,255,136,0.25)" : "rgba(255,68,102,0.2)"}`,
+            color: running ? "var(--green)" : "var(--red)",
+            padding: "5px 16px", borderRadius: 3,
+            fontSize: 10, letterSpacing: "0.14em",
+            fontWeight: 700,
+          }}>
+            {running ? "● CORRIENDO" : "○ INACTIVO"}
+          </div>
         </div>
       </header>
 
-      {/* ── DASHBOARD ──────────────────────────────────────────────────────── */}
+      {/* ── DASHBOARD ────────────────────────────────────────────────────── */}
       {tab === "dashboard" && (
         <div style={{
           display: "grid",
@@ -363,7 +365,7 @@ export default function Dashboard() {
 
           {/* SEÑAL */}
           <div style={{ background: "var(--bg)", padding: "20px 24px", borderRight: "1px solid var(--border)" }}>
-            <div style={{ fontSize: 9, color: "#444", letterSpacing: "0.15em", marginBottom: 6 }}>SEÑAL ACTIVA</div>
+            <div style={{ fontSize: 9, color: "#444", letterSpacing: "0.15em", marginBottom: 6 }}>SEÑAL VISUAL</div>
             {activeWindow && decision ? (
               <>
                 <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 8 }}>
@@ -386,13 +388,13 @@ export default function Dashboard() {
               </>
             ) : (
               <div style={{ fontSize: 16, color: "var(--dim)", marginTop: 8 }}>
-                {running && targetIsStale  ? "⚠ TARGET STALE"
-                 : running && !target      ? "⚠ SIN TARGET"
-                 : running                 ? "— FUERA DE VENTANA —"
-                 :                          "— BOT DETENIDO —"}
+                {targetIsStale ? "⚠ TARGET STALE"
+                  : !target    ? "⚠ SIN TARGET"
+                  :              "— FUERA DE VENTANA —"}
               </div>
             )}
 
+            {/* Posición activa — leída desde Supabase (escrita por el bot) */}
             {activeBet && (
               <div style={{
                 marginTop: 12, padding: "8px 10px",
@@ -400,7 +402,12 @@ export default function Dashboard() {
                 borderRadius: 3, fontSize: 10, color: "var(--yellow)",
                 display: "flex", flexDirection: "column", gap: 4,
               }}>
-                <div style={{ fontWeight: 700 }}>● POSICIÓN ACTIVA — {activeBet.dir}</div>
+                <div style={{ fontWeight: 700 }}>
+                  ● POSICIÓN ACTIVA — {activeBet.dir ?? activeBet.direction}
+                  {(activeBet.simulated || activeBet.simulado) && (
+                    <span style={{ color: "#888", fontWeight: 400, marginLeft: 6 }}>[SIMULADO]</span>
+                  )}
+                </div>
                 <div style={{ color: "#888", display: "grid", gridTemplateColumns: "1fr 1fr", gap: "2px 12px" }}>
                   <span>Entry: {fmtUSD(activeBet.entry)}</span>
                   <span>Stake: {fmtUSD(activeBet.stake)}</span>
@@ -429,37 +436,63 @@ export default function Dashboard() {
             {targetError && (
               <div style={{ fontSize: 10, color: "var(--yellow)", marginTop: 4 }}>{targetError}</div>
             )}
+            {/* Estado del bot reportado */}
+            {botState && (
+              <div style={{ fontSize: 9, color: "#333", marginTop: 8 }}>
+                Bot last seen: {botState.last_seen
+                  ? new Date(botState.last_seen).toLocaleTimeString("es-ES", { hour12: false })
+                  : "—"}
+                {botState.ops_today != null && (
+                  <span style={{ marginLeft: 8 }}>Ops hoy: {botState.ops_today}</span>
+                )}
+              </div>
+            )}
           </div>
         </div>
       )}
 
-      {/* ── STATS BAR ──────────────────────────────────────────────────────── */}
+      {/* ── STATS BAR ────────────────────────────────────────────────────── */}
       {tab === "dashboard" && (
         <div style={{
           display: "flex", gap: 32, padding: "14px 24px",
           borderBottom: "1px solid var(--border)", background: "#02020a",
-          flexWrap: "wrap",
+          flexWrap: "wrap", alignItems: "flex-end",
         }}>
           {/*
-           * v3.2: "BALANCE $500" eliminado — era un número ficticio hardcodeado
-           * sin relación con el stake real ni con el wallet on-chain.
-           * Reemplazado por "STAKE/OP" que muestra config.stake_usdc (el valor
-           * real que usa el bot para cada operación).
+           * v3.3: stake_usdc viene del bot (bot_config Supabase o bot-state).
+           * Si el bot no está activo aún, muestra DEFAULT_CONFIG.stake_usdc.
            */}
           <StatBox
             label="STAKE/OP"
             value={fmtUSD(config.stake_usdc)}
             color="var(--yellow)"
-            sub="por operación"
+            sub="configurado en bot"
           />
-          <StatBox label="P&L HOY"   value={fmtUSD(pnlDay)}   color={pnlDay   >= 0 ? "var(--green)" : "var(--red)"} />
-          <StatBox label="P&L TOTAL" value={fmtUSD(pnlTotal)} color={pnlTotal >= 0 ? "var(--green)" : "var(--red)"} />
-          <StatBox label="WINRATE"   value={winrate != null ? `${winrate.toFixed(0)}%` : "—"} color="var(--yellow)" sub={`${wins}W / ${losses}L`} />
-          <StatBox label="OPS"       value={total}             color="var(--dim)" />
+          <StatBox
+            label="P&L HOY"
+            value={fmtUSD(pnlDay)}
+            color={pnlDay >= 0 ? "var(--green)" : "var(--red)"}
+          />
+          <StatBox
+            label="P&L TOTAL"
+            value={fmtUSD(pnlTotal)}
+            color={pnlTotal >= 0 ? "var(--green)" : "var(--red)"}
+          />
+          <StatBox
+            label="WINRATE"
+            value={winrate != null ? `${winrate.toFixed(0)}%` : "—"}
+            color="var(--yellow)"
+            sub={`${wins}W / ${losses}L`}
+          />
+          <StatBox label="OPS" value={total} color="var(--dim)" />
+          {/* Indicador de refresco */}
+          <div style={{ marginLeft: "auto", fontSize: 9, color: "#333", alignSelf: "center" }}>
+            ↻ sync cada 10s · fuente: Supabase
+          </div>
         </div>
       )}
 
-      {/* ── MERCADO + CHART + LOG ───────────────────────────────────────────── */}
+      {/* ── MERCADO + CHART + LOG ─────────────────────────────────────────── */}
       {tab === "dashboard" && (
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", borderBottom: "1px solid var(--border)" }}>
           <div style={{ borderRight: "1px solid var(--border)" }}>
@@ -470,7 +503,6 @@ export default function Dashboard() {
               <div style={{ fontSize: 9, color: "#444", letterSpacing: "0.15em", marginBottom: 8 }}>PRECIO BTC — ÚLTIMOS 60s</div>
               <PriceChart data={priceHistory} target={target} />
             </div>
-            {/* IA */}
             <div style={{ padding: "12px 20px" }}>
               <div style={{ fontSize: 9, color: "#444", letterSpacing: "0.15em", marginBottom: 6 }}>ANÁLISIS IA</div>
               <div style={{ fontSize: 11, color: aiLoading ? "var(--dim)" : "var(--text)", lineHeight: 1.6 }}>
@@ -481,7 +513,7 @@ export default function Dashboard() {
         </div>
       )}
 
-      {/* ── LOG ────────────────────────────────────────────────────────────── */}
+      {/* ── LOG ──────────────────────────────────────────────────────────── */}
       {tab === "dashboard" && (
         <div style={{ padding: "12px 20px" }}>
           <div style={{ fontSize: 9, color: "#444", letterSpacing: "0.15em", marginBottom: 8 }}>LOG DE EVENTOS</div>
@@ -510,7 +542,7 @@ export default function Dashboard() {
         </div>
       )}
 
-      {/* ── HISTORIAL ──────────────────────────────────────────────────────── */}
+      {/* ── HISTORIAL ────────────────────────────────────────────────────── */}
       {tab === "historial" && (
         <div>
           <div style={{
@@ -519,12 +551,12 @@ export default function Dashboard() {
             background: "#02020a",
           }}>
             <span style={{ fontSize: 10, color: "#444", letterSpacing: "0.12em" }}>
-              {bets.length} OPERACIONES REGISTRADAS · CLIC EN FILA PARA DETALLES
+              {bets.length} OPERACIONES · FUENTE: SUPABASE (bot) · CLIC EN FILA PARA DETALLES
             </span>
             {bets.length > 0 && (
               <button
                 onClick={() => {
-                  if (window.confirm("¿Borrar historial local? (Supabase no se modifica)")) {
+                  if (window.confirm("¿Limpiar caché local? (Supabase no se modifica)")) {
                     setBets([]);
                     try { localStorage.removeItem(LS_KEY); } catch {}
                   }
@@ -544,17 +576,28 @@ export default function Dashboard() {
         </div>
       )}
 
-      {/* ── ANÁLISIS (v3.0) ────────────────────────────────────────────────── */}
+      {/* ── ANÁLISIS ─────────────────────────────────────────────────────── */}
       {tab === "análisis" && <StatsPanel />}
 
-      {/* ── CONFIG (v3.1: ModeSelector añadido) ───────────────────────────── */}
+      {/* ── CONFIG ───────────────────────────────────────────────────────── */}
       {tab === "config" && (
         <div style={{ padding: "24px" }}>
-          {/* Selector de modo Simulado / Real */}
           <div style={{ marginBottom: 32 }}>
             <ModeSelector />
           </div>
-          {/* Parámetros de estrategia */}
+          {/*
+           * ConfigPanel muestra los umbrales locales. Nota: los umbrales que
+           * usa el bot están en su config.yaml/variables de entorno (Railway).
+           * Estos valores locales son solo para la señal visual del dashboard.
+           */}
+          <div style={{
+            marginBottom: 16, padding: "10px 14px",
+            background: "rgba(255,204,0,0.04)", border: "1px solid rgba(255,204,0,0.15)",
+            borderRadius: 3, fontSize: 10, color: "#666",
+          }}>
+            ⚠ Los umbrales y stake que usa el bot están definidos en Railway (variables de entorno).
+            Los valores aquí son solo para la <span style={{ color: "var(--yellow)" }}>visualización de señal</span> en el dashboard.
+          </div>
           <ConfigPanel config={config} onChange={setConfig} />
         </div>
       )}
