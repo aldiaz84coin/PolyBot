@@ -1,6 +1,12 @@
 """
 monitor.py — Loop principal del bot: ventana horaria, stop loss, resolución
 
+v10.1 — FIX P&L SIMULADO: precio real CLOB en modo simulado
+  - Quitado "not sim_" del guard de real_exit_token_id.
+    Antes el simulado nunca consultaba el CLOB y hardcodeaba 0.98/0.02,
+    ahora tanto live como simulado usan el midpoint real del token al cierre.
+  - El fallback (0.98/0.02) solo actúa si no hay token_id disponible.
+
 v10.0 — MODO SIMULADO/REAL DINÁMICO DESDE BD
   - El bot lee trading_mode desde bot_config en Supabase cada 60s.
   - Si el dashboard cambia el modo, el bot lo recoge sin reiniciarse.
@@ -59,11 +65,11 @@ logger = logging.getLogger(__name__)
 _SEPARATOR  = "─" * 60
 _SEPARATOR2 = "·" * 60
 
-MAX_TARGET_RETRIES      = 5
-TARGET_RETRY_WAIT       = 10
-_CLOB_MIDPOINT          = "https://clob.polymarket.com/midpoint"
+MAX_TARGET_RETRIES       = 5
+TARGET_RETRY_WAIT        = 10
+_CLOB_MIDPOINT           = "https://clob.polymarket.com/midpoint"
 _SNAPSHOT_EVERY_N_CYCLES = 10
-_CONFIG_POLL_INTERVAL   = 60   # segundos entre lecturas de bot_config
+_CONFIG_POLL_INTERVAL    = 60   # segundos entre lecturas de bot_config
 
 
 def _in_any_window(mins_left: float) -> bool:
@@ -176,13 +182,11 @@ def _fetch_exit_token_price(token_id: str) -> float:
 
 def _load_historical_stats(csv_path: str) -> dict:
     """Intenta BD primero; si no disponible, cae a CSV local."""
-    # Intentar desde Supabase
     if db.is_enabled():
         stats = db.fetch_historical_stats()
         if stats.get("total_ops", 0) > 0:
             return stats
 
-    # Fallback CSV
     empty = {"total_ops": 0, "wins": 0, "losses": 0, "stops": 0,
              "total_pnl": 0.0, "total_invested": 0.0}
     if not os.path.exists(csv_path):
@@ -252,7 +256,8 @@ def _log_hour_ops(hour_utc: int, hour_ops: list, hist_stats: dict):
 
         pnl_str = f"{'+' if pnl >= 0 else ''}{pnl:,.2f}"
         logger.info(
-            f"[MONITOR] {i:>2}.  {direction:<5} {window:<6}  "
+            f"[MONITOR] {i:>2}.  "
+            f"{direction:<5} {window:<6}  "
             f"${entry_btc:>9,.0f}  {tokens:>8.4f}  {entry_odds:>6.4f}  "
             f"{exit_odds:>6.4f}  ${exit_btc:>9,.0f}  {result:<8}{sim}  ${pnl_str:>9}"
         )
@@ -376,10 +381,10 @@ def run(cfg: dict):
     last_notified_signal_key = None
     prev_mins_left           = None
 
-    ops_hoy        = 0
-    session_wins   = 0
-    session_losses = 0
-    session_pnl    = 0.0
+    ops_hoy          = 0
+    session_wins     = 0
+    session_losses   = 0
+    session_pnl      = 0.0
     session_invested = 0.0
 
     # Contadores por hora para sesión
@@ -434,8 +439,10 @@ def run(cfg: dict):
                     won   = False
                     exit_odds = 0.0
 
+                    # v10.1 FIX: quitado "not sim_" — simulado también consulta
+                    # el precio real del CLOB para calcular P&L correcto.
                     real_exit_token_id = None
-                    if mkt_ and not sim_:
+                    if mkt_:
                         direction_ = active_bet.get("direction", "")
                         tokens_   = mkt_.get("tokens", {})
                         if direction_ == "UP":
@@ -443,14 +450,14 @@ def run(cfg: dict):
                         else:
                             real_exit_token_id = tokens_.get("no", {}).get("token_id")
 
-                    # Precio live de salida
+                    # Precio live de salida (real y simulado usan CLOB)
                     real_exit_odds_val = None
                     if real_exit_token_id:
                         real_exit_odds_val = _fetch_exit_token_price(real_exit_token_id)
                         exit_odds = real_exit_odds_val
                         won = exit_odds > 0.95
                     else:
-                        # Modo simulado: comparar precio BTC vs target
+                        # Fallback: sin token_id — comparar precio BTC vs target
                         tgt_ = active_bet.get("target", 0)
                         dir_ = active_bet.get("direction", "")
                         if tgt_ and price:
@@ -458,11 +465,8 @@ def run(cfg: dict):
                                 won = price > tgt_
                             else:
                                 won = price < tgt_
-                        if sim_ and won:
-                            exit_odds = 0.98
-                        elif sim_:
-                            exit_odds = 0.02
-                            real_exit_odds_val = 1.0 if won else 0.0
+                        exit_odds          = 0.98 if won else 0.02
+                        real_exit_odds_val = exit_odds
 
                     if won:
                         retorno_real = round(tokens_held * exit_odds, 4)
@@ -646,7 +650,7 @@ def run(cfg: dict):
                         else tokens_mkt.get("no", {}).get("token_id")
                     )
                     exit_token_price = _fetch_exit_token_price(token_id) if token_id else 0.0
-                    entry_odds  = active_bet.get("odds", 0.5)
+                    entry_odds = active_bet.get("odds", 0.5)
 
                     proceeds = tokens_held * exit_token_price
                     pnl_usd  = round(proceeds - stake_, 4)
