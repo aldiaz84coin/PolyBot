@@ -1,6 +1,12 @@
 """
 monitor.py — Loop principal del bot: ventana horaria, stop loss, resolución
 
+v8.0 cambios:
+  - T-5 alta frecuencia: cuando hay active_bet y mins_left < 7, el ciclo
+    usa t5_sl_intervalo_s (default 1s) en vez del interval normal.
+    Permite cortar pérdidas ante movimientos bruscos cerca del cierre.
+  - min_retorno_pct: delegado a strategy.execute_order() — monitor no cambia.
+
 v7.0 — FIX CRÍTICO: resolución al cierre de vela
   _mins_to_close() nunca devuelve ≤ 0 (mínimo ~0.017 en :59:59, luego
   salta a 60 al cambiar de hora). La condición `if mins_left <= 0` NUNCA
@@ -327,12 +333,13 @@ def _fetch_target_with_retry(cfg: dict, hour_utc: int, slug: str | None = None) 
 # ── Loop principal ────────────────────────────────────────────────────────────
 
 def run(cfg: dict):
-    stake         = cfg["capital"]["stake_usdc"]
-    max_ops       = cfg["capital"]["max_operaciones_dia"]
-    interval      = cfg["strategy"].get("monitor_intervalo_s", 5)
-    stop_pct      = cfg["strategy"].get("stop_loss_pct", 5.0)
-    simulate_mode = cfg.get("strategy", {}).get("simulate_mode", False)
-    csv_path      = cfg.get("logging", {}).get("historial_csv", "logs/operaciones.csv")
+    stake          = cfg["capital"]["stake_usdc"]
+    max_ops        = cfg["capital"]["max_operaciones_dia"]
+    interval       = cfg["strategy"].get("monitor_intervalo_s", 5)
+    t5_sl_interval = cfg["strategy"].get("t5_sl_intervalo_s", 1)   # v8.0
+    stop_pct       = cfg["strategy"].get("stop_loss_pct", 5.0)
+    simulate_mode  = cfg.get("strategy", {}).get("simulate_mode", False)
+    csv_path       = cfg.get("logging", {}).get("historial_csv", "logs/operaciones.csv")
 
     # ── Cargar y mostrar historial acumulado ──────────────────────────────
     hist_stats = _load_historical_stats(csv_path)
@@ -361,6 +368,7 @@ def run(cfg: dict):
     hour_ops    = []
 
     last_notified_signal_key = None
+    _t5_hf_active = False   # v8.0: flag para loguear transición una sola vez
 
     logger.info(_SEPARATOR)
     sim_tag = " [MODO SIMULADO]" if simulate_mode else ""
@@ -676,7 +684,19 @@ def run(cfg: dict):
                         f"[MONITOR] ⛔ Límite diario alcanzado ({ops_hoy}/{max_ops}) — señal ignorada"
                     )
 
-            time.sleep(interval)
+            # v8.0: alta frecuencia en T-5 si hay posición abierta
+            in_t5_hf = (active_bet is not None and mins_left < 7)
+            if in_t5_hf and not _t5_hf_active:
+                logger.info(
+                    f"[MONITOR] ⚡ T-5 alta frecuencia activada — "
+                    f"intervalo {t5_sl_interval}s (era {interval}s)"
+                )
+                _t5_hf_active = True
+            elif not in_t5_hf and _t5_hf_active:
+                logger.info("[MONITOR] 🔵 T-5 alta frecuencia desactivada")
+                _t5_hf_active = False
+
+            time.sleep(t5_sl_interval if in_t5_hf else interval)
 
     except KeyboardInterrupt:
         logger.info("[MONITOR] ⛔ Bot detenido por el usuario (KeyboardInterrupt)")
