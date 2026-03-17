@@ -1,4 +1,13 @@
 "use client";
+/**
+ * Dashboard.jsx — v3.0
+ *
+ * CAMBIOS v3.0 (Supabase):
+ *   - Persistencia real: carga historial desde /api/bets (Supabase) al montar.
+ *   - localStorage como caché rápida de sesión; la fuente canónica es la BD.
+ *   - Nueva pestaña "análisis" → <StatsPanel /> con métricas de rendimiento.
+ *   - Versión bumped en header tag.
+ */
 
 import { useState, useEffect, useRef, useCallback } from "react";
 import {
@@ -12,6 +21,7 @@ import WindowBar   from "./WindowBar";
 import MarketInfo  from "./MarketInfo";
 import BetsTable   from "./BetsTable";
 import ConfigPanel from "./ConfigPanel";
+import StatsPanel  from "./StatsPanel";
 
 const LS_KEY = "polymarket_bets_v2";
 
@@ -52,21 +62,46 @@ export default function Dashboard() {
   const { log, add: addLog } = useLog();
   const { balance, pnlDay, applyBet, applyResult } = useBalance(500);
 
-  // ── Persistencia localStorage ────────────────────────────────────────────
+  // ── v3.0 Persistencia: Supabase (vía /api/bets) + localStorage ──────────
   useEffect(() => {
-    try {
-      const saved = localStorage.getItem(LS_KEY);
-      if (saved) {
-        const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed)) setBets(parsed);
-      }
-    } catch {}
-  }, []);
+    let cancelled = false;
 
+    async function loadHistory() {
+      // 1. Mostrar localStorage de inmediato como caché rápida
+      try {
+        const saved = localStorage.getItem(LS_KEY);
+        if (saved) {
+          const parsed = JSON.parse(saved);
+          if (Array.isArray(parsed) && parsed.length > 0) setBets(parsed);
+        }
+      } catch {}
+
+      // 2. Fetch de la API (Supabase si está configurado, in-memory si no)
+      try {
+        const res  = await fetch("/api/bets?limit=500");
+        if (!res.ok) return;
+        const json = await res.json();
+        if (cancelled) return;
+
+        const apiBets = json.bets || [];
+        if (apiBets.length > 0) {
+          setBets(apiBets);
+          // Sincronizar localStorage con los datos frescos
+          try { localStorage.setItem(LS_KEY, JSON.stringify(apiBets.slice(0, 500))); } catch {}
+        }
+      } catch (e) {
+        console.warn("[Dashboard] No se pudo cargar historial de API:", e.message);
+      }
+    }
+
+    loadHistory();
+    return () => { cancelled = true; };
+  }, []); // solo al montar
+
+  // Guardar en localStorage cuando cambian bets (el POST a /api/bets
+  // lo hace el bloque de ejecución de apuestas más abajo)
   useEffect(() => {
-    try {
-      localStorage.setItem(LS_KEY, JSON.stringify(bets.slice(0, 500)));
-    } catch {}
+    try { localStorage.setItem(LS_KEY, JSON.stringify(bets.slice(0, 500))); } catch {}
   }, [bets]);
 
   // ── minsLeft: calculado en tiempo real cada segundo desde end_ms ─────────
@@ -164,7 +199,6 @@ export default function Dashboard() {
   }, [price]);
 
   // ── Bot logic ─────────────────────────────────────────────────────────────
-  // ✅ FIX: activeWindow/umbral/decision declarados ANTES del useEffect que los usa
   const activeWindow = getActiveWindow(minsLeft);
   const umbral       = activeWindow ? config[activeWindow.configKey] : null;
   const decision     = (running && activeWindow && price && target && !targetIsStale)
@@ -246,30 +280,21 @@ export default function Dashboard() {
   }, [running, activeWindow?.key, decision?.signal, decision?.dir]);
 
   // ── Stop Loss ─────────────────────────────────────────────────────────────
-  // FIX v2.7: El P&L del stop ya no usa un porcentaje fijo (stake * stop_pct%).
-  // Ahora usa el precio REAL del token en Polymarket en el momento del stop:
-  //   shares = stake / odds_entrada
-  //   proceeds = shares * precio_actual_del_token
-  //   pnl_usd = proceeds - stake
-  // Esto refleja lo que realmente se recuperaría al vender la posición.
   useEffect(() => {
     if (!running || !activeBet || !price) return;
 
-    // Trigger del stop: sigue basado en movimiento de BTC vs entry
     const pnl_pct_btc = activeBet.dir === "UP"
       ? ((price - activeBet.entry) / activeBet.entry) * 100
       : ((activeBet.entry - price) / activeBet.entry) * 100;
 
     if (pnl_pct_btc <= -config.stop_loss_pct) {
-      // Precio actual del token en Polymarket (refleja la apuesta en tiempo real)
       const tokenPrice = activeBet.dir === "UP"
         ? (market?.tokens?.yes?.price ?? 0)
         : (market?.tokens?.no?.price  ?? 0);
 
-      // Cálculo real: shares comprados × precio actual = lo que se recupera
-      const sharesHeld  = activeBet.stake / Math.max(activeBet.odds ?? 0.5, 0.001);
-      const proceeds    = sharesHeld * tokenPrice;
-      const pnl_usd     = +(proceeds - activeBet.stake).toFixed(2);
+      const sharesHeld   = activeBet.stake / Math.max(activeBet.odds ?? 0.5, 0.001);
+      const proceeds     = sharesHeld * tokenPrice;
+      const pnl_usd      = +(proceeds - activeBet.stake).toFixed(2);
       const pnl_pct_real = +((pnl_usd / activeBet.stake) * 100).toFixed(1);
 
       setBets(b => b.map(bet =>
@@ -292,20 +317,14 @@ export default function Dashboard() {
     }
   }, [price, activeBet, running, market]);
 
-  // ── Resolución al cierre ──────────────────────────────────────────────────
-  // v2.8 FIX: Añadido null-guard para minsLeft (null cuando endMs no está
-  // disponible aún) y dependencias completas para evitar closures obsoletos.
-  // null > 0.8 === false en JS, lo que disparaba el efecto incorrectamente.
+  // ── Resolución al cierre de vela ──────────────────────────────────────────
   useEffect(() => {
     if (!running || !activeBet || !price || !target) return;
     if (minsLeft === null || minsLeft > 0.8) return;
 
     const won   = activeBet.dir === "UP" ? price > activeBet.target : price < activeBet.target;
-    // odds reales de entrada (corregido desde v2.7 — ya no defaultea a 0.5)
     const odds  = activeBet.odds || 0.5;
     const stake = activeBet.stake;
-    // WIN: cada share resuelve a $1 → retorno real = stake / odds
-    // LOSS: cada share resuelve a $0 → pnl = -stake
     const pnl_usd = won
       ? +(stake / odds - stake).toFixed(2)
       : +(-stake).toFixed(2);
@@ -328,11 +347,9 @@ export default function Dashboard() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ id: activeBet.id, result: won ? "WIN" : "LOSS", pnl: pnl_pct, pnl_usd }),
     }).catch(() => {});
-  // v2.8: deps completas — incluir activeBet, price y target evita
-  // closures obsoletos que leían valores de la apuesta anterior.
   }, [minsLeft, running, activeBet, price, target]);
 
-  // ── Derived display values ────────────────────────────────────────────────
+  // ── Derived display values ─────────────────────────────────────────────────
   const dist = (price && target) ? price - target : null;
 
   const marketSlugShort = market?.slug
@@ -345,14 +362,14 @@ export default function Dashboard() {
     ? { color: "var(--yellow)", label: "TARGET ERR"   }
     : null;
 
-  // Stats
-  const wins    = bets.filter(b => b.result === "WIN").length;
-  const losses  = bets.filter(b => b.result === "LOSS" || b.result === "STOP").length;
-  const total   = wins + losses;
-  const winrate = total > 0 ? (wins / total) * 100 : null;
+  // Stats (calculadas desde bets locales — siempre actualizadas en tiempo real)
+  const wins     = bets.filter(b => b.result === "WIN").length;
+  const losses   = bets.filter(b => b.result === "LOSS" || b.result === "STOP").length;
+  const total    = wins + losses;
+  const winrate  = total > 0 ? (wins / total) * 100 : null;
   const pnlTotal = bets.reduce((acc, b) => acc + (b.pnl_usd ?? 0), 0);
 
-  // ── Render ────────────────────────────────────────────────────────────────
+  // ── Render ─────────────────────────────────────────────────────────────────
   return (
     <div style={{ minHeight: "100vh", background: "var(--bg)", color: "var(--text)", fontFamily: "var(--font-mono)" }}>
 
@@ -372,7 +389,8 @@ export default function Dashboard() {
           <span style={{ color: "var(--green)", fontWeight: 700, letterSpacing: "0.12em", fontSize: 14 }}>
             POLYMARKET BTC BOT
           </span>
-          <Tag color="#2a4a3a">v2.8</Tag>
+          {/* v3.0 — bumped */}
+          <Tag color="#2a4a3a">v3.0</Tag>
           {marketActive
             ? <Tag color="#1a3a2a">MERCADO ACTIVO {marketSlugShort ? `· ${marketSlugShort}` : ""}</Tag>
             : <Tag color="#3a1a1a">SIN MERCADO</Tag>
@@ -383,7 +401,8 @@ export default function Dashboard() {
           )}
         </div>
         <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-          {["dashboard", "historial", "config"].map(t => (
+          {/* v3.0: añadida pestaña "análisis" */}
+          {["dashboard", "historial", "análisis", "config"].map(t => (
             <button
               key={t}
               onClick={() => setTab(t)}
@@ -530,11 +549,11 @@ export default function Dashboard() {
           borderBottom: "1px solid var(--border)", background: "#02020a",
           flexWrap: "wrap",
         }}>
-          <StatBox label="BALANCE" value={fmtUSD(balance)} color={balance >= 500 ? "var(--green)" : "var(--red)"} />
-          <StatBox label="P&L HOY"  value={fmtUSD(pnlDay)}  color={pnlDay >= 0 ? "var(--green)" : "var(--red)"} />
-          <StatBox label="P&L TOTAL" value={fmtUSD(pnlTotal)} color={pnlTotal >= 0 ? "var(--green)" : "var(--red)"} />
-          <StatBox label="WINRATE"  value={winrate != null ? `${winrate.toFixed(0)}%` : "—"} color="var(--yellow)" sub={`${wins}W / ${losses}L`} />
-          <StatBox label="OPS" value={total} color="var(--dim)" />
+          <StatBox label="BALANCE"   value={fmtUSD(balance)}  color={balance >= 500 ? "var(--green)" : "var(--red)"} />
+          <StatBox label="P&L HOY"   value={fmtUSD(pnlDay)}   color={pnlDay   >= 0  ? "var(--green)" : "var(--red)"} />
+          <StatBox label="P&L TOTAL" value={fmtUSD(pnlTotal)} color={pnlTotal >= 0  ? "var(--green)" : "var(--red)"} />
+          <StatBox label="WINRATE"   value={winrate != null ? `${winrate.toFixed(0)}%` : "—"} color="var(--yellow)" sub={`${wins}W / ${losses}L`} />
+          <StatBox label="OPS"       value={total}             color="var(--dim)" />
         </div>
       )}
 
@@ -603,8 +622,9 @@ export default function Dashboard() {
             {bets.length > 0 && (
               <button
                 onClick={() => {
-                  if (window.confirm("¿Borrar todo el historial?")) {
+                  if (window.confirm("¿Borrar historial local? (Supabase no se modifica)")) {
                     setBets([]);
+                    try { localStorage.removeItem(LS_KEY); } catch {}
                   }
                 }}
                 style={{
@@ -614,13 +634,16 @@ export default function Dashboard() {
                   padding: "4px 10px", borderRadius: 3,
                   cursor: "pointer", letterSpacing: "0.12em",
                 }}>
-                BORRAR HISTORIAL
+                LIMPIAR CACHÉ LOCAL
               </button>
             )}
           </div>
           <BetsTable bets={bets} />
         </div>
       )}
+
+      {/* ── ANÁLISIS (v3.0) ────────────────────────────────────────────────── */}
+      {tab === "análisis" && <StatsPanel />}
 
       {/* ── CONFIG ─────────────────────────────────────────────────────────── */}
       {tab === "config" && (

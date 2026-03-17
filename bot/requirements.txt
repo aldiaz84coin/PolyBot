@@ -1,5 +1,21 @@
+# PolyBot — Python dependencies
+# Actualizado v9.0: añadido supabase para persistencia compartida
+
+# Core
 requests>=2.31.0
 pyyaml>=6.0.1
-web3>=6.15.0
-python-telegram-bot>=20.7
+
+# Polymarket CLOB
 py-clob-client>=0.18.0
+
+# Web3 / Polygon
+web3>=6.0.0
+
+# Telegram
+python-telegram-bot>=20.0
+
+# Supabase (persistencia compartida bot ↔ dashboard)
+supabase>=2.4.0
+
+# Logging / utils
+python-dotenv>=1.0.0

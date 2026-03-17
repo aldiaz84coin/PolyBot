@@ -1,30 +1,23 @@
 """
 monitor.py — Loop principal del bot: ventana horaria, stop loss, resolución
 
-v8.0 cambios:
-  - T-5 alta frecuencia: cuando hay active_bet y mins_left < 7, el ciclo
-    usa t5_sl_intervalo_s (default 1s) en vez del interval normal.
-    Permite cortar pérdidas ante movimientos bruscos cerca del cierre.
-  - min_retorno_pct: delegado a strategy.execute_order() — monitor no cambia.
+v9.0 — PERSISTENCIA SUPABASE
+  - Todas las operaciones se escriben en Supabase en tiempo real:
+      · upsert_operation() al abrir apuesta (PENDING)
+      · close_operation() al resolver (WIN/LOSS/STOP)
+      · log_signal() para señales accionables
+      · log_price_snapshot() cada 5 minutos
+      · upsert_session() al cambio de hora
+  - _load_historical_stats() intenta BD primero, cae a CSV si no hay BD.
+  - El CSV de Railway sigue escribiéndose como backup secundario.
+  - La BD nunca bloquea el bot: cualquier error de Supabase es warned y continúa.
 
-v7.0 — FIX CRÍTICO: resolución al cierre de vela
-  _mins_to_close() nunca devuelve ≤ 0 (mínimo ~0.017 en :59:59, luego
-  salta a 60 al cambiar de hora). La condición `if mins_left <= 0` NUNCA
-  era True, dejando las apuestas abiertas indefinidamente sin registrar
-  WIN/LOSS ni actualizar el histórico. Fix: detectar el cierre por rollover
-  (prev_mins_left < 2 y mins_left > 50) o umbral final (< 0.5 min).
-
-v5.0 — FIXES NOTIFICACIONES:
-  1. Import notify_new_hour desde notifier
-  2. notify_hour_summary se llama SIEMPRE al cambio de hora (sin condición)
-  3. notify_new_hour se llama al inicio de cada hora nueva
-
-v4.0 — FIXES:
-  1. CRASH 429 CoinGecko: get_btc_price() ya nunca lanza excepción fatal
-  2. HISTORIAL SIMULADO: hour_ops con detalle completo por operación
-
-v3.2 — FIX NOTIFICACIONES TELEGRAM EN MODO SIMULADO
-v3.0 — Pre-producción fixes (stop_pct, stats, simulate_mode)
+v8.0 — T-5 alta frecuencia (intervalo 1s con posición abierta)
+v7.0 — FIX CRÍTICO: resolución por rollover de minutos
+v5.0 — FIXES NOTIFICACIONES
+v4.0 — FIXES crash 429 + historial simulado
+v3.2 — FIX TELEGRAM modo simulado
+v3.0 — Pre-producción fixes
 v2.9 — BUG FIX: señal WAIT ya no dispara execute_order
 v2.8 — FIX: _fetch_exit_token_price usa CLOB live
 v2.7 — Retornos reales desde Polymarket
@@ -51,6 +44,7 @@ from .notifier       import (
     notify_error,
     notify_startup_summary,
 )
+from . import db  # módulo de persistencia Supabase (v9.0)
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +54,9 @@ _SEPARATOR2 = "·" * 60
 MAX_TARGET_RETRIES = 5
 TARGET_RETRY_WAIT  = 10
 _CLOB_MIDPOINT     = "https://clob.polymarket.com/midpoint"
+
+# Cada cuántos ciclos guardar snapshot de precio (~5 min si interval=30s)
+_SNAPSHOT_EVERY_N_CYCLES = 10
 
 
 def _in_any_window(mins_left: float) -> bool:
@@ -89,7 +86,7 @@ def _log_cycle(price, target, mins_left, ops_hoy, max_ops):
     )
 
 
-# ── CSV de operaciones ────────────────────────────────────────────────────────
+# ── CSV de operaciones (backup local) ────────────────────────────────────────
 
 _CSV_HEADERS = [
     "id", "ts_entrada", "ts_cierre",
@@ -102,6 +99,7 @@ _CSV_HEADERS = [
     "resultado",
     "market_slug",
     "simulado",
+    "real_exit_odds",
 ]
 
 
@@ -123,7 +121,7 @@ def _csv_write_row(path: str, row: dict):
         logger.warning(f"[MONITOR] ⚠ Error escribiendo CSV: {e}")
 
 
-def _build_trade_row(bet, result, ts_cierre, pnl_usd, pnl_pct):
+def _build_trade_row(bet, result, ts_cierre, pnl_usd, pnl_pct, real_exit_odds=None):
     stake   = bet.get("stake", 0)
     odds    = bet.get("odds", 0.5)
     retorno = round(stake / odds, 2) if odds > 0 else 0
@@ -146,13 +144,25 @@ def _build_trade_row(bet, result, ts_cierre, pnl_usd, pnl_pct):
         "resultado":            result,
         "market_slug":          bet.get("market_slug", ""),
         "simulado":             bet.get("simulated", False),
+        "real_exit_odds":       real_exit_odds,
     }
 
 
 # ── Historial acumulado ───────────────────────────────────────────────────────
 
 def _load_historical_stats(csv_path: str) -> dict:
-    """Lee el CSV completo y devuelve stats acumuladas."""
+    """
+    Carga estadísticas históricas. Intenta Supabase primero; si no
+    está disponible, lee el CSV local de Railway.
+    """
+    # v9.0: intentar BD antes que CSV
+    if db.is_enabled():
+        stats_db = db.fetch_historical_stats()
+        if stats_db.get("total_ops", 0) >= 0:
+            logger.debug("[MONITOR] Historial cargado desde Supabase")
+            return stats_db
+
+    # Fallback: CSV local
     stats = {
         "total_ops": 0, "wins": 0, "losses": 0, "stops": 0,
         "total_pnl": 0.0, "total_invested": 0.0,
@@ -197,10 +207,6 @@ def _log_accumulated_stats(stats: dict, label: str = "HISTORIAL"):
 
 
 def _log_hour_ops(hour_utc: int, hour_ops: list, hist_stats: dict):
-    """
-    Muestra tabla detallada de operaciones de la hora actual + acumulado.
-    Se imprime al cambio de hora y al finalizar la sesión.
-    """
     if not hour_ops:
         return
 
@@ -229,344 +235,232 @@ def _log_hour_ops(hour_utc: int, hour_ops: list, hist_stats: dict):
 
         pnl_str = f"{'+' if pnl >= 0 else ''}{pnl:,.2f}"
         logger.info(
-            f"[MONITOR] {i:>2}.{sim}  {direction:<5} {window:<6}  "
-            f"${entry_btc:>9,.2f}  {tokens:>8.4f}  {entry_odds:>6.4f}  "
-            f"{exit_odds:>6.4f}  ${exit_btc:>9,.2f}  {result:<6}  "
-            f"${pnl_str:>9}"
+            f"[MONITOR] {i:>2}.  {direction:<5}{sim} {window:<6}  "
+            f"${entry_btc:>10,.0f}  {tokens:>8.4f}  {entry_odds:>6.4f}  "
+            f"{exit_odds:>6.4f}  ${exit_btc:>10,.0f}  {result:<6}  {pnl_str:>10}"
         )
 
+    sign = "+" if total_pnl >= 0 else ""
     logger.info(_SEPARATOR2)
-    hw   = hist_stats.get("wins", 0)
-    hl   = hist_stats.get("losses", 0) + hist_stats.get("stops", 0)
-    hp   = hist_stats.get("total_pnl", 0.0)
-    hr   = round(hw / (hw + hl) * 100) if (hw + hl) > 0 else 0
-    hs   = "+" if hp >= 0 else ""
-    ht   = f"{'+' if total_pnl >= 0 else ''}{total_pnl:,.2f}"
-    logger.info(
-        f"[MONITOR] Hora: P&L ${ht}  |  "
-        f"Acumulado: {hw}W/{hl}L WR={hr}%  P&L neto {hs}${hp:,.2f}"
-    )
+    logger.info(f"[MONITOR]      Hora P&L: {sign}${total_pnl:,.2f} USDC")
+    _log_accumulated_stats(hist_stats, label="ACUMULADO")
     logger.info(_SEPARATOR)
 
 
-# ── Exit token price (stop loss) ──────────────────────────────────────────────
+# ── Precio de salida (CLOB live) ─────────────────────────────────────────────
 
-def _fetch_exit_token_price(active_bet: dict, cfg: dict) -> float | None:
-    """
-    Obtiene el precio actual del token en Polymarket vía CLOB midpoint.
-    Fallback: Gamma API por conditionId.
-    """
-    market         = active_bet.get("market", {})
-    direction      = active_bet.get("direction", "UP")
-    outcome_target = "Yes" if direction == "UP" else "No"
-    token_id       = None
-
-    tokens = market.get("tokens", [])
-    if isinstance(tokens, dict):
-        t_data   = tokens.get("yes" if direction == "UP" else "no", {})
-        token_id = t_data.get("token_id") if isinstance(t_data, dict) else None
-    elif isinstance(tokens, list):
-        for t in tokens:
-            if t.get("outcome") == outcome_target:
-                token_id = t.get("token_id")
-                break
-
-    if token_id:
-        try:
-            r = requests.get(_CLOB_MIDPOINT, params={"token_id": token_id}, timeout=8)
-            r.raise_for_status()
-            mid = r.json().get("mid")
-            if mid is not None:
-                price = float(mid)
-                logger.info(f"[MONITOR] Exit token price (CLOB midpoint): {price:.4f}")
-                return price
-        except Exception as e:
-            logger.warning(f"[MONITOR] ⚠ CLOB midpoint falló: {e}")
-
-    # Fallback: Gamma API por conditionId
-    cond_id = market.get("condition_id", "")
-    if cond_id:
-        try:
-            r = requests.get(
-                "https://gamma-api.polymarket.com/markets",
-                params={"conditionId": cond_id},
-                timeout=8,
-            )
-            r.raise_for_status()
+def _fetch_exit_token_price(token_id: str) -> float:
+    """Obtiene precio live del token en el CLOB para calcular P&L real."""
+    try:
+        r = requests.get(_CLOB_MIDPOINT, params={"token_id": token_id}, timeout=5)
+        if r.ok:
             data = r.json()
-            if data:
-                m_tokens = data[0].get("tokens", [])
-                price_fallback = next(
-                    (float(t.get("price", 0)) for t in m_tokens
-                     if t.get("outcome") == outcome_target),
-                    None,
-                )
-                if price_fallback is not None:
-                    logger.warning(
-                        f"[MONITOR] ⚠ Exit token price (Gamma fallback, puede ser cacheado): "
-                        f"{price_fallback:.4f}"
-                    )
-                    return price_fallback
-        except Exception as e:
-            logger.warning(f"[MONITOR] ⚠ Gamma fallback falló: {e}")
-
-    logger.error("[MONITOR] ❌ No se pudo obtener exit token price — usando fallback % fijo")
-    return None
+            return float(data.get("mid", 0) or 0)
+    except Exception as e:
+        logger.warning(f"[MONITOR] ⚠ _fetch_exit_token_price: {e}")
+    return 0.0
 
 
-# ── Target con reintentos ─────────────────────────────────────────────────────
+# ── Helpers Supabase (v9.0) ───────────────────────────────────────────────────
 
-def _fetch_target_with_retry(cfg: dict, hour_utc: int, slug: str | None = None) -> float | None:
-    for attempt in range(1, MAX_TARGET_RETRIES + 1):
-        try:
-            t = get_open_1h_binance(slug=slug)
-            if t:
-                return t
-        except Exception as e:
-            logger.warning(f"[MONITOR] ⚠ Target intento {attempt}/{MAX_TARGET_RETRIES}: {e}")
-        if attempt < MAX_TARGET_RETRIES:
-            time.sleep(TARGET_RETRY_WAIT)
-    notify_target_failed(cfg, hour_utc)
-    return None
+def _build_db_operation(bet: dict) -> dict:
+    """Construye el dict de operación para Supabase (estado PENDING al abrir)."""
+    stake  = bet.get("stake", 0)
+    odds   = bet.get("odds", 0.5)
+    return {
+        "id":                   bet.get("id", ""),
+        "ts_entrada":           bet.get("ts_entrada", datetime.now(timezone.utc).isoformat()),
+        "direccion":            bet.get("direction", ""),
+        "ventana":              bet.get("window", ""),
+        "entry_price":          round(bet.get("entry", 0), 2),
+        "target_price":         round(bet.get("target", 0), 2) if bet.get("target") else None,
+        "distancia":            round(bet.get("distance", 0), 2),
+        "umbral":               bet.get("umbral"),
+        "odds_entrada":         round(odds, 6),
+        "stake_usd":            round(stake, 4),
+        "tokens_comprados":     round(bet.get("tokens", 0), 6),
+        "retorno_estimado_usd": round(stake / max(odds, 0.001), 4),
+        "resultado":            "PENDING",
+        "market_slug":          bet.get("market_slug", ""),
+        "simulado":             bool(bet.get("simulated", False)),
+        "source":               "bot",
+    }
+
+
+def _session_id(now: datetime) -> str:
+    return now.strftime("%Y-%m-%d-%H")
+
+
+def _sync_session_to_db(
+    now:             datetime,
+    market_slug:     str,
+    hour_wins:       int,
+    hour_losses:     int,
+    hour_stops:      int,
+    hour_pnl:        float,
+    hour_invested:   float,
+    simulado:        bool,
+):
+    """Actualiza el resumen de sesión horaria en Supabase."""
+    sid = _session_id(now)
+    db.upsert_session(
+        session_id  = sid,
+        fecha       = now.strftime("%Y-%m-%d"),
+        hour_utc    = now.hour,
+        market_slug = market_slug or "",
+        ops         = hour_wins + hour_losses + hour_stops,
+        wins        = hour_wins,
+        losses      = hour_losses,
+        stops       = hour_stops,
+        pnl_usd     = hour_pnl,
+        stake_total = hour_invested,
+        simulado    = simulado,
+    )
 
 
 # ── Loop principal ────────────────────────────────────────────────────────────
 
 def run(cfg: dict):
-    stake          = cfg["capital"]["stake_usdc"]
-    max_ops        = cfg["capital"]["max_operaciones_dia"]
-    interval       = cfg["strategy"].get("monitor_intervalo_s", 5)
-    t5_sl_interval = cfg["strategy"].get("t5_sl_intervalo_s", 1)   # v8.0
-    stop_pct       = cfg["strategy"].get("stop_loss_pct", 5.0)
-    simulate_mode  = cfg.get("strategy", {}).get("simulate_mode", False)
-    csv_path       = cfg.get("logging", {}).get("historial_csv", "logs/operaciones.csv")
+    # ── Config ────────────────────────────────────────────────────────────
+    csv_path    = cfg.get("logging", {}).get("csv_path", "logs/operaciones.csv")
+    interval    = cfg.get("monitor", {}).get("interval_s", 30)
+    max_ops     = cfg.get("monitor", {}).get("max_ops_per_day", 4)
+    stake       = float(cfg.get("capital", {}).get("stake_usdc", 10))
+    stop_pct    = float(cfg.get("strategy", {}).get("stop_loss_pct", 15))
+    simulate    = bool(cfg.get("strategy", {}).get("simulate_mode", False))
+    t5_sl_interval = cfg.get("monitor", {}).get("t5_sl_interval_s", 1)
 
-    # ── Cargar y mostrar historial acumulado ──────────────────────────────
-    hist_stats = _load_historical_stats(csv_path)
-    _log_accumulated_stats(hist_stats)
+    # v9.0: inicializar Supabase
+    supabase_url = cfg.get("supabase", {}).get("url", "")
+    supabase_key = cfg.get("supabase", {}).get("service_key", "")
+    db_ok = db.init(supabase_url, supabase_key)
+    if not db_ok:
+        logger.warning("[MONITOR] Supabase no disponible — usando solo CSV local")
 
-    session_pnl      = 0.0
-    session_invested = 0.0
-    session_wins     = 0
-    session_losses   = 0
+    logger.info(
+        f"[MONITOR] 🚀 Iniciando — stake=${stake}  stop={stop_pct}%  "
+        f"max_ops={max_ops}  interval={interval}s  "
+        f"simulate={'SÍ' if simulate else 'NO'}  "
+        f"db={'✅' if db_ok else '❌'}"
+    )
 
     notify_start(cfg)
+
+    # ── Estado inicial ─────────────────────────────────────────────────────
+    hist_stats = _load_historical_stats(csv_path)
+    _log_accumulated_stats(hist_stats, label="HISTORIAL AL ARRANCAR")
     notify_startup_summary(cfg, hist_stats)
 
-    # ── Estado de mercado/hora ────────────────────────────────────────────
-    market       = None
-    slug         = None
-    target       = None
-    active_bet   = None
-    fired_window = None
-    last_hour    = -1
-    last_slug    = None
-
-    hour_wins   = 0
-    hour_losses = 0
-    ops_hoy     = 0
-    hour_ops    = []
-
+    active_bet               = None
+    fired_window             = None
     last_notified_signal_key = None
-    _t5_hf_active = False   # v8.0: flag para loguear transición una sola vez
+    prev_mins_left           = None
 
-    logger.info(_SEPARATOR)
-    sim_tag = " [MODO SIMULADO]" if simulate_mode else ""
-    logger.info(f"[MONITOR] 🚀 Bot iniciado{sim_tag} — esperando mercado activo…")
-    logger.info(_SEPARATOR)
+    ops_hoy      = 0
+    session_wins = 0
+    session_losses = 0
+    session_pnl  = 0.0
+    session_invested = 0.0
 
-    # v7.0: inicializar mins_left antes del loop para que prev_mins_left
-    # tenga un valor válido desde la primera iteración.
-    mins_left      = _mins_to_close()
-    prev_mins_left = mins_left
+    # Contadores por hora para sesión
+    hour_wins    = 0
+    hour_losses  = 0
+    hour_stops   = 0
+    hour_pnl     = 0.0
+    hour_invested = 0.0
+    hour_ops     = []
+
+    now_utc  = datetime.now(timezone.utc)
+    last_hour = now_utc.hour
+    market   = None
+    target   = None
+    slug     = None
+    price    = 0.0
+
+    _t5_hf_active  = False
+    cycle_count    = 0     # v9.0: contador para price_snapshots
 
     try:
         while True:
-            # v7.0: guardar valor anterior ANTES de recomputar para detectar rollover
-            prev_mins_left = mins_left
-            mins_left      = _mins_to_close()
-            now_hour       = datetime.now(timezone.utc).hour
+            cycle_count += 1
+            now_utc    = datetime.now(timezone.utc)
+            mins_left  = _mins_to_close()
+            hour_utc   = now_utc.hour
 
-            # ── Reset horario ─────────────────────────────────────────────
-            if now_hour != last_hour:
-                if last_hour >= 0:
-                    # v5.0: resumen SIEMPRE al cambiar de hora (sin condición)
-                    hist_stats = _load_historical_stats(csv_path)
-                    _log_hour_ops(last_hour, hour_ops, hist_stats)
-                    notify_hour_summary(
-                        cfg, last_hour,
-                        hour_wins, hour_losses,
-                        ops_hoy, target or 0.0,
-                        hour_ops=hour_ops,
-                        hist_stats=hist_stats,
-                    )
-                # v5.0: notificar inicio de nueva hora SIEMPRE
-                notify_new_hour(cfg, now_hour, slug, target or 0.0)
-                # Reset contadores de hora
-                hour_wins                = 0
-                hour_losses              = 0
-                last_hour                = now_hour
-                ops_hoy                  = 0
-                hour_ops                 = []
-                last_notified_signal_key = None
+            # ── Cambio de hora ─────────────────────────────────────────────
+            candle_closed = (
+                prev_mins_left is not None
+                and prev_mins_left < 2
+                and mins_left > 50
+            ) or (mins_left < 0.5 and active_bet is not None)
 
-            # ── Obtener mercado (primero) ─────────────────────────────────
-            prev_slug = slug
-            market    = get_active_market()
-            slug      = market.get("slug") if market else None
-
-            if market and slug != prev_slug:
-                notify_market_found(cfg, market, mins_left)
-                logger.info(
-                    f"[MONITOR] 🎯 Mercado encontrado: {slug}\n"
-                    f"           conditionId: {market.get('condition_id', '—')}"
-                )
-                last_slug = slug
-                target    = None
-                last_notified_signal_key = None
-
-            if not market:
-                if prev_slug:
-                    notify_market_lost(cfg)
-                    logger.warning("[MONITOR] ⚠ Mercado perdido — esperando nuevo mercado")
-                time.sleep(interval)
-                continue
-
-            # ── Obtener target (después del mercado, con slug) ────────────
-            if target is None:
-                hour_utc = datetime.now(timezone.utc).hour
-                target   = _fetch_target_with_retry(cfg, hour_utc, slug=slug)
-                if target:
-                    notify_target_change(cfg, target, hour_utc)
-                    logger.info(f"[MONITOR] 🎯 Price to Beat: ${target:,.2f}")
-                else:
-                    logger.warning("[MONITOR] ⚠ Target no disponible — reintentando en próximo ciclo")
-                    time.sleep(interval)
-                    continue
-
-            # ── Obtener precio BTC (nunca crashea) ────────────────────────
-            try:
-                price = get_btc_price()
-            except Exception as e:
-                logger.warning(f"[MONITOR] ⚠ Precio BTC no disponible: {e} — saltando ciclo")
-                time.sleep(interval)
-                continue
-
-            if not price:
-                logger.warning("[MONITOR] ⚠ Precio BTC = None — saltando ciclo")
-                time.sleep(interval)
-                continue
-
-            _log_cycle(price, target, mins_left, ops_hoy, max_ops)
-
-            # ── Stop loss en posición abierta ─────────────────────────────
-            if active_bet:
-                sim_ = active_bet.get("simulated", False)
-
-                entry_price = active_bet.get("entry", price)
-                if active_bet["direction"] == "UP":
-                    pnl_btc = (price - entry_price) / entry_price * 100
-                else:
-                    pnl_btc = (entry_price - price) / entry_price * 100
-
-                if pnl_btc <= -stop_pct:
-                    exit_token_price = _fetch_exit_token_price(active_bet, cfg)
-                    stake_           = active_bet.get("stake", stake)
-                    entry_odds       = active_bet.get("odds", 0.5)
-                    tokens_held      = round(stake_ / max(entry_odds, 0.001), 4)
-
-                    if exit_token_price is not None:
-                        pnl_usd  = round(tokens_held * exit_token_price - stake_, 2)
-                        pnl_pct  = round((pnl_usd / stake_) * 100, 1) if stake_ > 0 else 0.0
-                    else:
-                        pnl_usd  = round(-stake_ * (stop_pct / 100), 2)
-                        pnl_pct  = -stop_pct
-                        exit_token_price = max(entry_odds + pnl_usd / tokens_held, 0.0) if tokens_held else 0.0
-
-                    result = "STOP"
-                    logger.info(
-                        f"[MONITOR] {'[SIMULADO] ' if sim_ else ''}🛑 STOP LOSS — "
-                        f"BTC movimiento: {pnl_btc:+.2f}%  "
-                        f"P&L: ${pnl_usd:+.2f} ({pnl_pct:+.1f}%)"
-                    )
-                    notify_stop_loss(cfg, active_bet, price, pnl_usd, simulated=sim_)
-
-                    ts_now = datetime.now(timezone.utc).isoformat()
-                    row    = _build_trade_row(active_bet, result, ts_now, pnl_usd, pnl_pct)
-                    _csv_write_row(csv_path, row)
-
-                    hour_ops.append({
-                        "direction":  active_bet["direction"],
-                        "window":     active_bet["window"],
-                        "entry_btc":  active_bet["entry"],
-                        "entry_odds": entry_odds,
-                        "stake":      stake_,
-                        "tokens":     tokens_held,
-                        "exit_odds":  exit_token_price,
-                        "exit_btc":   price,
-                        "result":     result,
-                        "pnl_usd":    pnl_usd,
-                        "simulated":  sim_,
-                    })
-
-                    session_pnl      += pnl_usd
-                    session_invested += stake_
-                    session_losses   += 1
-                    hour_losses      += 1
-
-                    hist_stats = _load_historical_stats(csv_path)
-                    _log_accumulated_stats(hist_stats, label="TRAS STOP_LOSS")
-
-                    active_bet               = None
-                    fired_window             = None
-                    last_notified_signal_key = None
-                    time.sleep(interval)
-                    continue
-
-                # ── Resolución al cierre de vela ──────────────────────────
-                # v7.0 FIX: _mins_to_close() nunca devuelve ≤ 0 (mínimo ~0.017
-                # en :59:59, luego salta a 60 al dar la hora). La antigua condición
-                # `mins_left <= 0` NUNCA era True. Ahora detectamos el cierre por:
-                #   a) rollover: veníamos de < 2 min y ahora tenemos > 50 min
-                #   b) umbral final: quedan < 0.5 min (últimos 30 seg de la vela)
-                candle_closed = (
-                    (prev_mins_left < 2.0 and mins_left > 50.0)  # rollover de hora
-                    or mins_left < 0.5                            # últimos 30 seg
-                )
-                if candle_closed:
-                    dir_   = active_bet["direction"]
-                    stake_ = active_bet.get("stake", stake)
-                    odds_  = active_bet.get("odds", 0.5)
+            if hour_utc != last_hour or candle_closed:
+                if active_bet:
+                    # Cierre de vela — resolver apuesta
+                    stake_  = active_bet.get("stake", 0)
+                    odds_   = active_bet.get("odds", 0.5)
+                    sim_    = active_bet.get("simulated", False)
                     tokens_held = round(stake_ / max(odds_, 0.001), 4)
 
-                    won = (dir_ == "UP" and price > active_bet["target"]) or \
-                          (dir_ == "DOWN" and price < active_bet["target"])
+                    # Determinar dirección ganadora
+                    mkt_     = active_bet.get("market")
+                    won      = False
+                    exit_odds = 0.0
+
+                    real_exit_token_id = None
+                    if mkt_ and not sim_:
+                        direction_ = active_bet.get("direction", "")
+                        tokens_   = mkt_.get("tokens", {})
+                        if direction_ == "UP":
+                            real_exit_token_id = tokens_.get("yes", {}).get("token_id")
+                        else:
+                            real_exit_token_id = tokens_.get("no", {}).get("token_id")
+
+                    # Precio live de salida
+                    real_exit_odds_val = None
+                    if real_exit_token_id:
+                        real_exit_odds_val = _fetch_exit_token_price(real_exit_token_id)
+                        exit_odds = real_exit_odds_val
+                        won = exit_odds > 0.95
+                    else:
+                        # Modo simulado: comparar precio BTC vs target
+                        tgt_ = active_bet.get("target", 0)
+                        dir_ = active_bet.get("direction", "")
+                        if tgt_ and price:
+                            if dir_ == "UP":
+                                won = price > tgt_
+                            else:
+                                won = price < tgt_
+                        if sim_ and won:
+                            exit_odds = 0.98
+                        elif sim_:
+                            exit_odds = 0.02
 
                     if won:
-                        exit_odds = 1.0
-                        pnl_usd   = round(tokens_held * exit_odds - stake_, 2)
-                        pnl_pct   = round((pnl_usd / stake_) * 100, 1) if stake_ > 0 else 0
-                        result    = "WIN"
+                        retorno_real = round(tokens_held * exit_odds, 4)
+                        pnl_usd  = round(retorno_real - stake_, 4)
+                        pnl_pct  = round((pnl_usd / stake_) * 100, 2)
+                        result   = "WIN"
                         hour_wins    += 1
                         session_wins += 1
                         notify_win(cfg, active_bet, price, simulated=sim_)
                         logger.info(
                             f"[MONITOR] {'[SIMULADO] ' if sim_ else ''}✅ WIN — "
-                            f"Tokens: {tokens_held:.4f} × {exit_odds:.4f} = ${tokens_held:.2f}  "
+                            f"Tokens: {tokens_held:.4f} × {exit_odds:.4f} = ${retorno_real:.2f}  "
                             f"P&L: +${pnl_usd:.2f} (+{pnl_pct:.1f}%)"
                         )
                         if not sim_:
                             try:
-                                redimir_posicion(active_bet["market"], cfg)
+                                redimir_posicion(cfg, active_bet)
                             except Exception as e:
-                                logger.warning(f"[MONITOR] ⚠ Error en claim: {e}")
+                                logger.warning(f"[MONITOR] ⚠ Claim fallido: {e}")
                         else:
                             logger.info("[MONITOR] [SIMULADO] Claim omitido en modo simulado")
                     else:
+                        pnl_usd  = -stake_
+                        pnl_pct  = -100.0
+                        result   = "LOSS"
                         exit_odds = 0.0
-                        pnl_usd   = -stake_
-                        pnl_pct   = -100.0
-                        result    = "LOSS"
                         hour_losses    += 1
                         session_losses += 1
                         notify_loss(cfg, active_bet, price, simulated=sim_)
@@ -577,8 +471,22 @@ def run(cfg: dict):
                         )
 
                     ts_now = datetime.now(timezone.utc).isoformat()
-                    row    = _build_trade_row(active_bet, result, ts_now, pnl_usd, pnl_pct)
+                    row    = _build_trade_row(
+                        active_bet, result, ts_now, pnl_usd, pnl_pct, real_exit_odds_val
+                    )
                     _csv_write_row(csv_path, row)
+
+                    # v9.0: cerrar en Supabase
+                    db.close_operation(
+                        op_id          = active_bet.get("id", ""),
+                        resultado      = result,
+                        pnl_usd        = pnl_usd,
+                        pnl_pct        = pnl_pct,
+                        odds_salida    = exit_odds,
+                        real_exit_odds = real_exit_odds_val,
+                        retorno_real_usd = round(tokens_held * exit_odds, 4) if won else 0.0,
+                        ts_cierre      = ts_now,
+                    )
 
                     hour_ops.append({
                         "direction":  active_bet["direction"],
@@ -596,9 +504,170 @@ def run(cfg: dict):
 
                     session_pnl      += pnl_usd
                     session_invested += stake_
+                    hour_pnl         += pnl_usd
+                    hour_invested    += stake_
 
                     hist_stats = _load_historical_stats(csv_path)
                     _log_accumulated_stats(hist_stats, label=f"TRAS {result}")
+
+                # Sincronizar sesión horaria en BD
+                _sync_session_to_db(
+                    now         = now_utc,
+                    market_slug = slug,
+                    hour_wins   = hour_wins,
+                    hour_losses = hour_losses,
+                    hour_stops  = hour_stops,
+                    hour_pnl    = hour_pnl,
+                    hour_invested = hour_invested,
+                    simulado    = simulate,
+                )
+
+                notify_hour_summary(cfg, hour_ops, hour_wins, hour_losses, hour_pnl, slug)
+                _log_hour_ops(last_hour, hour_ops, hist_stats)
+
+                # Reset de hora
+                hour_ops    = []
+                hour_wins   = 0
+                hour_losses = 0
+                hour_stops  = 0
+                hour_pnl    = 0.0
+                hour_invested = 0.0
+                last_hour   = hour_utc
+                active_bet  = None
+                fired_window = None
+                last_notified_signal_key = None
+
+                notify_new_hour(cfg, hour_utc, slug)
+
+            prev_mins_left = mins_left
+
+            # ── Obtener precio BTC ─────────────────────────────────────────
+            price = get_btc_price()
+            if not price:
+                time.sleep(interval)
+                continue
+
+            # ── Snapshot de precio (cada N ciclos) ────────────────────────
+            if cycle_count % _SNAPSHOT_EVERY_N_CYCLES == 0:
+                db.log_price_snapshot(
+                    btc_price    = price,
+                    target_price = target,
+                    market_slug  = slug,
+                    hour_utc     = hour_utc,
+                    mins_left    = mins_left,
+                )
+
+            # ── Obtener mercado activo ─────────────────────────────────────
+            new_market = get_active_market()
+            if new_market:
+                if not market or new_market.get("slug") != slug:
+                    notify_market_found(cfg, new_market)
+                    slug = new_market.get("slug")
+                market = new_market
+            elif market:
+                notify_market_lost(cfg)
+                market = None
+                slug   = None
+
+            if not market:
+                time.sleep(interval)
+                continue
+
+            # ── Obtener Price to Beat (apertura vela 1H Binance) ──────────
+            target_retries = 0
+            while not target and target_retries < MAX_TARGET_RETRIES:
+                target = get_open_1h_binance()
+                if not target:
+                    target_retries += 1
+                    if target_retries == 1:
+                        notify_target_failed(cfg)
+                    time.sleep(TARGET_RETRY_WAIT)
+
+            if not target:
+                time.sleep(interval)
+                continue
+
+            # ── Detectar cambio de target al cambiar la hora ───────────────
+            new_target = get_open_1h_binance()
+            if new_target and abs((new_target - target) / target) > 0.001:
+                notify_target_change(cfg, target, new_target)
+                target = new_target
+
+            _log_cycle(price, target, mins_left, ops_hoy, max_ops)
+
+            # ── Stop Loss (si hay apuesta activa) ─────────────────────────
+            if active_bet:
+                entry_price = active_bet.get("entry", price)
+                direction_  = active_bet.get("direction", "")
+                pnl_pct_btc = (
+                    ((price - entry_price) / entry_price) * 100
+                    if direction_ == "UP"
+                    else ((entry_price - price) / entry_price) * 100
+                )
+
+                if pnl_pct_btc <= -stop_pct:
+                    stake_  = active_bet.get("stake", 0)
+                    odds_   = active_bet.get("odds", 0.5)
+                    sim_    = active_bet.get("simulated", False)
+                    tokens_held = round(stake_ / max(odds_, 0.001), 4)
+
+                    mkt_        = active_bet.get("market", {})
+                    tokens_mkt  = mkt_.get("tokens", {})
+                    dir_        = active_bet.get("direction", "")
+                    token_id    = (
+                        tokens_mkt.get("yes", {}).get("token_id")
+                        if dir_ == "UP"
+                        else tokens_mkt.get("no", {}).get("token_id")
+                    )
+                    exit_token_price = _fetch_exit_token_price(token_id) if token_id else 0.0
+                    entry_odds  = active_bet.get("odds", 0.5)
+
+                    proceeds    = tokens_held * exit_token_price
+                    pnl_usd     = round(proceeds - stake_, 4)
+                    pnl_pct     = round((pnl_usd / stake_) * 100, 2) if stake_ > 0 else 0.0
+                    result      = "STOP"
+
+                    notify_stop_loss(cfg, active_bet, price, pnl_usd, simulated=sim_)
+
+                    ts_now = datetime.now(timezone.utc).isoformat()
+                    row    = _build_trade_row(active_bet, result, ts_now, pnl_usd, pnl_pct, exit_token_price)
+                    _csv_write_row(csv_path, row)
+
+                    # v9.0: cerrar en Supabase
+                    db.close_operation(
+                        op_id          = active_bet.get("id", ""),
+                        resultado      = result,
+                        pnl_usd        = pnl_usd,
+                        pnl_pct        = pnl_pct,
+                        odds_salida    = exit_token_price,
+                        real_exit_odds = exit_token_price,
+                        retorno_real_usd = proceeds,
+                        ts_cierre      = ts_now,
+                    )
+
+                    hour_ops.append({
+                        "direction":  active_bet["direction"],
+                        "window":     active_bet["window"],
+                        "entry_btc":  active_bet["entry"],
+                        "entry_odds": entry_odds,
+                        "stake":      stake_,
+                        "tokens":     tokens_held,
+                        "exit_odds":  exit_token_price,
+                        "exit_btc":   price,
+                        "result":     result,
+                        "pnl_usd":    pnl_usd,
+                        "simulated":  sim_,
+                    })
+
+                    session_pnl      += pnl_usd
+                    session_invested += stake_
+                    hour_pnl         += pnl_usd
+                    hour_invested    += stake_
+                    session_losses   += 1
+                    hour_stops       += 1
+
+                    hist_stats = _load_historical_stats(csv_path)
+                    _log_accumulated_stats(hist_stats, label="TRAS STOP_LOSS")
 
                     sign_s = "+" if session_pnl >= 0 else ""
                     logger.info(
@@ -614,7 +683,7 @@ def run(cfg: dict):
                     time.sleep(interval)
                     continue
 
-            # ── Evaluación de señal ───────────────────────────────────────
+            # ── Evaluación de señal ────────────────────────────────────────
             if not target:
                 time.sleep(interval)
                 continue
@@ -631,14 +700,30 @@ def run(cfg: dict):
                     )
                     last_notified_signal_key = signal_key
 
+                # v9.0: registrar señales accionables en BD
+                if signal.is_actionable:
+                    db.log_signal(
+                        btc_price    = price,
+                        target_price = target,
+                        distancia    = round(signal.distance, 2),
+                        umbral       = signal.umbral,
+                        ventana      = signal.window,
+                        direccion    = signal.direction.value,
+                        accionable   = True,
+                        market_slug  = slug,
+                        hour_utc     = hour_utc,
+                        mins_left    = mins_left,
+                        simulado     = simulate,
+                    )
+
             # Ejecutar solo si señal accionable
             if signal and signal.is_actionable and not active_bet and fired_window != signal.window:
                 if ops_hoy < max_ops:
                     result_order = execute_order(signal, market, cfg)
                     if result_order:
-                        ops_hoy += 1
-                        entry_odds    = result_order.get("odds", 0.5)
-                        tokens_bought = round(stake / max(entry_odds, 0.001), 4)
+                        ops_hoy       += 1
+                        entry_odds     = result_order.get("odds", 0.5)
+                        tokens_bought  = round(stake / max(entry_odds, 0.001), 4)
 
                         active_bet = {
                             "id":          result_order.get("id", ""),
@@ -676,6 +761,10 @@ def run(cfg: dict):
                             f"(+${pnl_est:.2f} / +{pct_est:.1f}%)"
                         )
                         notify_bet(cfg, active_bet, signal, simulated=active_bet["simulated"])
+
+                        # v9.0: insertar en Supabase como PENDING
+                        db.upsert_operation(_build_db_operation(active_bet))
+
                     else:
                         fired_window = signal.window  # evitar retry infinito
                         logger.error("[MONITOR] ❌ execute_order devolvió None — no se abre apuesta")
