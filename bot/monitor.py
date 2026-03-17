@@ -1,7 +1,8 @@
 """
-monitor.py — v10.0  (importaciones absolutas — bot/ root)
+monitor.py — v10.1  (importaciones absolutas — bot/ root)
 Ver bot/modules/monitor.py para documentación completa.
 
+v10.1 — FIX P&L SIMULADO: precio real CLOB en modo simulado.
 v10.0 — Modo simulado/real dinámico desde BD + canal de comandos dashboard→bot.
 v9.0  — Integración Supabase.
 """
@@ -36,11 +37,11 @@ logger = logging.getLogger(__name__)
 _SEPARATOR  = "─" * 60
 _SEPARATOR2 = "·" * 60
 
-MAX_TARGET_RETRIES      = 5
-TARGET_RETRY_WAIT       = 10
-_CLOB_MIDPOINT          = "https://clob.polymarket.com/midpoint"
+MAX_TARGET_RETRIES       = 5
+TARGET_RETRY_WAIT        = 10
+_CLOB_MIDPOINT           = "https://clob.polymarket.com/midpoint"
 _SNAPSHOT_EVERY_N_CYCLES = 10
-_CONFIG_POLL_INTERVAL   = 60   # segundos entre lecturas de bot_config
+_CONFIG_POLL_INTERVAL    = 60   # segundos entre lecturas de bot_config
 
 
 def _in_any_window(mins_left: float) -> bool:
@@ -227,7 +228,8 @@ def _log_hour_ops(hour_utc: int, hour_ops: list, hist_stats: dict):
 
         pnl_str = f"{'+' if pnl >= 0 else ''}{pnl:,.2f}"
         logger.info(
-            f"[MONITOR] {i:>2}.  {direction:<5} {window:<6}  "
+            f"[MONITOR] {i:>2}.  "
+            f"{direction:<5} {window:<6}  "
             f"${entry_btc:>9,.0f}  {tokens:>8.4f}  {entry_odds:>6.4f}  "
             f"{exit_odds:>6.4f}  ${exit_btc:>9,.0f}  {result:<8}{sim}  ${pnl_str:>9}"
         )
@@ -351,10 +353,10 @@ def run(cfg: dict):
     last_notified_signal_key = None
     prev_mins_left           = None
 
-    ops_hoy        = 0
-    session_wins   = 0
-    session_losses = 0
-    session_pnl    = 0.0
+    ops_hoy          = 0
+    session_wins     = 0
+    session_losses   = 0
+    session_pnl      = 0.0
     session_invested = 0.0
 
     # Contadores por hora para sesión
@@ -398,17 +400,21 @@ def run(cfg: dict):
 
             if hour_utc != last_hour or candle_closed:
                 if active_bet:
+                    # Cierre de vela — resolver apuesta
                     stake_  = active_bet.get("stake", 0)
                     odds_   = active_bet.get("odds", 0.5)
                     sim_    = active_bet.get("simulated", False)
                     tokens_held = round(stake_ / max(odds_, 0.001), 4)
 
+                    # Determinar dirección ganadora
                     mkt_  = active_bet.get("market")
                     won   = False
                     exit_odds = 0.0
 
+                    # v10.1 FIX: quitado "not sim_" — simulado también consulta
+                    # el precio real del CLOB para calcular P&L correcto.
                     real_exit_token_id = None
-                    if mkt_ and not sim_:
+                    if mkt_:
                         direction_ = active_bet.get("direction", "")
                         tokens_   = mkt_.get("tokens", {})
                         if direction_ == "UP":
@@ -416,12 +422,14 @@ def run(cfg: dict):
                         else:
                             real_exit_token_id = tokens_.get("no", {}).get("token_id")
 
+                    # Precio live de salida (real y simulado usan CLOB)
                     real_exit_odds_val = None
                     if real_exit_token_id:
                         real_exit_odds_val = _fetch_exit_token_price(real_exit_token_id)
                         exit_odds = real_exit_odds_val
                         won = exit_odds > 0.95
                     else:
+                        # Fallback: sin token_id — comparar precio BTC vs target
                         tgt_ = active_bet.get("target", 0)
                         dir_ = active_bet.get("direction", "")
                         if tgt_ and price:
@@ -429,11 +437,8 @@ def run(cfg: dict):
                                 won = price > tgt_
                             else:
                                 won = price < tgt_
-                        if sim_ and won:
-                            exit_odds = 0.98
-                        elif sim_:
-                            exit_odds = 0.02
-                            real_exit_odds_val = 1.0 if won else 0.0
+                        exit_odds          = 0.98 if won else 0.02
+                        real_exit_odds_val = exit_odds
 
                     if won:
                         retorno_real = round(tokens_held * exit_odds, 4)
@@ -508,6 +513,7 @@ def run(cfg: dict):
                     hist_stats = _load_historical_stats(csv_path)
                     _log_accumulated_stats(hist_stats, label=f"TRAS {result}")
 
+                # Sincronizar sesión horaria en BD
                 _sync_session_to_db(
                     now           = now_utc,
                     market_slug   = slug,
@@ -522,6 +528,7 @@ def run(cfg: dict):
                 notify_hour_summary(cfg, hour_utc, hour_wins, hour_losses, ops_hoy, target, hour_ops)
                 _log_hour_ops(last_hour, hour_ops, hist_stats)
 
+                # Reset de hora
                 hour_ops      = []
                 hour_wins     = 0
                 hour_losses   = 0
@@ -615,7 +622,7 @@ def run(cfg: dict):
                         else tokens_mkt.get("no", {}).get("token_id")
                     )
                     exit_token_price = _fetch_exit_token_price(token_id) if token_id else 0.0
-                    entry_odds  = active_bet.get("odds", 0.5)
+                    entry_odds = active_bet.get("odds", 0.5)
 
                     proceeds = tokens_held * exit_token_price
                     pnl_usd  = round(proceeds - stake_, 4)
@@ -694,6 +701,7 @@ def run(cfg: dict):
                     )
                     last_notified_signal_key = signal_key
 
+                # Registrar señales accionables en BD
                 if signal.is_actionable:
                     db.log_signal(
                         btc_price    = price,
@@ -716,7 +724,7 @@ def run(cfg: dict):
 
                     if result_order is None:
                         notify_order_failed(cfg, signal)
-                        fired_window = signal.window
+                        fired_window = signal.window   # evitar retry infinito
                         logger.error(
                             f"[MONITOR] ❌ execute_order devolvió None — "
                             f"ventana {signal.window} marcada como fired"
