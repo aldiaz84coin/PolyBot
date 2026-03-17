@@ -433,6 +433,7 @@ def run(cfg: dict):
                             exit_odds = 0.98
                         elif sim_:
                             exit_odds = 0.02
+                            real_exit_odds_val = 1.0 if won else 0.0
 
                     if won:
                         retorno_real = round(tokens_held * exit_odds, 4)
