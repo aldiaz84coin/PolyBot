@@ -1,6 +1,13 @@
 """
 monitor.py — Loop principal del bot: ventana horaria, stop loss, resolución
 
+v7.0 — FIX CRÍTICO: resolución al cierre de vela
+  _mins_to_close() nunca devuelve ≤ 0 (mínimo ~0.017 en :59:59, luego
+  salta a 60 al cambiar de hora). La condición `if mins_left <= 0` NUNCA
+  era True, dejando las apuestas abiertas indefinidamente sin registrar
+  WIN/LOSS ni actualizar el histórico. Fix: detectar el cierre por rollover
+  (prev_mins_left < 2 y mins_left > 50) o umbral final (< 0.5 min).
+
 v5.0 — FIXES NOTIFICACIONES:
   1. Import notify_new_hour desde notifier
   2. notify_hour_summary se llama SIEMPRE al cambio de hora (sin condición)
@@ -250,7 +257,6 @@ def _fetch_exit_token_price(active_bet: dict, cfg: dict) -> float | None:
     token_id       = None
 
     tokens = market.get("tokens", [])
-    # Soporta formato lista [{outcome, token_id}] y dict {yes: {token_id}}
     if isinstance(tokens, dict):
         t_data   = tokens.get("yes" if direction == "UP" else "no", {})
         token_id = t_data.get("token_id") if isinstance(t_data, dict) else None
@@ -362,10 +368,17 @@ def run(cfg: dict):
     logger.info(f"[MONITOR] 🚀 Bot iniciado{sim_tag} — esperando mercado activo…")
     logger.info(_SEPARATOR)
 
+    # v7.0: inicializar mins_left antes del loop para que prev_mins_left
+    # tenga un valor válido desde la primera iteración.
+    mins_left      = _mins_to_close()
+    prev_mins_left = mins_left
+
     try:
         while True:
-            mins_left = _mins_to_close()
-            now_hour  = datetime.now(timezone.utc).hour
+            # v7.0: guardar valor anterior ANTES de recomputar para detectar rollover
+            prev_mins_left = mins_left
+            mins_left      = _mins_to_close()
+            now_hour       = datetime.now(timezone.utc).hour
 
             # ── Reset horario ─────────────────────────────────────────────
             if now_hour != last_hour:
@@ -504,7 +517,16 @@ def run(cfg: dict):
                     continue
 
                 # ── Resolución al cierre de vela ──────────────────────────
-                if mins_left <= 0:
+                # v7.0 FIX: _mins_to_close() nunca devuelve ≤ 0 (mínimo ~0.017
+                # en :59:59, luego salta a 60 al dar la hora). La antigua condición
+                # `mins_left <= 0` NUNCA era True. Ahora detectamos el cierre por:
+                #   a) rollover: veníamos de < 2 min y ahora tenemos > 50 min
+                #   b) umbral final: quedan < 0.5 min (últimos 30 seg de la vela)
+                candle_closed = (
+                    (prev_mins_left < 2.0 and mins_left > 50.0)  # rollover de hora
+                    or mins_left < 0.5                            # últimos 30 seg
+                )
+                if candle_closed:
                     dir_   = active_bet["direction"]
                     stake_ = active_bet.get("stake", stake)
                     odds_  = active_bet.get("odds", 0.5)
@@ -648,6 +670,7 @@ def run(cfg: dict):
                         )
                         notify_bet(cfg, active_bet, signal, simulated=active_bet["simulated"])
                     else:
+                        fired_window = signal.window  # evitar retry infinito
                         logger.error("[MONITOR] ❌ execute_order devolvió None — no se abre apuesta")
                 else:
                     logger.info(
