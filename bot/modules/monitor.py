@@ -620,7 +620,7 @@ def run(cfg: dict):
 
             new_target = get_open_1h_binance()
             if new_target and abs((new_target - target) / target) > 0.001:
-                notify_target_change(cfg, target, new_target)
+                notify_target_change(cfg, target, new_target, mins_left)
                 target = new_target
 
             _log_cycle(price, target, mins_left, ops_hoy, max_ops)
