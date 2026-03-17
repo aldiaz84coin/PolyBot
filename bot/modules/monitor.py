@@ -537,7 +537,7 @@ def run(cfg: dict):
                 fired_window = None
                 last_notified_signal_key = None
 
-                notify_new_hour(cfg, hour_utc, slug)
+                notify_new_hour(cfg, hour_utc, slug, target)
 
             prev_mins_left = mins_left
 
