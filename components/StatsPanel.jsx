@@ -199,8 +199,8 @@ function useBets(simOnly) {
           setTotal(j2.count ?? null);
         }
       } else {
-        setTotal(json.count ?? null);
-      }
+        setTotal(json.summary?.total ?? json.count ?? null);
+             }
     } catch {
       setBets([]);
     } finally {
