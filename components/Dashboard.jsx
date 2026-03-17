@@ -293,8 +293,13 @@ export default function Dashboard() {
   }, [price, activeBet, running, market]);
 
   // ── Resolución al cierre ──────────────────────────────────────────────────
+  // v2.8 FIX: Añadido null-guard para minsLeft (null cuando endMs no está
+  // disponible aún) y dependencias completas para evitar closures obsoletos.
+  // null > 0.8 === false en JS, lo que disparaba el efecto incorrectamente.
   useEffect(() => {
-    if (!running || !activeBet || !price || !target || minsLeft > 0.8) return;
+    if (!running || !activeBet || !price || !target) return;
+    if (minsLeft === null || minsLeft > 0.8) return;
+
     const won   = activeBet.dir === "UP" ? price > activeBet.target : price < activeBet.target;
     // odds reales de entrada (corregido desde v2.7 — ya no defaultea a 0.5)
     const odds  = activeBet.odds || 0.5;
@@ -323,7 +328,9 @@ export default function Dashboard() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ id: activeBet.id, result: won ? "WIN" : "LOSS", pnl: pnl_pct, pnl_usd }),
     }).catch(() => {});
-  }, [minsLeft, running]);
+  // v2.8: deps completas — incluir activeBet, price y target evita
+  // closures obsoletos que leían valores de la apuesta anterior.
+  }, [minsLeft, running, activeBet, price, target]);
 
   // ── Derived display values ────────────────────────────────────────────────
   const dist = (price && target) ? price - target : null;
@@ -365,7 +372,7 @@ export default function Dashboard() {
           <span style={{ color: "var(--green)", fontWeight: 700, letterSpacing: "0.12em", fontSize: 14 }}>
             POLYMARKET BTC BOT
           </span>
-          <Tag color="#2a4a3a">v2.7</Tag>
+          <Tag color="#2a4a3a">v2.8</Tag>
           {marketActive
             ? <Tag color="#1a3a2a">MERCADO ACTIVO {marketSlugShort ? `· ${marketSlugShort}` : ""}</Tag>
             : <Tag color="#3a1a1a">SIN MERCADO</Tag>
@@ -435,42 +442,33 @@ export default function Dashboard() {
             {dist != null && target && (
               <div style={{ fontSize: 11, color: "#444", marginTop: 4 }}>
                 Dist target: <span style={{ color: dist > 0 ? "#4488ff" : "#ff8800", fontWeight: 700 }}>
-                  {dist > 0 ? "+" : ""}${dist.toFixed(0)}
+                  {dist > 0 ? "+" : ""}{fmtUSD(dist)}
                 </span>
               </div>
             )}
-            {priceError && <div style={{ fontSize: 9, color: "var(--red)", marginTop: 4 }}>{priceError}</div>}
-          </div>
-
-          {/* VENTANA */}
-          <div style={{ background: "var(--bg)", padding: "20px 24px", borderRight: "1px solid var(--border)" }}>
-            <div style={{ fontSize: 9, color: "#444", letterSpacing: "0.15em", marginBottom: 8 }}>VENTANA</div>
-            <div style={{
-              fontSize: 22, fontWeight: 700,
-              color: activeWindow ? activeWindow.color : "#333",
-            }}>
-              {activeWindow ? activeWindow.label : "— ESPERA —"}
+            <div style={{ marginTop: 16 }}>
+              <WindowBar minsLeft={minsLeft} activeWindow={activeWindow} />
             </div>
-            {activeWindow && (
-              <div style={{ fontSize: 11, color: "#444", marginTop: 4 }}>
-                {activeWindow.min}–{activeWindow.max} min restantes · umbral ${umbral}
-              </div>
-            )}
-            <WindowBar minsLeft={minsLeft} />
           </div>
 
           {/* SEÑAL */}
-          <div style={{ background: "var(--bg)", padding: "20px 24px" }}>
-            <div style={{ fontSize: 9, color: "#444", letterSpacing: "0.15em", marginBottom: 8 }}>SEÑAL</div>
-            {decision ? (
+          <div style={{ background: "var(--bg)", padding: "20px 24px", borderRight: "1px solid var(--border)" }}>
+            <div style={{ fontSize: 9, color: "#444", letterSpacing: "0.15em", marginBottom: 6 }}>SEÑAL ACTIVA</div>
+            {activeWindow && decision ? (
               <>
-                <div style={{
-                  fontSize: 30, fontWeight: 700,
-                  color: decision.dir === "UP" ? "var(--green)" : decision.dir === "DOWN" ? "var(--red)" : "#444",
-                }}>
-                  {decision.dir === "UP" ? "▲ UP" : decision.dir === "DOWN" ? "▼ DOWN" : "— WAIT —"}
+                <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 8 }}>
+                  <span style={{ color: activeWindow.color, fontSize: 12, fontWeight: 700 }}>
+                    [{activeWindow.key}]
+                  </span>
+                  <span style={{
+                    fontSize: 28, fontWeight: 700,
+                    color: decision.dir === "UP" ? "var(--green)"
+                         : decision.dir === "DOWN" ? "var(--red)" : "var(--dim)",
+                  }}>
+                    {decision.dir === "UP" ? "▲ UP" : decision.dir === "DOWN" ? "▼ DOWN" : "— WAIT"}
+                  </span>
                 </div>
-                <div style={{ fontSize: 11, color: "#444", marginTop: 4 }}>
+                <div style={{ fontSize: 11, color: decision.signal ? "var(--green)" : "#555" }}>
                   {decision.signal
                     ? `DIST $${Math.abs(decision.dist).toFixed(0)} > $${umbral} ✓`
                     : `DIST $${Math.abs(decision.dist).toFixed(0)} < $${umbral}`}
@@ -500,6 +498,26 @@ export default function Dashboard() {
                   <span>Ret. est.: {fmtUSD(activeBet.retorno_est)}</span>
                 </div>
               </div>
+            )}
+          </div>
+
+          {/* TARGET */}
+          <div style={{ background: "var(--bg)", padding: "20px 24px" }}>
+            <div style={{ fontSize: 9, color: "#444", letterSpacing: "0.15em", marginBottom: 6 }}>PRICE TO BEAT</div>
+            <div style={{
+              fontSize: 32, fontWeight: 700, lineHeight: 1,
+              color: targetIsStale ? "var(--red)" : targetError ? "var(--yellow)" : "var(--text)",
+            }}>
+              {target ? `$${fmt(target, 2)}` : (targetError ? "ERROR" : "—")}
+            </div>
+            {targetHourUtc != null && (
+              <div style={{ fontSize: 11, color: "#444", marginTop: 4 }}>
+                Vela {targetHourUtc}:00 UTC
+                {targetSource && <span style={{ marginLeft: 6, color: "#333" }}>{targetSource}</span>}
+              </div>
+            )}
+            {targetError && (
+              <div style={{ fontSize: 10, color: "var(--yellow)", marginTop: 4 }}>{targetError}</div>
             )}
           </div>
         </div>
