@@ -105,14 +105,17 @@ export default function Dashboard() {
     try { localStorage.setItem(LS_KEY, JSON.stringify(bets.slice(0, 500))); } catch {}
   }, [bets]);
 
-  // ── Precio history ────────────────────────────────────────────────────
-  useEffect(() => {
-    if (!price) return;
-    setPriceHistory(h => {
-      const next = [...h, { t: Date.now(), p: price }];
-      return next.slice(-60);
+ // ── Precio history ────────────────────────────────────────────────────
+useEffect(() => {
+  if (!price) return;
+  setPriceHistory(h => {
+    const ts = new Date().toLocaleTimeString("es-ES", {
+      hour: "2-digit", minute: "2-digit", second: "2-digit",
     });
-  }, [price]);
+    const next = [...h, { ts, price }];
+    return next.slice(-60);
+  });
+}, [price]);
 
   // ── Target (Price to Beat) ─────────────────────────────────────────────
   const [target, setTarget]           = useState(null);
