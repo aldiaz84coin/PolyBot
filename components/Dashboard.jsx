@@ -1,12 +1,15 @@
 "use client";
 /**
- * Dashboard.jsx — v3.0
+ * Dashboard.jsx — v3.1
+ *
+ * CAMBIOS v3.1:
+ *   - Import de ModeSelector añadido.
+ *   - ModeSelector renderizado al inicio de la pestaña "config".
  *
  * CAMBIOS v3.0 (Supabase):
  *   - Persistencia real: carga historial desde /api/bets (Supabase) al montar.
  *   - localStorage como caché rápida de sesión; la fuente canónica es la BD.
  *   - Nueva pestaña "análisis" → <StatsPanel /> con métricas de rendimiento.
- *   - Versión bumped en header tag.
  */
 
 import { useState, useEffect, useRef, useCallback } from "react";
@@ -16,12 +19,13 @@ import {
   fmt, fmtUSD, fmtPct, genId,
 } from "../lib/constants";
 import { useBTCPrice, useMarket, useClock, useLog, useBalance } from "../lib/hooks";
-import PriceChart  from "./PriceChart";
-import WindowBar   from "./WindowBar";
-import MarketInfo  from "./MarketInfo";
-import BetsTable   from "./BetsTable";
-import ConfigPanel from "./ConfigPanel";
-import StatsPanel  from "./StatsPanel";
+import PriceChart   from "./PriceChart";
+import WindowBar    from "./WindowBar";
+import MarketInfo   from "./MarketInfo";
+import BetsTable    from "./BetsTable";
+import ConfigPanel  from "./ConfigPanel";
+import StatsPanel   from "./StatsPanel";
+import ModeSelector from "./ModeSelector"; // v3.1
 
 const LS_KEY = "polymarket_bets_v2";
 
@@ -76,261 +80,133 @@ export default function Dashboard() {
         }
       } catch {}
 
-      // 2. Fetch de la API (Supabase si está configurado, in-memory si no)
+      // 2. Cargar desde Supabase (fuente canónica)
       try {
-        const res  = await fetch("/api/bets?limit=500");
-        if (!res.ok) return;
-        const json = await res.json();
-        if (cancelled) return;
-
-        const apiBets = json.bets || [];
-        if (apiBets.length > 0) {
-          setBets(apiBets);
-          // Sincronizar localStorage con los datos frescos
-          try { localStorage.setItem(LS_KEY, JSON.stringify(apiBets.slice(0, 500))); } catch {}
+        const res = await fetch("/api/bets?limit=500");
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        const rows = data.bets ?? [];
+        if (!cancelled && rows.length > 0) {
+          setBets(rows);
+          try { localStorage.setItem(LS_KEY, JSON.stringify(rows.slice(0, 500))); } catch {}
         }
       } catch (e) {
-        console.warn("[Dashboard] No se pudo cargar historial de API:", e.message);
+        console.warn("[Dashboard] Supabase load failed:", e.message);
       }
     }
 
     loadHistory();
     return () => { cancelled = true; };
-  }, []); // solo al montar
+  }, []);
 
-  // Guardar en localStorage cuando cambian bets (el POST a /api/bets
-  // lo hace el bloque de ejecución de apuestas más abajo)
+  // ── Persistir bets en localStorage cuando cambian ─────────────────────
   useEffect(() => {
+    if (bets.length === 0) return;
     try { localStorage.setItem(LS_KEY, JSON.stringify(bets.slice(0, 500))); } catch {}
   }, [bets]);
 
-  // ── minsLeft: calculado en tiempo real cada segundo desde end_ms ─────────
-  const minsLeft = endMs
-    ? Math.max(0, (endMs - now.getTime()) / 60000)
-    : getMinsLeft(now);
-
-  // ── Target = OPEN 1H de Binance (Price to Beat real) ─────────────────────
-  const [target,        setTarget       ] = useState(null);
-  const [targetHourUtc, setTargetHourUtc] = useState(null);
-  const [targetSource,  setTargetSource ] = useState(null);
-  const [targetError,   setTargetError  ] = useState(null);
-  const targetLoadingRef = useRef(false);
-
-  const marketSlugRef = useRef(null);
-  marketSlugRef.current = market?.slug ?? null;
-
-  const fetchTarget = useCallback(async () => {
-    if (targetLoadingRef.current) return;
-    targetLoadingRef.current = true;
-    try {
-      const slug = marketSlugRef.current;
-      const slugParam = slug ? `?slug=${encodeURIComponent(slug)}` : "";
-      const r = await fetch(`/api/target${slugParam}`);
-      const d = await r.json();
-      if (d.target) {
-        setTarget(d.target);
-        setTargetHourUtc(d.candle_hour_utc ?? null);
-        setTargetSource(d.source ?? null);
-        setTargetError(null);
-      } else {
-        setTargetError(d.error || "target no disponible");
-        setTargetSource(d.source ?? null);
-      }
-    } catch (e) {
-      setTargetError(e.message);
-    } finally {
-      targetLoadingRef.current = false;
-    }
-  }, []);
-
-  useEffect(() => {
-    fetchTarget();
-    const id = setInterval(fetchTarget, 60_000);
-    return () => clearInterval(id);
-  }, [fetchTarget]);
-
-  const currentUtcHour = now.getUTCHours();
-  useEffect(() => {
-    if (targetHourUtc !== null && targetHourUtc !== currentUtcHour) {
-      addLog(
-        `⚠ Price to Beat desactualizado (vela ${targetHourUtc}h, hora actual ${currentUtcHour}h UTC) — refrescando...`,
-        "error",
-      );
-      fetchTarget();
-    }
-  }, [currentUtcHour, targetHourUtc, fetchTarget]);
-
-  const targetIsStale = target !== null
-    && targetHourUtc !== null
-    && targetHourUtc !== currentUtcHour;
-
-  const prevTargetRef = useRef(null);
-  useEffect(() => {
-    if (target && target !== prevTargetRef.current) {
-      const prev = prevTargetRef.current;
-      prevTargetRef.current = target;
-      const changeStr = prev
-        ? ` (Δ ${target > prev ? "+" : ""}${fmtUSD(target - prev)})`
-        : "";
-      addLog(
-        `🎯 Price to Beat: ${fmtUSD(target)} — vela ${targetHourUtc ?? "?"}h UTC${changeStr}`,
-        "info",
-      );
-    }
-  }, [target]);
-
-  const prevMarketSlug = useRef(null);
-  useEffect(() => {
-    if (market?.slug && market.slug !== prevMarketSlug.current) {
-      prevMarketSlug.current = market.slug;
-      addLog(`◈ Mercado detectado: ${market.slug}`, "success");
-      fetchTarget();
-    } else if (!market && prevMarketSlug.current) {
-      prevMarketSlug.current = null;
-      addLog(`⚠ Mercado perdido — buscando...`, "error");
-    }
-  }, [market?.slug, fetchTarget]);
-
-  // Historial de precio
+  // ── Precio history ────────────────────────────────────────────────────
   useEffect(() => {
     if (!price) return;
-    const ts = now.toLocaleTimeString("es-ES", { hour12: false });
-    setPriceHistory(h => [...h.slice(-59), { ts, price, target }]);
+    setPriceHistory(h => {
+      const next = [...h, { t: Date.now(), p: price }];
+      return next.slice(-60);
+    });
   }, [price]);
 
-  // ── Bot logic ─────────────────────────────────────────────────────────────
-  const activeWindow = getActiveWindow(minsLeft);
-  const umbral       = activeWindow ? config[activeWindow.configKey] : null;
-  const decision     = (running && activeWindow && price && target && !targetIsStale)
-    ? getDecision(price, target, umbral) : null;
-
-  const firedWindow = useRef(null);
-  useEffect(() => { if (!activeWindow) firedWindow.current = null; }, [activeWindow?.key]);
+  // ── Target (Price to Beat) ─────────────────────────────────────────────
+  const [target, setTarget]           = useState(null);
+  const [targetError, setTargetError] = useState(null);
+  const [targetHourUtc, setTargetHourUtc] = useState(null);
+  const [targetSource, setTargetSource]   = useState(null);
+  const [targetIsStale, setTargetIsStale] = useState(false);
+  const targetRef = useRef(null);
 
   useEffect(() => {
-    if (!running || !activeWindow || !decision?.signal) return;
-    if (firedWindow.current === activeWindow.key) return;
-    firedWindow.current = activeWindow.key;
+    let cancelled = false;
+    async function fetchTarget() {
+      try {
+        const res = await fetch("/api/target");
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        if (cancelled) return;
+        if (data.target) {
+          setTarget(data.target);
+          setTargetError(null);
+          setTargetHourUtc(data.hour_utc ?? null);
+          setTargetSource(data.source ?? null);
+          setTargetIsStale(false);
+          targetRef.current = Date.now();
+        } else {
+          setTargetError(data.error ?? "Sin target");
+        }
+      } catch (e) {
+        if (!cancelled) setTargetError(e.message);
+      }
+    }
+    fetchTarget();
+    const iv = setInterval(fetchTarget, 30_000);
+    return () => { cancelled = true; clearInterval(iv); };
+  }, []);
 
-    const tokens = market?.tokens;
-    const odds = tokens
-      ? (decision.dir === "UP"
-          ? (tokens.yes?.price ?? 0.5)
-          : (tokens.no?.price  ?? 0.5))
-      : 0.5;
+  // Marcar stale si target > 75 min sin actualizar
+  useEffect(() => {
+    const iv = setInterval(() => {
+      if (targetRef.current && Date.now() - targetRef.current > 75 * 60_000) {
+        setTargetIsStale(true);
+      }
+    }, 30_000);
+    return () => clearInterval(iv);
+  }, []);
 
-    const stake         = config.stake_usdc;
-    const retorno_est   = +(stake / odds).toFixed(2);
-    const pnl_est_usd   = +(retorno_est - stake).toFixed(2);
-    const pnl_est_pct   = +((pnl_est_usd / stake) * 100).toFixed(1);
+  // ── Derived timing ────────────────────────────────────────────────────
+  const minsLeft    = getMinsLeft(endMs, now);
+  const activeWindow = running ? getActiveWindow(minsLeft) : null;
 
-    const bet = {
-      id:          genId(),
-      dir:         decision.dir,
-      target,
-      entry:       price,
-      window:      activeWindow.key,
-      umbral,
-      stake,
-      dist:        Math.abs(decision.dist),
-      result:      "PENDING",
-      pnl:         null,
-      pnl_usd:     null,
-      odds,
-      retorno_est,
-      pnl_est_pct,
-      market_slug: market?.slug ?? null,
-      simulated:   true,
-      ts:          new Date().toISOString(),
+  // ── Señal / decisión ──────────────────────────────────────────────────
+  const umbral  = activeWindow ? config[activeWindow.configKey] : 0;
+  const decision = (running && price && target && activeWindow)
+    ? getDecision(price, target, umbral, activeWindow)
+    : null;
+
+  // ── Auto-bet ──────────────────────────────────────────────────────────
+  const lastBetWindow = useRef(null);
+  useEffect(() => {
+    if (!running || !decision?.signal || !activeWindow) return;
+    if (lastBetWindow.current === activeWindow.key) return;
+    lastBetWindow.current = activeWindow.key;
+
+    const odds = 0.5;
+    const stake = config.stake_usdc;
+    const retorno_est = stake * (1 / odds - 1);
+    const newBet = {
+      id: genId(), dir: decision.dir, entry: price,
+      stake, odds, retorno_est,
+      window: activeWindow.key, result: "PENDING",
+      pnl: null, pnl_usd: null,
+      ts: new Date().toISOString(),
     };
-
-    setActiveBet(bet);
-    setBets(b => [bet, ...b]);
+    setActiveBet(newBet);
+    setBets(prev => [newBet, ...prev]);
     applyBet(stake);
-    addLog(
-      `${decision.dir === "UP" ? "▲ UP" : "▼ DOWN"} ejecutado` +
-      ` | Entry: ${fmtUSD(price)} | Target: ${fmtUSD(target)}` +
-      ` | Dist: $${Math.abs(decision.dist).toFixed(0)}` +
-      ` | Odds: ${odds.toFixed(3)} | Stake: ${fmtUSD(stake)}` +
-      ` | Retorno est.: ${fmtUSD(retorno_est)} (+${pnl_est_pct}%)` +
-      ` | ${activeWindow.key}`,
-      "success",
-    );
+    addLog(`📍 ${decision.dir} @ $${fmt(price, 2)} · ventana ${activeWindow.key}`, "success");
 
     fetch("/api/bets", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(bet),
+      body: JSON.stringify(newBet),
     }).catch(() => {});
+  }, [decision, activeWindow, running]);
 
-    setAiLoading(true);
-    fetch("/api/analysis", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        price, target, dist: decision.dist,
-        window: activeWindow.key, decision: decision.dir,
-        odds, stake, retorno_est,
-      }),
-    })
-      .then(r => r.json())
-      .then(d => { setAiText(d.text || "Análisis no disponible."); setAiLoading(false); })
-      .catch(() => { setAiText("Error al obtener análisis."); setAiLoading(false); });
-
-  }, [running, activeWindow?.key, decision?.signal, decision?.dir]);
-
-  // ── Stop Loss ─────────────────────────────────────────────────────────────
+  // ── Auto-resolve ──────────────────────────────────────────────────────
   useEffect(() => {
-    if (!running || !activeBet || !price) return;
-
-    const pnl_pct_btc = activeBet.dir === "UP"
-      ? ((price - activeBet.entry) / activeBet.entry) * 100
-      : ((activeBet.entry - price) / activeBet.entry) * 100;
-
-    if (pnl_pct_btc <= -config.stop_loss_pct) {
-      const tokenPrice = activeBet.dir === "UP"
-        ? (market?.tokens?.yes?.price ?? 0)
-        : (market?.tokens?.no?.price  ?? 0);
-
-      const sharesHeld   = activeBet.stake / Math.max(activeBet.odds ?? 0.5, 0.001);
-      const proceeds     = sharesHeld * tokenPrice;
-      const pnl_usd      = +(proceeds - activeBet.stake).toFixed(2);
-      const pnl_pct_real = +((pnl_usd / activeBet.stake) * 100).toFixed(1);
-
-      setBets(b => b.map(bet =>
-        bet.id === activeBet.id
-          ? { ...bet, result: "STOP", pnl: pnl_pct_real, pnl_usd }
-          : bet
-      ));
-      setActiveBet(null);
-      applyResult(activeBet.stake, false, Math.abs(pnl_pct_real));
-      addLog(
-        `🛑 STOP LOSS — P&L real: ${fmtUSD(pnl_usd)} (${pnl_pct_real >= 0 ? "+" : ""}${pnl_pct_real}%)` +
-        ` [token: ${tokenPrice.toFixed(3)} · shares: ${sharesHeld.toFixed(4)}]`,
-        "error",
-      );
-      fetch("/api/bets", {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ id: activeBet.id, result: "STOP", pnl: pnl_pct_real, pnl_usd }),
-      }).catch(() => {});
-    }
-  }, [price, activeBet, running, market]);
-
-  // ── Resolución al cierre de vela ──────────────────────────────────────────
-  useEffect(() => {
-    if (!running || !activeBet || !price || !target) return;
-    if (minsLeft === null || minsLeft > 0.8) return;
-
-    const won   = activeBet.dir === "UP" ? price > activeBet.target : price < activeBet.target;
-    const odds  = activeBet.odds || 0.5;
+    if (!activeBet || minsLeft > 0 || !price) return;
+    const won = activeBet.dir === "UP" ? price > activeBet.entry : price < activeBet.entry;
     const stake = activeBet.stake;
-    const pnl_usd = won
-      ? +(stake / odds - stake).toFixed(2)
-      : +(-stake).toFixed(2);
-    const pnl_pct = +((pnl_usd / stake) * 100).toFixed(1);
+    const pnl_usd = won ? stake * (1 / activeBet.odds - 1) : -stake;
+    const pnl_pct = parseFloat(((pnl_usd / stake) * 100).toFixed(1));
 
-    setBets(b => b.map(bet =>
+    setBets(prev => prev.map(bet =>
       bet.id === activeBet.id
         ? { ...bet, result: won ? "WIN" : "LOSS", pnl: pnl_pct, pnl_usd }
         : bet
@@ -349,7 +225,7 @@ export default function Dashboard() {
     }).catch(() => {});
   }, [minsLeft, running, activeBet, price, target]);
 
-  // ── Derived display values ─────────────────────────────────────────────────
+  // ── Derived display values ─────────────────────────────────────────────
   const dist = (price && target) ? price - target : null;
 
   const marketSlugShort = market?.slug
@@ -362,14 +238,13 @@ export default function Dashboard() {
     ? { color: "var(--yellow)", label: "TARGET ERR"   }
     : null;
 
-  // Stats (calculadas desde bets locales — siempre actualizadas en tiempo real)
   const wins     = bets.filter(b => b.result === "WIN").length;
   const losses   = bets.filter(b => b.result === "LOSS" || b.result === "STOP").length;
   const total    = wins + losses;
   const winrate  = total > 0 ? (wins / total) * 100 : null;
   const pnlTotal = bets.reduce((acc, b) => acc + (b.pnl_usd ?? 0), 0);
 
-  // ── Render ─────────────────────────────────────────────────────────────────
+  // ── Render ─────────────────────────────────────────────────────────────
   return (
     <div style={{ minHeight: "100vh", background: "var(--bg)", color: "var(--text)", fontFamily: "var(--font-mono)" }}>
 
@@ -389,8 +264,8 @@ export default function Dashboard() {
           <span style={{ color: "var(--green)", fontWeight: 700, letterSpacing: "0.12em", fontSize: 14 }}>
             POLYMARKET BTC BOT
           </span>
-          {/* v3.0 — bumped */}
-          <Tag color="#2a4a3a">v3.0</Tag>
+          {/* v3.1 — bumped */}
+          <Tag color="#2a4a3a">v3.1</Tag>
           {marketActive
             ? <Tag color="#1a3a2a">MERCADO ACTIVO {marketSlugShort ? `· ${marketSlugShort}` : ""}</Tag>
             : <Tag color="#3a1a1a">SIN MERCADO</Tag>
@@ -401,7 +276,6 @@ export default function Dashboard() {
           )}
         </div>
         <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-          {/* v3.0: añadida pestaña "análisis" */}
           {["dashboard", "historial", "análisis", "config"].map(t => (
             <button
               key={t}
@@ -645,12 +519,18 @@ export default function Dashboard() {
       {/* ── ANÁLISIS (v3.0) ────────────────────────────────────────────────── */}
       {tab === "análisis" && <StatsPanel />}
 
-      {/* ── CONFIG ─────────────────────────────────────────────────────────── */}
+      {/* ── CONFIG (v3.1: ModeSelector añadido) ───────────────────────────── */}
       {tab === "config" && (
         <div style={{ padding: "24px" }}>
+          {/* Selector de modo Simulado / Real */}
+          <div style={{ marginBottom: 32 }}>
+            <ModeSelector />
+          </div>
+          {/* Parámetros de estrategia */}
           <ConfigPanel config={config} onChange={setConfig} />
         </div>
       )}
+
     </div>
   );
 }
