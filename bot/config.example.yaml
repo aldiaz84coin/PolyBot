@@ -11,7 +11,7 @@ strategy:
   stop_loss_pct:  0.50    # stop loss: salir si el movimiento BTC supera este %
   monitor_intervalo_s: 5  # frecuencia del loop fuera de ventana T-5 (segundos)
   t5_sl_intervalo_s:   1  # v8.0: frecuencia en T-5 con posición abierta (segundos)
-  min_retorno_pct:  20.0  # v8.0: retorno mínimo estimado para entrar (0 = desactivado)
+  min_retorno_pct:  2.5  # v8.0: retorno mínimo estimado para entrar (0 = desactivado)
                           #   retorno = (1/odds - 1) * 100
                           #   ej: odds=0.60 → retorno 66.7%  ✅ (si min=20)
                           #       odds=0.85 → retorno 17.6%  ❌ (si min=20)
