@@ -1,11 +1,13 @@
 """
-db.py — v1.0  Capa de persistencia Supabase para PolyBot
+db.py — v2.0  Capa de persistencia Supabase para PolyBot
 ────────────────────────────────────────────────────────────────────────────
 Tablas:
   operations      — Historial completo de trades
   signal_log      — Señales accionables evaluadas (calibración de umbrales)
   price_snapshots — Muestreo de precio BTC cada ~5 min
   market_sessions — Resumen por hora de mercado
+  bot_config      — Configuración compartida bot ↔ dashboard (v2.0)
+  bot_commands    — Canal de comandos dashboard → bot (v2.0)
 
 Uso en monitor.py:
   import db
@@ -15,11 +17,16 @@ Uso en monitor.py:
   db.log_signal(signal_dict)           # señales accionables
   db.log_price_snapshot(...)           # cada N ciclos
   db.upsert_session(session_id, ...)   # al cambiar de hora
+  db.get_config("trading_mode")        # leer configuración compartida (v2.0)
+  db.set_config("bot_simulate_active", "true")  # escribir estado (v2.0)
 
 Diseño:
   - Todas las funciones son fire-and-forget con try/except interno.
   - El bot sigue funcionando aunque Supabase no esté disponible.
   - El CSV de Railway sigue escribiéndose como backup secundario.
+
+v2.0 — Añade get_config / set_config para sistema de modo simulado/real.
+v1.0 — Persistencia inicial de operaciones, señales, snapshots y sesiones.
 """
 import logging
 from datetime import datetime, timezone
@@ -29,7 +36,7 @@ logger = logging.getLogger(__name__)
 
 # ── Cliente Supabase (importación opcional) ────────────────────────────────
 
-_client = None   # supabase.Client | None
+_client  = None   # supabase.Client | None
 _enabled = False
 
 
@@ -60,6 +67,18 @@ def init(url: str, key: str) -> bool:
 
 def is_enabled() -> bool:
     return _enabled and _client is not None
+
+
+# ── Helpers internos ───────────────────────────────────────────────────────
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+def _r2(v) -> Optional[float]:
+    return round(float(v), 2) if v is not None else None
+
+def _r4(v) -> Optional[float]:
+    return round(float(v), 4) if v is not None else None
 
 
 # ── Operaciones ────────────────────────────────────────────────────────────
@@ -278,22 +297,20 @@ def fetch_historical_stats(simulado: Optional[bool] = None) -> dict:
 
 
 def fetch_operations(
-    limit:   int  = 200,
-    resultado: str = None,   # WIN | LOSS | STOP | PENDING
-    date:    str  = None,    # YYYY-MM-DD
-    simulado: bool = None,
+    limit:     int  = 200,
+    resultado: str  = None,   # WIN | LOSS | STOP | PENDING
+    date:      str  = None,   # YYYY-MM-DD
+    simulado:  bool = None,
 ) -> list:
     """Devuelve operaciones recientes (más nuevas primero)."""
     if not is_enabled():
         return []
     try:
-        q = _client.table("operations").select("*").order(
-            "ts_entrada", desc=True
-        ).limit(limit)
+        q = _client.table("operations").select("*").order("ts_entrada", desc=True).limit(limit)
         if resultado:
             q = q.eq("resultado", resultado)
         if date:
-            q = q.gte("ts_entrada", f"{date}T00:00:00Z").lt("ts_entrada", f"{date}T23:59:59Z")
+            q = q.gte("ts_entrada", f"{date}T00:00:00Z").lte("ts_entrada", f"{date}T23:59:59Z")
         if simulado is not None:
             q = q.eq("simulado", simulado)
         return q.execute().data or []
@@ -302,13 +319,50 @@ def fetch_operations(
         return []
 
 
-# ── Helpers internos ───────────────────────────────────────────────────────
+# ── Configuración compartida bot ↔ dashboard (v2.0) ───────────────────────
 
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+def get_config(key: str, default: str = None) -> Optional[str]:
+    """
+    Lee un valor de bot_config por clave.
+    Devuelve el valor como string, o default si no existe / DB no disponible.
 
-def _r2(v) -> Optional[float]:
-    return round(float(v), 2) if v is not None else None
+    Ejemplo:
+        mode = get_config("trading_mode", "simulate")
+        simulate = (mode == "simulate")
+    """
+    if not is_enabled():
+        return default
+    try:
+        res = _client.table("bot_config") \
+            .select("value") \
+            .eq("key", key) \
+            .single() \
+            .execute()
+        if res.data:
+            return res.data.get("value", default)
+        return default
+    except Exception as e:
+        logger.debug(f"[DB] get_config [{key}]: {e}")
+        return default
 
-def _r4(v) -> Optional[float]:
-    return round(float(v), 4) if v is not None else None
+
+def set_config(key: str, value: str) -> bool:
+    """
+    Escribe (upsert) un valor en bot_config.
+    Útil para que el bot reporte su estado actual al dashboard.
+
+    Ejemplo:
+        set_config("bot_simulate_active", "true")
+        set_config("bot_started_at", datetime.now(timezone.utc).isoformat())
+    """
+    if not is_enabled():
+        return False
+    try:
+        _client.table("bot_config").upsert(
+            {"key": key, "value": str(value), "updated_at": _now()},
+            on_conflict="key",
+        ).execute()
+        return True
+    except Exception as e:
+        logger.warning(f"[DB] ⚠ set_config [{key}={value}]: {e}")
+        return False

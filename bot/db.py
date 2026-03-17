@@ -1,7 +1,9 @@
 """
-db.py — v1.0  (importaciones absolutas — para bot/monitor.py, bot/main.py)
+db.py — v2.0  (importaciones absolutas — para bot/monitor.py, bot/main.py)
 Contenido idéntico a bot/modules/db.py salvo la ruta de importación.
 Ver bot/modules/db.py para documentación completa.
+
+v2.0 — Añade get_config / set_config para sistema de modo simulado/real.
 """
 # Re-exportar todo desde el módulo canónico
 from modules.db import (
@@ -14,6 +16,9 @@ from modules.db import (
     upsert_session,
     fetch_historical_stats,
     fetch_operations,
+    get_config,
+    set_config,
+    _client,   # expuesto para command_handler (acceso directo al cliente)
 )
 
 __all__ = [
@@ -22,4 +27,6 @@ __all__ = [
     "log_signal", "log_price_snapshot",
     "upsert_session",
     "fetch_historical_stats", "fetch_operations",
+    "get_config", "set_config",
+    "_client",
 ]
