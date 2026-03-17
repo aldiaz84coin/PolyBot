@@ -522,7 +522,7 @@ def run(cfg: dict):
                     simulado    = simulate,
                 )
 
-                notify_hour_summary(cfg, hour_ops, hour_wins, hour_losses, hour_pnl, slug)
+                notify_hour_summary(cfg, hour_utc, hour_wins, hour_losses, ops_hoy, target, hour_ops)
                 _log_hour_ops(last_hour, hour_ops, hist_stats)
 
                 # Reset de hora
