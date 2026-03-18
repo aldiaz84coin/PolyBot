@@ -1,16 +1,12 @@
 """
-command_handler.py — v1.0
-Ejecutor de comandos emitidos desde el dashboard via tabla bot_commands.
+command_handler.py — v1.1  (importaciones relativas — bot/modules/)
 
-Comandos soportados:
-  check_clob      → prueba conectividad CLOB + lectura de precio
-  check_balance   → consulta saldo USDC y POL en cartera
-  test_order      → ejecuta una orden real de prueba con importe mínimo
-                    params: { direction: 'UP'|'DOWN', stake: 1.0 }
-
-Uso desde monitor.py:
-  from modules.command_handler import process_pending_commands
-  process_pending_commands(cfg)   # llamar periódicamente en el loop principal
+Cambios v1.1:
+  - FIX: get_active_btc_market → get_active_market  (nombre real en market_scanner)
+  - FIX: get_active_market ya no recibe cfg como argumento
+  - FIX: get_clob_price ahora importable (alias público añadido en market_scanner)
+  - FIX: _handle_check_balance intenta múltiples RPCs de Polygon
+         (polygon-rpc.com bloqueado en Railway con 401)
 """
 
 import logging
@@ -19,17 +15,23 @@ from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
+# RPCs públicos de Polygon — se prueban en orden hasta que uno responda
+_POLYGON_RPCS = [
+    "https://rpc.ankr.com/polygon",
+    "https://polygon-bor-rpc.publicnode.com",
+    "https://1rpc.io/matic",
+    "https://polygon-rpc.com",
+    "https://rpc-mainnet.matic.network",
+]
 
-# ── Helpers de DB ─────────────────────────────────────────────────────────
+
+# ── Helpers Supabase ──────────────────────────────────────────────────────────
 
 def _claim_command(client, cmd_id: int) -> bool:
-    """Marca el comando como 'running' de forma atómica."""
     try:
         res = client.table("bot_commands") \
             .update({"status": "running", "updated_at": datetime.now(timezone.utc).isoformat()}) \
-            .eq("id", cmd_id) \
-            .eq("status", "pending") \
-            .execute()
+            .eq("id", cmd_id).eq("status", "pending").execute()
         return bool(res.data)
     except Exception as e:
         logger.warning(f"[CMD] ⚠ claim_command [{cmd_id}]: {e}")
@@ -37,11 +39,9 @@ def _claim_command(client, cmd_id: int) -> bool:
 
 
 def _finish_command(client, cmd_id: int, success: bool, result: dict):
-    """Escribe resultado y marca status=done|error."""
     try:
-        status = "done" if success else "error"
         client.table("bot_commands").update({
-            "status":     status,
+            "status":     "done" if success else "error",
             "result":     {**result, "success": success},
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }).eq("id", cmd_id).execute()
@@ -49,28 +49,27 @@ def _finish_command(client, cmd_id: int, success: bool, result: dict):
         logger.warning(f"[CMD] ⚠ finish_command [{cmd_id}]: {e}")
 
 
-# ── Handlers individuales ─────────────────────────────────────────────────
+# ── Handlers de comandos ──────────────────────────────────────────────────────
 
 def _handle_check_clob(cfg: dict) -> tuple[bool, dict]:
     """
-    Verifica conectividad con clob.polymarket.com:
+    Verifica conexión CLOB:
     1. Obtiene mercado activo via Gamma API
     2. Lee precio CLOB via midpoint endpoint
     Devuelve (success, result_dict)
     """
     try:
-        import requests
-        from modules.market_scanner import get_active_btc_market, get_clob_price
+        from modules.market_scanner import get_active_market, get_clob_price
 
         t0 = time.time()
 
-        # Obtener mercado activo
-        market = get_active_btc_market(cfg)
+        # FIX v1.1: get_active_market() — sin argumentos
+        market = get_active_market()
         if not market:
             return False, {"error": "No se encontró mercado BTC activo en Gamma API"}
 
-        market_slug = market.get("slug", "—")
-        clob_ids    = market.get("clobTokenIds", [])
+        market_slug  = market.get("slug", "—")
+        clob_ids     = market.get("clobTokenIds", [])
         if not clob_ids:
             return False, {
                 "error": "Mercado sin clobTokenIds",
@@ -80,18 +79,17 @@ def _handle_check_clob(cfg: dict) -> tuple[bool, dict]:
         yes_token_id = clob_ids[0]
         no_token_id  = clob_ids[1] if len(clob_ids) > 1 else None
 
-        # Leer precio CLOB YES
         yes_price = get_clob_price(yes_token_id)
         no_price  = get_clob_price(no_token_id) if no_token_id else None
 
         latency_ms = round((time.time() - t0) * 1000)
 
         return True, {
-            "latency_ms":  latency_ms,
-            "market_slug": market_slug,
+            "latency_ms":   latency_ms,
+            "market_slug":  market_slug,
             "yes_token_id": yes_token_id,
-            "yes_price":   yes_price,
-            "no_price":    no_price,
+            "yes_price":    yes_price,
+            "no_price":     no_price,
         }
 
     except Exception as e:
@@ -102,43 +100,57 @@ def _handle_check_clob(cfg: dict) -> tuple[bool, dict]:
 def _handle_check_balance(cfg: dict) -> tuple[bool, dict]:
     """
     Consulta saldo USDC (ERC-20 en Polygon) y POL (gas).
-    Devuelve (success, result_dict)
+    FIX v1.1: intenta múltiples RPCs porque polygon-rpc.com devuelve 401 en Railway.
     """
     try:
         from web3 import Web3
 
-        rpc_url    = cfg.get("polymarket", {}).get("rpc_url", "https://polygon-rpc.com")
         funder_addr = cfg.get("polymarket", {}).get("funder", "")
-
         if not funder_addr:
             return False, {"error": "polymarket.funder no configurado"}
 
-        w3 = Web3(Web3.HTTPProvider(rpc_url))
-
-        # USDC en Polygon (6 decimales) — dirección oficial
         USDC_POLYGON = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
-        ERC20_ABI = [
-            {
-                "constant": True, "inputs": [{"name": "_owner", "type": "address"}],
-                "name": "balanceOf", "outputs": [{"name": "balance", "type": "uint256"}],
-                "type": "function",
-            }
-        ]
+        ERC20_ABI = [{
+            "constant": True,
+            "inputs":   [{"name": "_owner", "type": "address"}],
+            "name":     "balanceOf",
+            "outputs":  [{"name": "balance", "type": "uint256"}],
+            "type":     "function",
+        }]
 
-        usdc = w3.eth.contract(address=Web3.to_checksum_address(USDC_POLYGON), abi=ERC20_ABI)
+        # Tomar RPC de cfg si está definido, sino iterar la lista interna
+        cfg_rpc = cfg.get("polymarket", {}).get("rpc_url", "")
+        rpc_list = ([cfg_rpc] + _POLYGON_RPCS) if cfg_rpc else _POLYGON_RPCS
+
         addr_cs = Web3.to_checksum_address(funder_addr)
-        raw_usdc = usdc.functions.balanceOf(addr_cs).call()
-        usdc_balance = raw_usdc / 1_000_000  # 6 decimales
+        last_error = "No se probó ningún RPC"
 
-        # Balance POL (gas nativo)
-        raw_pol  = w3.eth.get_balance(addr_cs)
-        pol_balance = raw_pol / 1e18
+        for rpc_url in rpc_list:
+            try:
+                w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 10}))
+                if not w3.is_connected():
+                    last_error = f"RPC no conectado: {rpc_url}"
+                    logger.warning(f"[CMD] ⚠ Balance RPC no conectado: {rpc_url}")
+                    continue
 
-        return True, {
-            "usdc_balance": round(usdc_balance, 4),
-            "pol_balance":  round(pol_balance, 6),
-            "wallet":       funder_addr[:10] + "…",
-        }
+                usdc     = w3.eth.contract(address=Web3.to_checksum_address(USDC_POLYGON), abi=ERC20_ABI)
+                raw_usdc = usdc.functions.balanceOf(addr_cs).call()
+                raw_pol  = w3.eth.get_balance(addr_cs)
+
+                logger.info(f"[CMD] ✅ Balance obtenido via {rpc_url}")
+                return True, {
+                    "usdc_balance": round(raw_usdc / 1_000_000, 4),
+                    "pol_balance":  round(raw_pol  / 1e18,      6),
+                    "wallet":       funder_addr[:10] + "…",
+                    "rpc_used":     rpc_url,
+                }
+
+            except Exception as rpc_err:
+                last_error = str(rpc_err)
+                logger.warning(f"[CMD] ⚠ Balance RPC falló ({rpc_url}): {rpc_err}")
+                continue
+
+        return False, {"error": f"Todos los RPCs fallaron. Último error: {last_error}"}
 
     except Exception as e:
         logger.error(f"[CMD] check_balance error: {e}", exc_info=True)
@@ -147,11 +159,11 @@ def _handle_check_balance(cfg: dict) -> tuple[bool, dict]:
 
 def _handle_test_order(cfg: dict, params: dict) -> tuple[bool, dict]:
     """
-    Ejecuta una orden real de prueba en el mercado activo.
+    Coloca una orden de prueba real (SIMULATE_MODE ignorado).
     params: { direction: 'UP'|'DOWN', stake: float }
     """
     try:
-        from modules.market_scanner import get_active_btc_market, get_clob_price
+        from modules.market_scanner import get_active_market, get_clob_price
         from modules.strategy import Signal, Direction, execute_order
 
         direction_str = str(params.get("direction", "UP")).upper()
@@ -167,8 +179,8 @@ def _handle_test_order(cfg: dict, params: dict) -> tuple[bool, dict]:
         test_cfg.setdefault("strategy", {})
         test_cfg["strategy"] = {**test_cfg["strategy"], "simulate_mode": False}
 
-        # Obtener mercado activo
-        market = get_active_btc_market(test_cfg)
+        # FIX v1.1: get_active_market() — sin argumentos
+        market = get_active_market()
         if not market:
             return False, {"error": "No se encontró mercado BTC activo"}
 
@@ -186,13 +198,12 @@ def _handle_test_order(cfg: dict, params: dict) -> tuple[bool, dict]:
         # Construir señal sintética para test
         signal = Signal(
             direction=direction,
-            distance=9999,  # señal fuerte artificial para prueba
+            distance=9999,
             target=0,
             price=0,
             umbral=0,
             window="TEST",
         )
-        # Inyectar token_id en el mercado para el test
         market_with_token = {**market, "_test_token_id": token_id}
 
         result_order = execute_order(signal, market_with_token, test_cfg)
@@ -212,7 +223,7 @@ def _handle_test_order(cfg: dict, params: dict) -> tuple[bool, dict]:
         return False, {"error": str(e)}
 
 
-# ── Dispatcher principal ──────────────────────────────────────────────────
+# ── Dispatcher principal ──────────────────────────────────────────────────────
 
 def process_pending_commands(cfg: dict):
     """
@@ -227,7 +238,6 @@ def process_pending_commands(cfg: dict):
 
         client = db._client  # acceso directo al cliente Supabase
 
-        # Buscar el comando pending más antiguo
         res = client.table("bot_commands") \
             .select("id, command, params") \
             .eq("status", "pending") \
@@ -245,7 +255,6 @@ def process_pending_commands(cfg: dict):
 
         logger.info(f"[CMD] 📩 Procesando comando #{cmd_id}: {command}  params={params}")
 
-        # Reclamar atómicamente (evita doble ejecución si hubiera dos instancias)
         if not _claim_command(client, cmd_id):
             return  # otro proceso ya lo tomó
 
