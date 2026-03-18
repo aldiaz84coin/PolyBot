@@ -8,7 +8,7 @@ strategy:
   t15_umbral_usd: 300     # umbral ventana T-15min
   t10_umbral_usd: 200     # umbral ventana T-10min
   t5_umbral_usd:  150     # umbral ventana T-5min
-  stop_loss_pct:  0.1    # stop loss: salir si pierde el 50%
+  stop_loss_pct:   10    # stop loss: salir si pierde el 50%
   monitor_intervalo_s: 5  # frecuencia del loop (segundos)
 
 capital:
