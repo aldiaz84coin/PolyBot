@@ -1,5 +1,12 @@
 /**
- * components/ModeSelector.jsx — v1.1
+ * components/ModeSelector.jsx — v1.2
+ *
+ * CAMBIOS v1.2:
+ *   - FIX: el bloque de resultado del balance ahora muestra correctamente
+ *     los campos "usdc" y "pol" que devuelve el backend v1.3.
+ *   - NUEVO: sección de diagnóstico RPC debajo del saldo: muestra todos los
+ *     RPCs intentados con su latencia y estado (✓/✗), para identificar los
+ *     más rápidos y reordenarlos en _POLYGON_RPCS.
  *
  * CAMBIOS v1.1:
  *   - Guard res.ok antes de res.json() en runClobCheck, runBalanceCheck y
@@ -59,10 +66,8 @@ const S = {
 // ── v1.1: helper para fetch → JSON con guard res.ok ───────────────────────
 async function safeJson(res) {
   if (!res.ok) {
-    // El servidor devolvió HTML (500/404) — leer como texto para debug
     let body = "";
     try { body = await res.text(); } catch (_) {}
-    // Extraer mensaje legible si hay JSON dentro del HTML
     const match = body.match(/"error"\s*:\s*"([^"]+)"/);
     const msg = match ? match[1] : `HTTP ${res.status} — el servidor devolvió una respuesta no válida`;
     throw new Error(msg);
@@ -132,11 +137,6 @@ function PreflightStep({ num, title, description, chipStatus, children }) {
     : chipStatus === "loading" ? "rgba(68,136,255,0.2)"
     : "#1a1a2a";
 
-  const bg =
-    chipStatus === "ok"      ? "rgba(0,255,136,0.15)"
-    : chipStatus === "error" ? "rgba(255,68,102,0.15)"
-    : "#1a1a2a";
-
   return (
     <div style={{
       border: `1px solid ${borderColor}`,
@@ -189,7 +189,6 @@ function PreflightScreen({ onCancel, onConfirm }) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ command: "check_clob" }),
       });
-      // v1.1: guard res.ok — evita crash si el servidor devuelve HTML
       const { ok, id, error } = await safeJson(res);
       if (!ok) throw new Error(error || "Error enviando comando");
       poll(id, (data) => {
@@ -212,7 +211,6 @@ function PreflightScreen({ onCancel, onConfirm }) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ command: "check_balance" }),
       });
-      // v1.1: guard res.ok
       const { ok, id, error } = await safeJson(res);
       if (!ok) throw new Error(error || "Error enviando comando");
       poll(id, (data) => {
@@ -241,7 +239,6 @@ function PreflightScreen({ onCancel, onConfirm }) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ command: "test_order", params: { direction: testDir, stake } }),
       });
-      // v1.1: guard res.ok
       const { ok, id, error } = await safeJson(res);
       if (!ok) throw new Error(error || "Error enviando comando");
       poll(id, (data) => {
@@ -356,14 +353,78 @@ function PreflightScreen({ onCancel, onConfirm }) {
                 borderRadius: 3, fontSize: 9, color: "#666", lineHeight: 1.8,
               }}>
                 {balanceResult.error
-                  ? <span style={{ color: "#ff4466" }}>Error: {balanceResult.error}</span>
+                  ? (
+                    <>
+                      <span style={{ color: "#ff4466" }}>Error: {balanceResult.error}</span>
+                      {/* Diagnóstico de RPCs incluso en error */}
+                      {balanceResult.rpc_attempts?.length > 0 && (
+                        <div style={{ marginTop: 6, borderTop: "1px solid #111", paddingTop: 5 }}>
+                          <div style={{ color: "#333", marginBottom: 3, letterSpacing: "0.1em" }}>INTENTOS RPC:</div>
+                          {balanceResult.rpc_attempts.map((a, i) => (
+                            <div key={i} style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
+                              <span style={{
+                                color: a.ok ? "#00ff88" : "#ff4466",
+                                overflow: "hidden", textOverflow: "ellipsis",
+                                whiteSpace: "nowrap", maxWidth: 260,
+                              }}>
+                                {a.ok ? "✓" : "✗"} {a.rpc}
+                              </span>
+                              <span style={{ color: a.ok ? "#4488ff" : "#333", flexShrink: 0 }}>
+                                {a.latency_ms}ms
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </>
+                  )
                   : (
                     <>
+                      {/* v1.2 FIX: campos "usdc" y "pol" (backend v1.3) */}
                       {balanceResult.usdc != null && (
-                        <div>USDC: <b style={{ color: "#00ff88" }}>${balanceResult.usdc?.toFixed(2)}</b></div>
+                        <div>USDC: <b style={{ color: "#00ff88" }}>${balanceResult.usdc.toFixed(2)}</b></div>
                       )}
                       {balanceResult.pol != null && (
-                        <div>POL (gas): <b style={{ color: "#888" }}>{balanceResult.pol?.toFixed(4)}</b></div>
+                        <div>POL (gas): <b style={{ color: "#888" }}>{balanceResult.pol.toFixed(4)}</b></div>
+                      )}
+                      {balanceResult.rpc_used && (
+                        <div style={{ marginTop: 2 }}>
+                          RPC: <b style={{ color: "#4488ff" }}>
+                            {balanceResult.rpc_used.replace("https://", "")}
+                          </b>
+                          {balanceResult.rpc_latency_ms != null && (
+                            <span style={{ color: "#333" }}> · {balanceResult.rpc_latency_ms}ms</span>
+                          )}
+                        </div>
+                      )}
+                      {/* v1.2 NUEVO: diagnóstico completo de RPCs */}
+                      {balanceResult.rpc_attempts?.length > 1 && (
+                        <div style={{ marginTop: 6, borderTop: "1px solid #111", paddingTop: 5 }}>
+                          <div style={{ color: "#333", marginBottom: 3, letterSpacing: "0.1em" }}>
+                            TODOS LOS RPCs ({balanceResult.rpc_attempts.filter(a => a.ok).length}/{balanceResult.rpc_attempts.length} OK):
+                          </div>
+                          {balanceResult.rpc_attempts.map((a, i) => (
+                            <div key={i} style={{
+                              display: "flex", justifyContent: "space-between", gap: 8,
+                              opacity: a.ok ? 1 : 0.5,
+                            }}>
+                              <span style={{
+                                color: a.ok ? "#00ff88" : "#ff4466",
+                                overflow: "hidden", textOverflow: "ellipsis",
+                                whiteSpace: "nowrap", maxWidth: 260,
+                                fontSize: 8,
+                              }}>
+                                {a.ok ? "✓" : "✗"} {a.rpc.replace("https://", "")}
+                              </span>
+                              <span style={{ color: a.ok ? "#4488ff" : "#2a2a3a", flexShrink: 0, fontSize: 8 }}>
+                                {a.latency_ms}ms
+                                {!a.ok && a.error && (
+                                  <span style={{ color: "#333" }}> — {a.error.slice(0, 30)}</span>
+                                )}
+                              </span>
+                            </div>
+                          ))}
+                        </div>
                       )}
                     </>
                   )
@@ -498,7 +559,6 @@ export default function ModeSelector() {
     setLoading(true);
     try {
       const res  = await fetch("/api/config?key=trading_mode");
-      // v1.1: guard res.ok
       const data = await safeJson(res);
       setMode(data.value === "real" ? "real" : "simulate");
       if (data.updated_at) setLastUpdated(data.updated_at);
@@ -520,7 +580,6 @@ export default function ModeSelector() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ key: "trading_mode", value: newMode }),
       });
-      // v1.1: guard res.ok
       const data = await safeJson(res);
       if (data.ok) {
         setMode(newMode);
