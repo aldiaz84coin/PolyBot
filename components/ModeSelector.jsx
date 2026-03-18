@@ -1,11 +1,18 @@
 "use client";
 /**
- * components/ModeSelector.jsx — v2.1
+ * components/ModeSelector.jsx — v2.2
+ *
+ * CAMBIOS v2.2 — Timeout en poller + aviso bot inactivo:
+ *   - useCommandPoller ahora acepta timeoutMs (default 35s).
+ *     Si el bot no responde en ese tiempo, resuelve con error explicativo
+ *     en lugar de esperar indefinidamente.
+ *   - runBalanceCheck muestra aviso previo si el bot está inactivo (stale)
+ *     antes de intentar el comando.
+ *   - Paso 2 incluye indicador visual de estado del bot (ACTIVO / INACTIVO).
  *
  * CAMBIOS v2.1 — check_clob DIRECTO:
  *   runClobCheck detecta respuesta directa (data.direct === true) y aplica
- *   el resultado inmediatamente sin iniciar polling. check_balance y
- *   test_order siguen usando el poller como antes.
+ *   el resultado inmediatamente sin iniciar polling.
  *
  * CAMBIOS v2.0 — Preflight screen para cambio a modo real.
  * CAMBIOS v1.1 — safeJson con guard res.ok.
@@ -50,6 +57,9 @@ const S = {
   col: { display: "flex", flexDirection: "column", gap: 12 },
 };
 
+// Timeout para el poller (ms). Si el bot no responde en este tiempo → error.
+const POLL_TIMEOUT_MS = 35_000;
+
 // ── Helpers ───────────────────────────────────────────────────────────────
 
 async function safeJson(res) {
@@ -57,7 +67,9 @@ async function safeJson(res) {
     let body = "";
     try { body = await res.text(); } catch (_) {}
     const match = body.match(/"error"\s*:\s*"([^"]+)"/);
-    const msg = match ? match[1] : `HTTP ${res.status} — el servidor devolvió una respuesta no válida`;
+    const msg = match
+      ? match[1]
+      : `HTTP ${res.status} — el servidor devolvió una respuesta no válida`;
     throw new Error(msg);
   }
   return res.json();
@@ -67,9 +79,9 @@ async function safeJson(res) {
 
 function CheckChip({ status }) {
   const map = {
-    idle:    { color: "#333",    label: "—"       },
-    loading: { color: "#4488ff", label: "..."      },
-    ok:      { color: "#00ff88", label: "✓ OK"    },
+    idle:    { color: "#333",    label: "—"        },
+    loading: { color: "#4488ff", label: "..."       },
+    ok:      { color: "#00ff88", label: "✓ OK"     },
     error:   { color: "#ff4466", label: "✗ ERROR"  },
   };
   const { color, label } = map[status] || map.idle;
@@ -85,19 +97,59 @@ function CheckChip({ status }) {
   );
 }
 
+// ── BotStatusBadge ────────────────────────────────────────────────────────
+
+function BotStatusBadge({ botRunning, botChecked }) {
+  if (!botChecked) return null;
+  const color = botRunning ? "#00ff88" : "#ff8800";
+  const label = botRunning ? "● BOT ACTIVO" : "○ BOT INACTIVO";
+  return (
+    <span style={{
+      fontSize: 9, fontWeight: 700, letterSpacing: "0.1em",
+      color, padding: "2px 8px", borderRadius: 2,
+      border: `1px solid ${color}40`,
+      background: `${color}0d`,
+    }}>
+      {label}
+    </span>
+  );
+}
+
 // ── useCommandPoller ──────────────────────────────────────────────────────
-// Usado solo para check_balance y test_order (pasan por el bot).
+// Usado para check_balance y test_order (pasan por el bot).
+// Incluye timeout: si el bot no responde en POLL_TIMEOUT_MS, resuelve con error.
 
 function useCommandPoller() {
-  const timerRef = useRef(null);
+  const timerRef    = useRef(null);
+  const deadlineRef = useRef(null);
 
   const cancel = useCallback(() => {
-    if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
+    if (timerRef.current) {
+      clearInterval(timerRef.current);
+      timerRef.current = null;
+    }
+    deadlineRef.current = null;
   }, []);
 
   const poll = useCallback((id, onDone) => {
     cancel();
+    deadlineRef.current = Date.now() + POLL_TIMEOUT_MS;
+
     timerRef.current = setInterval(async () => {
+      // ── Timeout guard ───────────────────────────────────────────────
+      if (Date.now() > deadlineRef.current) {
+        cancel();
+        onDone({
+          status: "error",
+          result: {
+            success: false,
+            error:   `Sin respuesta del bot tras ${POLL_TIMEOUT_MS / 1000}s. Verifica que Railway esté activo y el bot corriendo.`,
+          },
+        });
+        return;
+      }
+
+      // ── Poll Supabase ────────────────────────────────────────────────
       try {
         const res  = await fetch(`/api/commands?id=${id}`, { cache: "no-store" });
         const data = await safeJson(res);
@@ -105,9 +157,13 @@ function useCommandPoller() {
           cancel();
           onDone(data);
         }
+        // Si status es "pending" o "running", continuar esperando
       } catch (e) {
         cancel();
-        onDone({ status: "error", result: { success: false, error: e.message } });
+        onDone({
+          status: "error",
+          result: { success: false, error: e.message },
+        });
       }
     }, 2000);
   }, [cancel]);
@@ -115,6 +171,32 @@ function useCommandPoller() {
   useEffect(() => () => cancel(), [cancel]);
 
   return { poll, cancel };
+}
+
+// ── useBotStatus ──────────────────────────────────────────────────────────
+// Consulta /api/bot-state para saber si el bot está activo.
+
+function useBotStatus() {
+  const [running,  setRunning]  = useState(false);
+  const [checked,  setChecked]  = useState(false);
+
+  useEffect(() => {
+    async function check() {
+      try {
+        const res  = await fetch("/api/bot-state", { cache: "no-store" });
+        if (!res.ok) { setChecked(true); return; }
+        const data = await res.json();
+        setRunning(data?.status === "running" && !data?.stale);
+      } catch (_) {
+        // bot inaccesible → asumir inactivo
+      } finally {
+        setChecked(true);
+      }
+    }
+    check();
+  }, []);
+
+  return { running, checked };
 }
 
 // ── PreflightStep ─────────────────────────────────────────────────────────
@@ -155,7 +237,8 @@ function PreflightStep({ num, title, description, chipStatus, children }) {
 // ── PreflightScreen ───────────────────────────────────────────────────────
 
 function PreflightScreen({ onCancel, onConfirm }) {
-  const { poll, cancel } = useCommandPoller();
+  const { poll, cancel }       = useCommandPoller();
+  const { running: botRunning, checked: botChecked } = useBotStatus();
 
   const [clobStatus,    setClobStatus]    = useState("idle");
   const [clobResult,    setClobResult]    = useState(null);
@@ -169,14 +252,14 @@ function PreflightScreen({ onCancel, onConfirm }) {
 
   const canConfirm = clobStatus === "ok" && confirmText === "REAL";
 
-  // ── Check CLOB — v2.1: ejecución directa, sin polling ────────────────────
+  // ── Check CLOB — v2.2: ejecución directa desde Vercel, sin bot ───────────
   const runClobCheck = async () => {
     setClobStatus("loading"); setClobResult(null);
     try {
       const res = await fetch("/api/commands", {
-        method: "POST",
+        method:  "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ command: "check_clob" }),
+        body:    JSON.stringify({ command: "check_clob" }),
       });
       const data = await safeJson(res);
       if (!data.ok) throw new Error(data.error || "Error enviando comando");
@@ -189,12 +272,12 @@ function PreflightScreen({ onCancel, onConfirm }) {
         return;
       }
 
-      // Fallback legacy: si por alguna razón llega id (no debería pasar para check_clob).
+      // Fallback (no debería llegar aquí en v1.3+, pero por seguridad):
       if (data.id) {
         poll(data.id, (pollData) => {
           const ok = pollData.status === "done" && pollData.result?.success;
           setClobStatus(ok ? "ok" : "error");
-          setClobResult(pollData.result);
+          setClobResult(pollData.result ?? pollData.result);
         });
       }
     } catch (e) {
@@ -205,12 +288,13 @@ function PreflightScreen({ onCancel, onConfirm }) {
 
   // ── Check Balance — pasa por el bot (necesita wallet) ────────────────────
   const runBalanceCheck = async () => {
+    // Aviso preventivo si el bot está inactivo (pero permitir intentar)
     setBalanceStatus("loading"); setBalanceResult(null);
     try {
       const res = await fetch("/api/commands", {
-        method: "POST",
+        method:  "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ command: "check_balance" }),
+        body:    JSON.stringify({ command: "check_balance" }),
       });
       const { ok, id, error } = await safeJson(res);
       if (!ok) throw new Error(error || "Error enviando comando");
@@ -236,9 +320,9 @@ function PreflightScreen({ onCancel, onConfirm }) {
     }
     try {
       const res = await fetch("/api/commands", {
-        method: "POST",
+        method:  "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ command: "test_order", params: { direction: testDir, stake } }),
+        body:    JSON.stringify({ command: "test_order", params: { direction: testDir, stake } }),
       });
       const { ok, id, error } = await safeJson(res);
       if (!ok) throw new Error(error || "Error enviando comando");
@@ -268,6 +352,7 @@ function PreflightScreen({ onCancel, onConfirm }) {
         maxHeight: "90vh", overflowY: "auto",
         boxShadow: "0 0 60px rgba(255,68,102,0.08)",
       }}>
+
         {/* Header */}
         <div style={{ marginBottom: 20 }}>
           <div style={{ ...S.row, justifyContent: "space-between", marginBottom: 8 }}>
@@ -287,7 +372,7 @@ function PreflightScreen({ onCancel, onConfirm }) {
 
         <div style={S.col}>
 
-          {/* PASO 1: CLOB */}
+          {/* PASO 1: CLOB — ejecución directa desde Vercel */}
           <PreflightStep
             num={1}
             title="Conexión CLOB"
@@ -323,20 +408,32 @@ function PreflightScreen({ onCancel, onConfirm }) {
             )}
           </PreflightStep>
 
-          {/* PASO 2: Balance */}
+          {/* PASO 2: Balance — requiere bot activo */}
           <PreflightStep
             num={2}
             title="Balance de cartera"
             description="Consulta el saldo USDC y POL en tu cartera de Polygon. Requiere que el bot esté activo en Railway."
             chipStatus={balanceStatus}
           >
+            {/* Indicador estado del bot */}
+            <div style={{ ...S.row, marginBottom: 8 }}>
+              <BotStatusBadge botRunning={botRunning} botChecked={botChecked} />
+              {botChecked && !botRunning && balanceStatus === "idle" && (
+                <span style={{ fontSize: 9, color: "#ff8800" }}>
+                  ⚠ Bot inactivo — el comando esperará hasta que Railway responda (35s timeout)
+                </span>
+              )}
+            </div>
+
             <div style={S.row}>
               <button
                 onClick={runBalanceCheck}
                 disabled={balanceStatus === "loading"}
                 style={S.btn("blue", balanceStatus === "loading")}
               >
-                {balanceStatus === "loading" ? "CONSULTANDO…" : "CONSULTAR BALANCE"}
+                {balanceStatus === "loading"
+                  ? `CONSULTANDO… (timeout ${POLL_TIMEOUT_MS / 1000}s)`
+                  : "CONSULTAR BALANCE"}
               </button>
             </div>
             {balanceResult && (
@@ -360,7 +457,7 @@ function PreflightScreen({ onCancel, onConfirm }) {
             )}
           </PreflightStep>
 
-          {/* PASO 3: Orden de prueba */}
+          {/* PASO 3: Orden de prueba (opcional) */}
           <PreflightStep
             num={3}
             title="Orden de prueba (opcional)"
@@ -494,9 +591,9 @@ export default function ModeSelector() {
     setSaving(true);
     try {
       const res = await fetch("/api/config", {
-        method: "POST",
+        method:  "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ key: "trading_mode", value: newMode }),
+        body:    JSON.stringify({ key: "trading_mode", value: newMode }),
       });
       const data = await safeJson(res);
       if (data.ok) {
