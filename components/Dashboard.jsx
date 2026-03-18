@@ -1,35 +1,28 @@
 "use client";
 /**
- * Dashboard.jsx — v3.3
+ * Dashboard.jsx — v3.4
+ *
+ * CAMBIOS v3.4 — FIX MERCADO + LOG DE EVENTOS
+ * ─────────────────────────────────────────────────────────────
+ *  FIX 1: Mercado activo siempre mostraba "Buscando..."
+ *    - useMarket() ya devolvía error y apiResponse, pero Dashboard no
+ *      los pasaba a <MarketInfo>. Añadidos error={marketError} y
+ *      apiResponse={marketApiResponse} al render de MarketInfo.
+ *
+ *  FIX 2: Log de eventos siempre vacío
+ *    - useLog() es in-memory: se llena solo mientras el dashboard
+ *      está abierto. Ahora se alimenta de dos fuentes:
+ *      a) Cambios de botState en tiempo real (via useRef + useEffect).
+ *      b) Historial reciente de Supabase al montar (GET /api/events).
  *
  * CAMBIOS v3.3 — ARQUITECTURA: Dashboard = solo lector, Bot = único escritor
  * ─────────────────────────────────────────────────────────────────────────
- *  PROBLEMA ANTERIOR:
- *    El dashboard tenía lógica de "auto-bet" (creaba operaciones con odds=0.5
- *    hardcodeado) y "auto-resolve" (resolvía WIN/LOSS comparando precio BTC
- *    local) y las escribía en Supabase. El bot hacía lo mismo con datos
- *    reales del CLOB. Resultado: operaciones duplicadas y P&L incorrecto.
- *
- *  SOLUCIÓN:
- *    - Eliminados auto-bet y auto-resolve por completo.
- *    - El bot (Railway) es la ÚNICA fuente de escritura en Supabase.
- *    - Dashboard solo lee /api/bets (Supabase) cada 10s.
- *    - activeBet se deriva de bets: la primera operación con result=PENDING.
- *    - stake_usdc se lee de /api/config?key=stake_usdc (escrito por el bot
- *      al arrancar). Fallback: DEFAULT_CONFIG.stake_usdc.
- *    - running se lee de /api/bot-state (el bot reporta su estado cada ciclo).
- *    - pnlDay calculado desde bets del día (persiste entre recargas).
- *
- * CAMBIOS v3.2:
- *   - useBalance simplificado, balance/pnlDay movidos a Dashboard.
- *   - Stats bar: BALANCE $500 reemplazado por STAKE/OP desde config.
- *
- * CAMBIOS v3.1:
- *   - ModeSelector en pestaña config.
- *
- * CAMBIOS v3.0 (Supabase):
- *   - Persistencia real via /api/bets.
- *   - Nueva pestaña "análisis" → StatsPanel.
+ *  - Eliminados auto-bet y auto-resolve.
+ *  - El bot (Railway) es la ÚNICA fuente de escritura en Supabase.
+ *  - Dashboard solo lee /api/bets (Supabase) cada 10s.
+ *  - activeBet se deriva de bets: la primera operación con result=PENDING.
+ *  - stake_usdc se lee de /api/config?key=stake_usdc.
+ *  - running se lee de /api/bot-state.
  */
 
 import { useState, useEffect, useRef, useCallback } from "react";
@@ -47,9 +40,9 @@ import ConfigPanel  from "./ConfigPanel";
 import StatsPanel   from "./StatsPanel";
 import ModeSelector from "./ModeSelector";
 
-const LS_KEY          = "polymarket_bets_v2";
-const BETS_POLL_MS    = 10_000;   // refresco bets desde Supabase cada 10s
-const BOTSTATE_POLL_MS = 5_000;   // refresco estado del bot cada 5s
+const LS_KEY           = "polymarket_bets_v2";
+const BETS_POLL_MS     = 10_000;
+const BOTSTATE_POLL_MS = 5_000;
 
 function Tag({ children, color = "#555" }) {
   return (
@@ -82,17 +75,17 @@ export default function Dashboard() {
   const [priceHistory, setPriceHistory] = useState([]);
 
   // ── Estado del bot leído desde /api/bot-state ─────────────────────────
-  // running = true si el bot reportó estado hace < 90s
   const [botState, setBotState] = useState(null);
-  const running    = botState?.status === "running" && !botState?.stale;
-  const botStale   = botState?.stale ?? true;
+  const running  = botState?.status === "running" && !botState?.stale;
+  const botStale = botState?.stale ?? true;
 
+  // ── v3.4: destructurar error y apiResponse de useMarket ──────────────
   const { price, prev, source, error: priceError, loading: priceLoading } = useBTCPrice(true);
-  const { market, endMs, active: marketActive, error: marketError } = useMarket();
+  const { market, endMs, active: marketActive, error: marketError, apiResponse: marketApiResponse } = useMarket();
   const now = useClock();
   const { log, add: addLog } = useLog();
 
-  // ── 1. Cargar bets desde Supabase (fuente canónica — escritas por el bot) ─
+  // ── 1. Cargar bets desde Supabase ─────────────────────────────────────
   const loadBets = useCallback(async () => {
     try {
       const res = await fetch("/api/bets?limit=500");
@@ -109,7 +102,6 @@ export default function Dashboard() {
   }, []);
 
   useEffect(() => {
-    // Cache rápida de localStorage al montar
     try {
       const saved = localStorage.getItem(LS_KEY);
       if (saved) {
@@ -131,8 +123,6 @@ export default function Dashboard() {
         if (!res.ok) return;
         const data = await res.json();
         setBotState(data);
-
-        // Sincronizar stake_usdc si el bot lo reporta
         if (data.stake_usdc) {
           setConfig(c => ({ ...c, stake_usdc: parseFloat(data.stake_usdc) }));
         }
@@ -143,8 +133,87 @@ export default function Dashboard() {
     return () => clearInterval(id);
   }, []);
 
-  // ── 3. Leer stake_usdc del bot desde bot_config en Supabase ─────────
-  //    El bot escribe set_config("stake_usdc", ...) al arrancar.
+  // ── 3. Log automático desde cambios de botState (v3.4) ───────────────
+  const prevBotRef = useRef(null);
+  useEffect(() => {
+    if (!botState) return;
+    const prev = prevBotRef.current;
+
+    if (!prev && botState.status === "running") {
+      addLog("🟢 Bot conectado al dashboard", "success");
+    }
+    if (botState.status === "offline" && prev?.status === "running") {
+      addLog("🔴 Bot desconectado", "error");
+    }
+    if (botState.window && botState.window !== prev?.window) {
+      addLog(`📊 Ventana activa: ${botState.window}`, "info");
+    }
+    if (
+      botState.direction &&
+      botState.direction !== "WAIT" &&
+      botState.direction !== prev?.direction
+    ) {
+      const icon   = botState.direction === "UP" ? "🟢" : "🔴";
+      const btcStr = botState.price
+        ? ` | BTC $${Number(botState.price).toLocaleString("en-US")}`
+        : "";
+      addLog(`${icon} Señal ${botState.direction} | ${botState.window ?? ""}${btcStr}`, "info");
+    }
+    if (botState.bet_active && !prev?.bet_active) {
+      addLog("💰 Apuesta abierta", "success");
+    }
+    if (botState.bet_active === false && prev?.bet_active === true) {
+      addLog("🏁 Posición cerrada", "info");
+    }
+
+    prevBotRef.current = botState;
+  }, [botState, addLog]);
+
+  // ── 4. Carga histórica del log desde Supabase al montar (v3.4) ───────
+  useEffect(() => {
+    async function loadRecentEvents() {
+      try {
+        const res = await fetch("/api/events?limit=30");
+        if (!res.ok) return;
+        const data = await res.json();
+        const entries = data.events ?? [];
+
+        // Añadir en orden cronológico inverso (más reciente primero)
+        entries.forEach(ev => {
+          const icon =
+            ev.type === "signal"
+              ? ev.direccion === "UP"   ? "🟢"
+              : ev.direccion === "DOWN" ? "🔴"
+              : "📊"
+              : ev.resultado === "WIN"  ? "✅"
+              : ev.resultado === "LOSS" ? "❌"
+              : ev.resultado === "STOP" ? "🛑"
+              : "🔄";
+
+          const sim = ev.simulado ? " [SIM]" : "";
+
+          const msg =
+            ev.type === "signal"
+              ? `${icon} Señal ${ev.direccion} [${ev.ventana}]${sim} | Dist $${Math.abs(ev.distancia ?? 0).toFixed(0)}`
+              : `${icon} Op ${ev.resultado ?? "PENDING"} ${ev.direccion ?? ""}${sim} | P&L ${
+                  ev.pnl_usd != null
+                    ? (ev.pnl_usd >= 0 ? "+" : "") + "$" + Math.abs(ev.pnl_usd).toFixed(2)
+                    : "—"
+                }`;
+
+          const type =
+            ev.resultado === "WIN"  ? "success"
+          : ev.resultado === "LOSS" || ev.resultado === "STOP" ? "error"
+          : "info";
+
+          addLog(msg, type);
+        });
+      } catch {}
+    }
+    loadRecentEvents();
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── 5. Leer stake_usdc del bot desde bot_config en Supabase ──────────
   useEffect(() => {
     async function fetchStake() {
       try {
@@ -153,16 +222,14 @@ export default function Dashboard() {
         const data = await res.json();
         if (data.value) {
           const v = parseFloat(data.value);
-          if (!isNaN(v) && v > 0) {
-            setConfig(c => ({ ...c, stake_usdc: v }));
-          }
+          if (!isNaN(v) && v > 0) setConfig(c => ({ ...c, stake_usdc: v }));
         }
       } catch {}
     }
     fetchStake();
   }, []);
 
-  // ── Precio history ────────────────────────────────────────────────────
+  // ── Precio history ─────────────────────────────────────────────────────
   useEffect(() => {
     if (!price) return;
     setPriceHistory(h => {
@@ -217,21 +284,20 @@ export default function Dashboard() {
     return () => clearInterval(iv);
   }, []);
 
-  // ── Timing ────────────────────────────────────────────────────────────
+  // ── Timing ─────────────────────────────────────────────────────────────
   const minsLeft     = getMinsLeft(endMs, now);
-  // activeWindow solo sirve para mostrar señal visual, no para entrar órdenes
   const activeWindow = getActiveWindow(minsLeft);
 
-  // ── Señal visual (solo display — el bot decide si entra o no) ─────────
+  // ── Señal visual ───────────────────────────────────────────────────────
   const umbral   = activeWindow ? config[activeWindow.configKey] : 0;
   const decision = (price && target && activeWindow)
     ? getDecision(price, target, umbral, activeWindow)
     : null;
 
-  // ── activeBet: primera operación PENDING en Supabase (escrita por el bot)
+  // ── activeBet: primera operación PENDING en Supabase ──────────────────
   const activeBet = bets.find(b => b.result === "PENDING") ?? null;
 
-  // ── Stats derivadas de bets (fuente: Supabase) ─────────────────────────
+  // ── Stats derivadas de bets ────────────────────────────────────────────
   const wins     = bets.filter(b => b.result === "WIN").length;
   const losses   = bets.filter(b => b.result === "LOSS" || b.result === "STOP").length;
   const total    = wins + losses;
@@ -275,8 +341,7 @@ export default function Dashboard() {
           <span style={{ color: "var(--green)", fontWeight: 700, letterSpacing: "0.12em", fontSize: 14 }}>
             POLYMARKET BTC BOT
           </span>
-          <Tag color="#2a4a3a">v3.3</Tag>
-          {/* Estado del bot real (Railway) */}
+          <Tag color="#2a4a3a">v3.4</Tag>
           {running
             ? <Tag color="#1a3a2a">BOT ACTIVO</Tag>
             : botStale
@@ -312,21 +377,19 @@ export default function Dashboard() {
               {t}
             </button>
           ))}
-          {/* Botón solo muestra estado real del bot — no lo controla */}
           <div style={{
             background: running ? "rgba(0,255,136,0.08)" : "rgba(255,68,102,0.08)",
             border: `1px solid ${running ? "rgba(0,255,136,0.25)" : "rgba(255,68,102,0.2)"}`,
             color: running ? "var(--green)" : "var(--red)",
             padding: "5px 16px", borderRadius: 3,
-            fontSize: 10, letterSpacing: "0.14em",
-            fontWeight: 700,
+            fontSize: 10, letterSpacing: "0.14em", fontWeight: 700,
           }}>
             {running ? "● CORRIENDO" : "○ INACTIVO"}
           </div>
         </div>
       </header>
 
-      {/* ── DASHBOARD ────────────────────────────────────────────────────── */}
+      {/* ── PANEL PRINCIPAL ──────────────────────────────────────────────── */}
       {tab === "dashboard" && (
         <div style={{
           display: "grid",
@@ -374,8 +437,9 @@ export default function Dashboard() {
                   </span>
                   <span style={{
                     fontSize: 28, fontWeight: 700,
-                    color: decision.dir === "UP" ? "var(--green)"
-                         : decision.dir === "DOWN" ? "var(--red)" : "var(--dim)",
+                    color: decision.dir === "UP"   ? "var(--green)"
+                         : decision.dir === "DOWN" ? "var(--red)"
+                         : "var(--dim)",
                   }}>
                     {decision.dir === "UP" ? "▲ UP" : decision.dir === "DOWN" ? "▼ DOWN" : "— WAIT"}
                   </span>
@@ -394,7 +458,6 @@ export default function Dashboard() {
               </div>
             )}
 
-            {/* Posición activa — leída desde Supabase (escrita por el bot) */}
             {activeBet && (
               <div style={{
                 marginTop: 12, padding: "8px 10px",
@@ -436,7 +499,6 @@ export default function Dashboard() {
             {targetError && (
               <div style={{ fontSize: 10, color: "var(--yellow)", marginTop: 4 }}>{targetError}</div>
             )}
-            {/* Estado del bot reportado */}
             {botState && (
               <div style={{ fontSize: 9, color: "#333", marginTop: 8 }}>
                 Bot last seen: {botState.last_seen
@@ -458,10 +520,6 @@ export default function Dashboard() {
           borderBottom: "1px solid var(--border)", background: "#02020a",
           flexWrap: "wrap", alignItems: "flex-end",
         }}>
-          {/*
-           * v3.3: stake_usdc viene del bot (bot_config Supabase o bot-state).
-           * Si el bot no está activo aún, muestra DEFAULT_CONFIG.stake_usdc.
-           */}
           <StatBox
             label="STAKE/OP"
             value={fmtUSD(config.stake_usdc)}
@@ -485,7 +543,6 @@ export default function Dashboard() {
             sub={`${wins}W / ${losses}L`}
           />
           <StatBox label="OPS" value={total} color="var(--dim)" />
-          {/* Indicador de refresco */}
           <div style={{ marginLeft: "auto", fontSize: 9, color: "#333", alignSelf: "center" }}>
             ↻ sync cada 10s · fuente: Supabase
           </div>
@@ -496,7 +553,15 @@ export default function Dashboard() {
       {tab === "dashboard" && (
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", borderBottom: "1px solid var(--border)" }}>
           <div style={{ borderRight: "1px solid var(--border)" }}>
-            <MarketInfo market={market} minsLeft={minsLeft} activeWindow={activeWindow} />
+            {/* v3.4 FIX: pasar error y apiResponse para que MarketInfo muestre
+                el panel de error en vez de quedarse en "Buscando..." */}
+            <MarketInfo
+              market={market}
+              minsLeft={minsLeft}
+              activeWindow={activeWindow}
+              error={marketError}
+              apiResponse={marketApiResponse}
+            />
           </div>
           <div>
             <div style={{ padding: "12px 20px", borderBottom: "1px solid var(--border)" }}>
@@ -513,7 +578,7 @@ export default function Dashboard() {
         </div>
       )}
 
-      {/* ── LOG ──────────────────────────────────────────────────────────── */}
+      {/* ── LOG DE EVENTOS ────────────────────────────────────────────────── */}
       {tab === "dashboard" && (
         <div style={{ padding: "12px 20px" }}>
           <div style={{ fontSize: 9, color: "#444", letterSpacing: "0.15em", marginBottom: 8 }}>LOG DE EVENTOS</div>
@@ -585,11 +650,6 @@ export default function Dashboard() {
           <div style={{ marginBottom: 32 }}>
             <ModeSelector />
           </div>
-          {/*
-           * ConfigPanel muestra los umbrales locales. Nota: los umbrales que
-           * usa el bot están en su config.yaml/variables de entorno (Railway).
-           * Estos valores locales son solo para la señal visual del dashboard.
-           */}
           <div style={{
             marginBottom: 16, padding: "10px 14px",
             background: "rgba(255,204,0,0.04)", border: "1px solid rgba(255,204,0,0.15)",
