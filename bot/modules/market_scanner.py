@@ -485,3 +485,7 @@ def get_open_1h_binance(slug: str | None = None) -> float | None:
 
     logger.error("[SCANNER] ❌ No se pudo obtener Price to Beat (Binance + Kraken fallidos)")
     return None
+
+
+# Alias público — usado por command_handler para verificación CLOB
+get_clob_price = _fetch_live_price
