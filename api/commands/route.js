@@ -1,92 +1,164 @@
 /**
- * app/api/config/route.js — v1.0
- * Gestión de configuración compartida bot ↔ dashboard.
+ * app/api/commands/route.js — v1.1
+ * Canal de comandos dashboard → bot.
  *
- * GET  /api/config?key=trading_mode    → { key, value, updated_at }
- * GET  /api/config                     → { configs: [{key,value,updated_at},...] }
- * POST /api/config  { key, value }     → { ok, key, value }
+ * POST /api/commands  { command, params }   → { ok, id }
+ * GET  /api/commands?id=123                 → { id, command, status, result, ... }
+ * GET  /api/commands?status=pending         → { commands: [...] }
+ *
+ * CAMBIOS v1.1:
+ *   - Añadido try/catch externo explícito que garantiza JSON incluso si
+ *     req.json() falla (body malformado / content-type incorrecto).
+ *   - Supabase null → 503 JSON en ambos métodos (ya existía, reforzado).
+ *   - Logs de error más descriptivos para Railway/Vercel.
+ *
+ * Comandos soportados:
+ *   check_clob      → bot prueba conectividad CLOB y devuelve latencia + token_id
+ *   check_balance   → bot consulta saldo USDC en cartera
+ *   test_order      → bot ejecuta una orden real de prueba
+ *                     params: { direction: 'UP'|'DOWN', stake: 1.0 }
  */
 
 import { NextResponse } from "next/server";
 import { getSupabase } from "../../../lib/supabase";
 
-// ── Fallback en memoria si Supabase no está disponible ────────────────────
-const _mem = new Map([["trading_mode", "simulate"]]);
+const VALID_COMMANDS = ["check_clob", "check_balance", "test_order"];
 
-export async function GET(req) {
-  const { searchParams } = new URL(req.url);
-  const key = searchParams.get("key");
-
-  const sb = getSupabase();
-  if (sb) {
-    try {
-      if (key) {
-        const { data, error } = await sb
-          .from("bot_config")
-          .select("key, value, updated_at")
-          .eq("key", key)
-          .single();
-        if (error && error.code !== "PGRST116") throw error;  // 116 = not found
-        if (data) return NextResponse.json(data, { headers: { "Cache-Control": "no-store" } });
-        // Key no existe → devolver null con fallback
-        return NextResponse.json(
-          { key, value: _mem.get(key) ?? null, updated_at: null, source: "default" },
-          { headers: { "Cache-Control": "no-store" } }
-        );
-      } else {
-        const { data, error } = await sb
-          .from("bot_config")
-          .select("key, value, updated_at")
-          .order("key");
-        if (error) throw error;
-        return NextResponse.json(
-          { configs: data || [], source: "supabase" },
-          { headers: { "Cache-Control": "no-store" } }
-        );
-      }
-    } catch (e) {
-      console.error("[config/GET] Supabase error:", e.message);
-    }
-  }
-
-  // Fallback memoria
-  if (key) {
-    return NextResponse.json(
-      { key, value: _mem.get(key) ?? null, updated_at: null, source: "memory" },
-      { headers: { "Cache-Control": "no-store" } }
-    );
-  }
-  const configs = [..._mem.entries()].map(([k, v]) => ({ key: k, value: v, updated_at: null }));
-  return NextResponse.json({ configs, source: "memory" }, { headers: { "Cache-Control": "no-store" } });
-}
+// ── POST /api/commands ────────────────────────────────────────────────────
 
 export async function POST(req) {
+  // Outer try: garantiza que NUNCA se devuelve HTML aunque falle req.json()
   try {
-    const { key, value } = await req.json();
-    if (!key || value === undefined) {
-      return NextResponse.json({ ok: false, error: "key y value son requeridos" }, { status: 400 });
+    let body;
+    try {
+      body = await req.json();
+    } catch (_) {
+      return NextResponse.json(
+        { ok: false, error: "Body inválido — se esperaba JSON con { command, params }" },
+        { status: 400 }
+      );
     }
 
-    // Actualizar memoria de fallback
-    _mem.set(key, String(value));
+    const { command, params = {} } = body;
 
-    const sb = getSupabase();
-    if (sb) {
-      try {
-        const now = new Date().toISOString();
-        const { error } = await sb.from("bot_config").upsert(
-          { key, value: String(value), updated_at: now },
-          { onConflict: "key" }
+    if (!command || !VALID_COMMANDS.includes(command)) {
+      return NextResponse.json(
+        { ok: false, error: `Comando inválido. Válidos: ${VALID_COMMANDS.join(", ")}` },
+        { status: 400 }
+      );
+    }
+
+    // Validaciones específicas por comando
+    if (command === "test_order") {
+      if (!["UP", "DOWN"].includes(params?.direction)) {
+        return NextResponse.json(
+          { ok: false, error: "test_order requiere params.direction = 'UP' | 'DOWN'" },
+          { status: 400 }
         );
-        if (error) throw error;
-        return NextResponse.json({ ok: true, key, value, source: "supabase" });
-      } catch (e) {
-        console.error("[config/POST] Supabase error:", e.message);
+      }
+      const stake = parseFloat(params?.stake);
+      if (isNaN(stake) || stake < 0.5 || stake > 10) {
+        return NextResponse.json(
+          { ok: false, error: "test_order requiere params.stake entre 0.50 y 10.00 USDC" },
+          { status: 400 }
+        );
       }
     }
 
-    return NextResponse.json({ ok: true, key, value, source: "memory" });
+    // Verificar Supabase disponible
+    const sb = getSupabase();
+    if (!sb) {
+      console.error("[commands/POST] Supabase no disponible — SUPABASE_URL / SUPABASE_SERVICE_KEY ausentes");
+      return NextResponse.json(
+        {
+          ok: false,
+          error: "Supabase no configurado — añade SUPABASE_URL y SUPABASE_SERVICE_KEY en Vercel → Settings → Environment Variables y redespliega",
+        },
+        { status: 503 }
+      );
+    }
+
+    const now = new Date().toISOString();
+    const { data, error } = await sb
+      .from("bot_commands")
+      .insert({ command, params, status: "pending", created_at: now, updated_at: now })
+      .select("id")
+      .single();
+
+    if (error) throw error;
+
+    return NextResponse.json(
+      { ok: true, id: data.id, command, status: "pending" },
+      { headers: { "Cache-Control": "no-store" } }
+    );
+
   } catch (e) {
-    return NextResponse.json({ ok: false, error: e.message }, { status: 400 });
+    console.error("[commands/POST] Error inesperado:", e?.message ?? e);
+    return NextResponse.json(
+      { ok: false, error: e?.message ?? "Error interno del servidor" },
+      { status: 500 }
+    );
+  }
+}
+
+// ── GET /api/commands ─────────────────────────────────────────────────────
+
+export async function GET(req) {
+  try {
+    const { searchParams } = new URL(req.url);
+    const id     = searchParams.get("id");
+    const status = searchParams.get("status");
+
+    const sb = getSupabase();
+    if (!sb) {
+      console.error("[commands/GET] Supabase no disponible");
+      return NextResponse.json(
+        { ok: false, error: "Supabase no configurado" },
+        { status: 503 }
+      );
+    }
+
+    if (id) {
+      const { data, error } = await sb
+        .from("bot_commands")
+        .select("*")
+        .eq("id", id)
+        .single();
+      if (error) throw error;
+      return NextResponse.json(data, { headers: { "Cache-Control": "no-store" } });
+    }
+
+    if (status) {
+      const { data, error } = await sb
+        .from("bot_commands")
+        .select("*")
+        .eq("status", status)
+        .order("created_at", { ascending: false })
+        .limit(20);
+      if (error) throw error;
+      return NextResponse.json(
+        { commands: data || [] },
+        { headers: { "Cache-Control": "no-store" } }
+      );
+    }
+
+    // Sin filtros → últimos 10 comandos
+    const { data, error } = await sb
+      .from("bot_commands")
+      .select("*")
+      .order("created_at", { ascending: false })
+      .limit(10);
+    if (error) throw error;
+    return NextResponse.json(
+      { commands: data || [] },
+      { headers: { "Cache-Control": "no-store" } }
+    );
+
+  } catch (e) {
+    console.error("[commands/GET] Error:", e?.message ?? e);
+    return NextResponse.json(
+      { ok: false, error: e?.message ?? "Error interno del servidor" },
+      { status: 500 }
+    );
   }
 }
