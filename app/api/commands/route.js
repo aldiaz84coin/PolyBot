@@ -1,33 +1,25 @@
 /**
- * app/api/commands/route.js — v1.1
- * Canal de comandos dashboard → bot.
+ * app/api/commands/route.js — v1.2
+ *
+ * CAMBIOS v1.2:
+ *   - export const dynamic = "force-dynamic" para evitar caché en GET
+ *   - Logs explícitos en cada método para debug en Vercel
  *
  * POST /api/commands  { command, params }   → { ok, id }
- * GET  /api/commands?id=123                 → { id, command, status, result, ... }
+ * GET  /api/commands?id=123                 → { id, command, status, result }
  * GET  /api/commands?status=pending         → { commands: [...] }
- *
- * CAMBIOS v1.1:
- *   - Añadido try/catch externo explícito que garantiza JSON incluso si
- *     req.json() falla (body malformado / content-type incorrecto).
- *   - Supabase null → 503 JSON en ambos métodos (ya existía, reforzado).
- *   - Logs de error más descriptivos para Railway/Vercel.
- *
- * Comandos soportados:
- *   check_clob      → bot prueba conectividad CLOB y devuelve latencia + token_id
- *   check_balance   → bot consulta saldo USDC en cartera
- *   test_order      → bot ejecuta una orden real de prueba
- *                     params: { direction: 'UP'|'DOWN', stake: 1.0 }
  */
 
 import { NextResponse } from "next/server";
 import { getSupabase } from "../../../lib/supabase";
+
+export const dynamic = "force-dynamic";
 
 const VALID_COMMANDS = ["check_clob", "check_balance", "test_order"];
 
 // ── POST /api/commands ────────────────────────────────────────────────────
 
 export async function POST(req) {
-  // Outer try: garantiza que NUNCA se devuelve HTML aunque falle req.json()
   try {
     let body;
     try {
@@ -48,54 +40,56 @@ export async function POST(req) {
       );
     }
 
-    // Validaciones específicas por comando
     if (command === "test_order") {
-      if (!["UP", "DOWN"].includes(params?.direction)) {
+      const { direction, stake } = params;
+      if (!["UP", "DOWN"].includes(direction)) {
         return NextResponse.json(
-          { ok: false, error: "test_order requiere params.direction = 'UP' | 'DOWN'" },
+          { ok: false, error: "direction debe ser 'UP' o 'DOWN'" },
           { status: 400 }
         );
       }
-      const stake = parseFloat(params?.stake);
-      if (isNaN(stake) || stake < 0.5 || stake > 10) {
+      if (typeof stake !== "number" || stake < 0.5 || stake > 10) {
         return NextResponse.json(
-          { ok: false, error: "test_order requiere params.stake entre 0.50 y 10.00 USDC" },
+          { ok: false, error: "stake debe estar entre 0.50 y 10.00 USDC" },
           { status: 400 }
         );
       }
     }
 
-    // Verificar Supabase disponible
-    const sb = getSupabase();
-    if (!sb) {
-      console.error("[commands/POST] Supabase no disponible — SUPABASE_URL / SUPABASE_SERVICE_KEY ausentes");
+    const supabase = getSupabase();
+    if (!supabase) {
       return NextResponse.json(
-        {
-          ok: false,
-          error: "Supabase no configurado — añade SUPABASE_URL y SUPABASE_SERVICE_KEY en Vercel → Settings → Environment Variables y redespliega",
-        },
+        { ok: false, error: "Supabase no disponible — verifica variables de entorno" },
         { status: 503 }
       );
     }
 
-    const now = new Date().toISOString();
-    const { data, error } = await sb
+    const { data, error } = await supabase
       .from("bot_commands")
-      .insert({ command, params, status: "pending", created_at: now, updated_at: now })
+      .insert({
+        command,
+        params,
+        status: "pending",
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      })
       .select("id")
       .single();
 
-    if (error) throw error;
+    if (error) {
+      console.error("[commands POST] Supabase insert error:", error.message);
+      return NextResponse.json(
+        { ok: false, error: `Error al encolar comando: ${error.message}` },
+        { status: 500 }
+      );
+    }
 
-    return NextResponse.json(
-      { ok: true, id: data.id, command, status: "pending" },
-      { headers: { "Cache-Control": "no-store" } }
-    );
+    return NextResponse.json({ ok: true, id: data.id });
 
-  } catch (e) {
-    console.error("[commands/POST] Error inesperado:", e?.message ?? e);
+  } catch (err) {
+    console.error("[commands POST] Unexpected error:", err.message);
     return NextResponse.json(
-      { ok: false, error: e?.message ?? "Error interno del servidor" },
+      { ok: false, error: `Error inesperado: ${err.message}` },
       { status: 500 }
     );
   }
@@ -105,59 +99,54 @@ export async function POST(req) {
 
 export async function GET(req) {
   try {
-    const { searchParams } = new URL(req.url);
-    const id     = searchParams.get("id");
-    const status = searchParams.get("status");
-
-    const sb = getSupabase();
-    if (!sb) {
-      console.error("[commands/GET] Supabase no disponible");
+    const supabase = getSupabase();
+    if (!supabase) {
       return NextResponse.json(
-        { ok: false, error: "Supabase no configurado" },
+        { error: "Supabase no disponible" },
         { status: 503 }
       );
     }
 
+    const { searchParams } = new URL(req.url);
+    const id     = searchParams.get("id");
+    const status = searchParams.get("status");
+
     if (id) {
-      const { data, error } = await sb
+      const { data, error } = await supabase
         .from("bot_commands")
-        .select("*")
+        .select("id, command, status, result, created_at, updated_at")
         .eq("id", id)
         .single();
-      if (error) throw error;
-      return NextResponse.json(data, { headers: { "Cache-Control": "no-store" } });
+
+      if (error) {
+        return NextResponse.json({ error: error.message }, { status: 404 });
+      }
+      return NextResponse.json(data);
     }
 
     if (status) {
-      const { data, error } = await sb
+      const { data, error } = await supabase
         .from("bot_commands")
-        .select("*")
+        .select("id, command, status, result, created_at, updated_at")
         .eq("status", status)
         .order("created_at", { ascending: false })
         .limit(20);
-      if (error) throw error;
-      return NextResponse.json(
-        { commands: data || [] },
-        { headers: { "Cache-Control": "no-store" } }
-      );
+
+      if (error) {
+        return NextResponse.json({ error: error.message }, { status: 500 });
+      }
+      return NextResponse.json({ commands: data });
     }
 
-    // Sin filtros → últimos 10 comandos
-    const { data, error } = await sb
-      .from("bot_commands")
-      .select("*")
-      .order("created_at", { ascending: false })
-      .limit(10);
-    if (error) throw error;
     return NextResponse.json(
-      { commands: data || [] },
-      { headers: { "Cache-Control": "no-store" } }
+      { error: "Parámetro requerido: ?id=X o ?status=Y" },
+      { status: 400 }
     );
 
-  } catch (e) {
-    console.error("[commands/GET] Error:", e?.message ?? e);
+  } catch (err) {
+    console.error("[commands GET] Unexpected error:", err.message);
     return NextResponse.json(
-      { ok: false, error: e?.message ?? "Error interno del servidor" },
+      { error: `Error inesperado: ${err.message}` },
       { status: 500 }
     );
   }
