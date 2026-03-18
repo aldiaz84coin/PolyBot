@@ -1,6 +1,12 @@
 """
 monitor.py — Loop principal del bot: ventana horaria, stop loss, resolución
 
+v10.5 — notify_stop_loss enriquecida con desglose completo de la operación:
+  - Precio y total de compra (entry_odds × tokens × stake)
+  - Precio y total de venta (exit_token_price × tokens)
+  - Resultado neto en USD y %
+  - Condición exacta que disparó el SL (token entry→exit, pérdida vs umbral)
+
 v10.4 — FIX KeyError 'name' + corrección de API evaluate / execute_order / notify
   - Bloque de evaluación de señal completamente reescrito con la API correcta:
     · evaluate(price, target, mins_left, cfg)  ← elimina active_window["name"]
@@ -224,10 +230,10 @@ def _load_historical_stats(csv_path: str) -> dict:
                 elif res == "STOP": stops  += 1
         total = wins + losses + stops
         return {
-            "wins":     wins,
-            "losses":   losses,
-            "stops":    stops,
-            "total":    total,
+            "wins":      wins,
+            "losses":    losses,
+            "stops":     stops,
+            "total":     total,
             "pnl_total": round(pnl_total, 2),
             "invested":  round(invested_total, 2),
             "win_rate":  round(wins / (wins + losses) * 100, 1) if (wins + losses) > 0 else 0,
@@ -521,16 +527,17 @@ def run(cfg: dict):
                     target_retries += 1
                     if target_retries == 1:
                         notify_target_failed(cfg, cur_hour)
-                    logger.warning(
-                        f"[MONITOR] ⚠ Target no disponible "
-                        f"(intento {target_retries}/{MAX_TARGET_RETRIES})"
-                    )
                     time.sleep(TARGET_RETRY_WAIT)
 
             if not target:
                 logger.error("[MONITOR] ❌ Target no disponible tras reintentos — ciclo siguiente")
                 time.sleep(interval)
                 continue
+
+            new_target = get_open_1h_binance()
+            if new_target and abs((new_target - target) / target) > 0.001:
+                notify_target_change(cfg, target, new_target, mins_left)
+                target = new_target
 
             _log_cycle(price, target, mins_left, ops_hoy, max_ops)
 
@@ -602,7 +609,14 @@ def run(cfg: dict):
                         hist_stats = _load_historical_stats(csv_path)
                         _log_accumulated_stats(hist_stats, label="TRAS STOP_LOSS")
 
-                        notify_stop_loss(cfg, active_bet, price, pnl_usd, simulated=sim_)
+                        # v10.5: desglose completo compra/venta/condición SL
+                        notify_stop_loss(
+                            cfg, active_bet, price, pnl_usd,
+                            pnl_pct          = pnl_pct,
+                            exit_token_price = exit_token_price,
+                            stop_pct         = stop_pct,
+                            simulated        = sim_,
+                        )
                         sign_s = "+" if session_pnl >= 0 else ""
                         logger.info(
                             f"[MONITOR] {'[SIMULADO] ' if sim_ else ''}🛑 STOP LOSS — "
@@ -623,7 +637,6 @@ def run(cfg: dict):
                 dir_        = active_bet.get("direction", "")
 
                 mkt_  = active_bet.get("market")
-
                 # FIX v10.3 — tokens es lista: convertir a dict por outcome
                 tokens_mkt = _tokens_to_dict(mkt_.get("tokens", {})) if mkt_ else {}
                 real_exit_token_id = (
@@ -803,7 +816,7 @@ def run(cfg: dict):
                             "odds":        entry_odds,
                             "tokens":      tokens_bought,
                             "market":      market,
-                            "market_slug": slug or "",
+                            "market_slug": slug,
                             "simulated":   result_order.get("simulated", False),
                             "ts_entrada":  datetime.now(timezone.utc).isoformat(),
                         }
