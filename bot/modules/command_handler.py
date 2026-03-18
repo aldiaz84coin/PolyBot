@@ -1,5 +1,11 @@
 """
-command_handler.py — v1.1  (importaciones relativas — bot/modules/)
+command_handler.py — v1.2  (importaciones relativas — bot/modules/)
+
+Cambios v1.2:
+  - FIX CRÍTICO: _handle_check_clob y _handle_test_order leían market.get("clobTokenIds")
+    que NO existe en el dict devuelto por get_active_market(). El scanner devuelve un dict
+    procesado con clave "tokens" (lista de {"outcome","token_id","price",...}).
+    Ahora se extraen yes_token_id / no_token_id desde market["tokens"].
 
 Cambios v1.1:
   - FIX: get_active_btc_market → get_active_market  (nombre real en market_scanner)
@@ -57,27 +63,33 @@ def _handle_check_clob(cfg: dict) -> tuple[bool, dict]:
     1. Obtiene mercado activo via Gamma API
     2. Lee precio CLOB via midpoint endpoint
     Devuelve (success, result_dict)
+
+    FIX v1.2: get_active_market() devuelve dict procesado con clave "tokens" (lista),
+              NO "clobTokenIds". Extraer token_ids desde market["tokens"].
     """
     try:
         from modules.market_scanner import get_active_market, get_clob_price
 
         t0 = time.time()
 
-        # FIX v1.1: get_active_market() — sin argumentos
         market = get_active_market()
         if not market:
             return False, {"error": "No se encontró mercado BTC activo en Gamma API"}
 
-        market_slug  = market.get("slug", "—")
-        clob_ids     = market.get("clobTokenIds", [])
-        if not clob_ids:
+        market_slug = market.get("slug", "—")
+
+        # FIX v1.2: tokens es lista [{"outcome":"Yes","token_id":...}, ...]
+        tokens_list  = market.get("tokens", [])
+        yes_token    = next((t for t in tokens_list if t.get("outcome") == "Yes"), None)
+        no_token     = next((t for t in tokens_list if t.get("outcome") == "No"),  None)
+        yes_token_id = yes_token.get("token_id") if yes_token else None
+        no_token_id  = no_token.get("token_id")  if no_token  else None
+
+        if not yes_token_id:
             return False, {
-                "error": "Mercado sin clobTokenIds",
+                "error":       "Mercado sin token YES",
                 "market_slug": market_slug,
             }
-
-        yes_token_id = clob_ids[0]
-        no_token_id  = clob_ids[1] if len(clob_ids) > 1 else None
 
         yes_price = get_clob_price(yes_token_id)
         no_price  = get_clob_price(no_token_id) if no_token_id else None
@@ -119,10 +131,10 @@ def _handle_check_balance(cfg: dict) -> tuple[bool, dict]:
         }]
 
         # Tomar RPC de cfg si está definido, sino iterar la lista interna
-        cfg_rpc = cfg.get("polymarket", {}).get("rpc_url", "")
+        cfg_rpc  = cfg.get("polymarket", {}).get("rpc_url", "")
         rpc_list = ([cfg_rpc] + _POLYGON_RPCS) if cfg_rpc else _POLYGON_RPCS
 
-        addr_cs = Web3.to_checksum_address(funder_addr)
+        addr_cs    = Web3.to_checksum_address(funder_addr)
         last_error = "No se probó ningún RPC"
 
         for rpc_url in rpc_list:
@@ -161,6 +173,9 @@ def _handle_test_order(cfg: dict, params: dict) -> tuple[bool, dict]:
     """
     Coloca una orden de prueba real (SIMULATE_MODE ignorado).
     params: { direction: 'UP'|'DOWN', stake: float }
+
+    FIX v1.2: igual que _handle_check_clob — leer tokens desde market["tokens"],
+              no desde market["clobTokenIds"].
     """
     try:
         from modules.market_scanner import get_active_market, get_clob_price
@@ -179,18 +194,25 @@ def _handle_test_order(cfg: dict, params: dict) -> tuple[bool, dict]:
         test_cfg.setdefault("strategy", {})
         test_cfg["strategy"] = {**test_cfg["strategy"], "simulate_mode": False}
 
-        # FIX v1.1: get_active_market() — sin argumentos
         market = get_active_market()
         if not market:
             return False, {"error": "No se encontró mercado BTC activo"}
 
-        clob_ids = market.get("clobTokenIds", [])
-        if not clob_ids:
-            return False, {"error": "Mercado sin clobTokenIds"}
+        # FIX v1.2: tokens es lista [{"outcome":"Yes","token_id":...}, ...]
+        tokens_list = market.get("tokens", [])
+        yes_token   = next((t for t in tokens_list if t.get("outcome") == "Yes"), None)
+        no_token    = next((t for t in tokens_list if t.get("outcome") == "No"),  None)
 
-        direction  = Direction.UP if direction_str == "UP" else Direction.DOWN
-        token_idx  = 0 if direction == Direction.UP else 1
-        token_id   = clob_ids[token_idx] if len(clob_ids) > token_idx else clob_ids[0]
+        if not yes_token:
+            return False, {"error": "Mercado sin token YES"}
+
+        direction = Direction.UP if direction_str == "UP" else Direction.DOWN
+        token     = yes_token if direction == Direction.UP else (no_token or yes_token)
+        token_id  = token.get("token_id")
+
+        if not token_id:
+            return False, {"error": "token_id no encontrado en el mercado"}
+
         entry_odds = get_clob_price(token_id)
         if not entry_odds or entry_odds <= 0:
             return False, {"error": f"No se pudo obtener precio CLOB para token {token_id[:10]}…"}
