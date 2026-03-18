@@ -1,61 +1,48 @@
 /**
- * app/api/commands/route.js — v1.3
+ * app/api/commands/route.js — v1.4
  *
- * CAMBIOS v1.3:
+ * CAMBIOS v1.4 — FIX CRÍTICO: HTTP 401 en check_clob
+ *   - runCheckClobInline ya NO hace fetch HTTP a ${origin}/api/market.
+ *     Ese fetch server-to-server era bloqueado por Vercel con 401.
+ *   - Ahora importa fetchActiveMarket() desde lib/market-fetch.js y la
+ *     llama directamente, sin pasar por la capa HTTP.
+ *   - Eliminado parámetro requestUrl (ya no es necesario).
+ *
+ * CAMBIOS v1.3 (referencia):
  *   - check_clob ejecuta INLINE desde Vercel (sin bot, sin Supabase).
- *     Llama a /api/market del mismo deployment para obtener slug + precios CLOB.
- *     Retorna { ok: true, direct: true, status, result } inmediatamente.
- *   - check_balance y test_order siguen usando Supabase + polling (requieren bot).
- *
- * CAMBIOS v1.2:
- *   - export const dynamic = "force-dynamic" para evitar caché en GET
- *   - Logs explícitos en cada método para debug en Vercel
+ *   - check_balance y test_order siguen usando Supabase + polling.
  *
  * POST /api/commands  { command, params }
  *   check_clob    → { ok, direct: true, status, result }   (sin bot)
  *   check_balance → { ok, id }                             (requiere bot)
  *   test_order    → { ok, id }                             (requiere bot)
  *
- * GET /api/commands?id=123        → { id, command, status, result }
+ * GET /api/commands?id=123         → { id, command, status, result }
  * GET /api/commands?status=pending → { commands: [...] }
  */
 
-import { NextResponse } from "next/server";
-import { getSupabase }  from "../../../lib/supabase";
+import { NextResponse }       from "next/server";
+import { getSupabase }        from "../../../lib/supabase";
+import { fetchActiveMarket }  from "../../../lib/market-fetch";
 
 export const dynamic = "force-dynamic";
 
 const VALID_COMMANDS = ["check_clob", "check_balance", "test_order"];
 
-// ── check_clob inline — ejecutado directamente en Vercel ─────────────────
-// Llama a /api/market (mismo deployment) para obtener el mercado activo y
-// precios CLOB sin depender del bot de Railway.
+// ── check_clob inline — sin llamada HTTP interna ──────────────────────────
+// Llama fetchActiveMarket() directamente (Gamma + CLOB) sin hacer fetch
+// a ${origin}/api/market, evitando el 401 de Vercel en llamadas internas.
 
-async function runCheckClobInline(requestUrl) {
+async function runCheckClobInline() {
   const t0 = Date.now();
   try {
-    // Derivar origin del request para evitar hardcodear la URL del deployment.
-    const { origin } = new URL(requestUrl);
-    const marketRes = await fetch(`${origin}/api/market`, {
-      cache: "no-store",
-      signal: AbortSignal.timeout(8_000),
-    });
-
-    if (!marketRes.ok) {
-      return {
-        success:    false,
-        error:      `HTTP ${marketRes.status} al llamar /api/market`,
-        latency_ms: Date.now() - t0,
-      };
-    }
-
-    const mData = await marketRes.json();
+    const mData = await fetchActiveMarket();
 
     if (!mData.active || !mData.market) {
       return {
-        success:    false,
-        error:      mData.error ?? "Mercado BTC no encontrado en Gamma",
-        latency_ms: Date.now() - t0,
+        success:     false,
+        error:       mData.error || "Mercado BTC no encontrado en Gamma",
+        latency_ms:  Date.now() - t0,
         slugs_tried: mData.slugs_tried ?? [],
       };
     }
@@ -64,8 +51,8 @@ async function runCheckClobInline(requestUrl) {
     return {
       success:     true,
       market_slug: m.slug,
-      yes_price:   m.tokens?.yes?.price   ?? null,
-      no_price:    m.tokens?.no?.price    ?? null,
+      yes_price:   m.tokens?.yes?.price        ?? null,
+      no_price:    m.tokens?.no?.price         ?? null,
       yes_source:  m.tokens?.yes?.price_source ?? null,
       no_source:   m.tokens?.no?.price_source  ?? null,
       latency_ms:  Date.now() - t0,
@@ -73,7 +60,7 @@ async function runCheckClobInline(requestUrl) {
   } catch (e) {
     return {
       success:    false,
-      error:      e.message ?? "Error desconocido en check_clob inline",
+      error:      e.message || "Error desconocido en check_clob",
       latency_ms: Date.now() - t0,
     };
   }
@@ -104,9 +91,9 @@ export async function POST(req) {
 
     // ── check_clob: ejecución inline, sin bot, sin Supabase ──────────────
     if (command === "check_clob") {
-      console.log("[commands POST] check_clob → ejecutando inline");
-      const result = await runCheckClobInline(req.url);
-      console.log("[commands POST] check_clob inline result:", result);
+      console.log("[commands POST] check_clob → ejecutando inline (v1.4, sin HTTP interno)");
+      const result = await runCheckClobInline();
+      console.log("[commands POST] check_clob result:", JSON.stringify(result));
       return NextResponse.json({
         ok:     true,
         direct: true,
@@ -165,7 +152,7 @@ export async function POST(req) {
     return NextResponse.json({ ok: true, id: data.id, command, status: "pending" });
 
   } catch (err) {
-    console.error("[commands POST] Unexpected error:", err.message);
+    console.error("[commands POST] Error inesperado:", err.message);
     return NextResponse.json(
       { ok: false, error: `Error inesperado: ${err.message}` },
       { status: 500 }
@@ -237,7 +224,7 @@ export async function GET(req) {
     );
 
   } catch (err) {
-    console.error("[commands GET] Unexpected error:", err.message);
+    console.error("[commands GET] Error:", err.message);
     return NextResponse.json(
       { ok: false, error: `Error inesperado: ${err.message}` },
       { status: 500 }
