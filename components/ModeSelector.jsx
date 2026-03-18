@@ -1,54 +1,41 @@
+"use client";
 /**
- * components/ModeSelector.jsx — v1.2
+ * components/ModeSelector.jsx — v2.1
  *
- * CAMBIOS v1.2:
- *   - FIX: el bloque de resultado del balance ahora muestra correctamente
- *     los campos "usdc" y "pol" que devuelve el backend v1.3.
- *   - NUEVO: sección de diagnóstico RPC debajo del saldo: muestra todos los
- *     RPCs intentados con su latencia y estado (✓/✗), para identificar los
- *     más rápidos y reordenarlos en _POLYGON_RPCS.
+ * CAMBIOS v2.1 — check_clob DIRECTO:
+ *   runClobCheck detecta respuesta directa (data.direct === true) y aplica
+ *   el resultado inmediatamente sin iniciar polling. check_balance y
+ *   test_order siguen usando el poller como antes.
  *
- * CAMBIOS v1.1:
- *   - Guard res.ok antes de res.json() en runClobCheck, runBalanceCheck y
- *     runTestOrder: evita el crash "Unexpected token '<'" cuando el servidor
- *     devuelve HTML (500/404) en lugar de JSON.
- *   - Helper safeJson() centraliza la comprobación en los tres handlers.
- *
- * Panel completo para:
- *  1. Mostrar modo actual (SIMULADO / REAL) leído desde Supabase vía /api/config
- *  2. Cambiar de modo (escribir en Supabase → el bot lo recarga en ~60s)
- *  3. Pantalla de pre-vuelo al pasar a REAL:
- *       - Check CLOB connectivity  (comando check_clob → bot)
- *       - Check saldo USDC         (comando check_balance → bot)
- *       - Orden de prueba manual   (comando test_order → bot, opcional)
- *       - Confirmación de activación
+ * CAMBIOS v2.0 — Preflight screen para cambio a modo real.
+ * CAMBIOS v1.1 — safeJson con guard res.ok.
  */
 
-"use client";
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 
-// ── Helpers visuales ──────────────────────────────────────────────────────
+// ── Estilos ───────────────────────────────────────────────────────────────
 
 const S = {
-  font: { fontFamily: "var(--font-mono, 'JetBrains Mono', monospace)" },
+  font: {
+    fontFamily: "'SF Mono', 'Fira Code', monospace",
+    color: "#c8c8d8",
+  },
   badge: (mode) => ({
     display: "inline-flex", alignItems: "center", gap: 6,
+    fontSize: 11, fontWeight: 700, letterSpacing: "0.1em",
     padding: "4px 12px", borderRadius: 3,
-    fontSize: 11, fontWeight: 700, letterSpacing: "0.14em",
-    background: mode === "real"
-      ? "rgba(255, 68, 102, 0.12)"
-      : "rgba(0, 102, 255, 0.10)",
-    border: `1px solid ${mode === "real" ? "rgba(255,68,102,0.4)" : "rgba(0,102,255,0.3)"}`,
-    color: mode === "real" ? "#ff4466" : "#4488ff",
+    background: mode === "real" ? "rgba(255,68,102,0.1)" : "rgba(68,136,255,0.1)",
+    border:     mode === "real" ? "1px solid rgba(255,68,102,0.3)" : "1px solid rgba(68,136,255,0.3)",
+    color:      mode === "real" ? "#ff4466" : "#4488ff",
   }),
   dot: (mode) => ({
-    width: 7, height: 7, borderRadius: "50%",
+    width: 6, height: 6, borderRadius: "50%",
     background: mode === "real" ? "#ff4466" : "#4488ff",
-    animation: "pulse 2s infinite",
+    animation: mode === "real" ? "pulse 1.5s infinite" : "none",
   }),
   btn: (variant = "default", disabled = false) => ({
-    padding: "7px 18px", borderRadius: 3,
-    fontSize: 10, letterSpacing: "0.12em", fontWeight: 700,
+    padding: "7px 14px", borderRadius: 3,
+    fontSize: 10, letterSpacing: "0.1em",
     cursor: disabled ? "not-allowed" : "pointer",
     opacity: disabled ? 0.4 : 1,
     border: "1px solid",
@@ -63,7 +50,8 @@ const S = {
   col: { display: "flex", flexDirection: "column", gap: 12 },
 };
 
-// ── v1.1: helper para fetch → JSON con guard res.ok ───────────────────────
+// ── Helpers ───────────────────────────────────────────────────────────────
+
 async function safeJson(res) {
   if (!res.ok) {
     let body = "";
@@ -75,14 +63,14 @@ async function safeJson(res) {
   return res.json();
 }
 
-// ── CheckChip ────────────────────────────────────────────────────────────
+// ── CheckChip ─────────────────────────────────────────────────────────────
 
 function CheckChip({ status }) {
   const map = {
-    idle:    { color: "#333",     label: "—"      },
-    loading: { color: "#4488ff",  label: "..."     },
-    ok:      { color: "#00ff88",  label: "✓ OK"   },
-    error:   { color: "#ff4466",  label: "✗ ERROR" },
+    idle:    { color: "#333",    label: "—"       },
+    loading: { color: "#4488ff", label: "..."      },
+    ok:      { color: "#00ff88", label: "✓ OK"    },
+    error:   { color: "#ff4466", label: "✗ ERROR"  },
   };
   const { color, label } = map[status] || map.idle;
   return (
@@ -98,6 +86,7 @@ function CheckChip({ status }) {
 }
 
 // ── useCommandPoller ──────────────────────────────────────────────────────
+// Usado solo para check_balance y test_order (pasan por el bot).
 
 function useCommandPoller() {
   const timerRef = useRef(null);
@@ -180,7 +169,7 @@ function PreflightScreen({ onCancel, onConfirm }) {
 
   const canConfirm = clobStatus === "ok" && confirmText === "REAL";
 
-  // ── Check CLOB ───────────────────────────────────────────────────────────
+  // ── Check CLOB — v2.1: ejecución directa, sin polling ────────────────────
   const runClobCheck = async () => {
     setClobStatus("loading"); setClobResult(null);
     try {
@@ -189,20 +178,32 @@ function PreflightScreen({ onCancel, onConfirm }) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ command: "check_clob" }),
       });
-      const { ok, id, error } = await safeJson(res);
-      if (!ok) throw new Error(error || "Error enviando comando");
-      poll(id, (data) => {
-        const ok2 = data.status === "done" && data.result?.success;
-        setClobStatus(ok2 ? "ok" : "error");
+      const data = await safeJson(res);
+      if (!data.ok) throw new Error(data.error || "Error enviando comando");
+
+      // Respuesta directa — la API route ejecutó check_clob inline, sin bot.
+      if (data.direct) {
+        const ok = data.status === "done" && data.result?.success;
+        setClobStatus(ok ? "ok" : "error");
         setClobResult(data.result);
-      });
+        return;
+      }
+
+      // Fallback legacy: si por alguna razón llega id (no debería pasar para check_clob).
+      if (data.id) {
+        poll(data.id, (pollData) => {
+          const ok = pollData.status === "done" && pollData.result?.success;
+          setClobStatus(ok ? "ok" : "error");
+          setClobResult(pollData.result);
+        });
+      }
     } catch (e) {
       setClobStatus("error");
       setClobResult({ error: e.message });
     }
   };
 
-  // ── Check Balance ────────────────────────────────────────────────────────
+  // ── Check Balance — pasa por el bot (necesita wallet) ────────────────────
   const runBalanceCheck = async () => {
     setBalanceStatus("loading"); setBalanceResult(null);
     try {
@@ -224,7 +225,7 @@ function PreflightScreen({ onCancel, onConfirm }) {
     }
   };
 
-  // ── Orden de prueba ───────────────────────────────────────────────────────
+  // ── Orden de prueba — pasa por el bot (necesita L2 auth) ─────────────────
   const runTestOrder = async () => {
     setTestStatus("loading"); setTestResult(null);
     const stake = parseFloat(testStake);
@@ -290,7 +291,7 @@ function PreflightScreen({ onCancel, onConfirm }) {
           <PreflightStep
             num={1}
             title="Conexión CLOB"
-            description="Verifica que el bot puede conectarse a clob.polymarket.com, autenticarse con Level 2 y leer precios de mercado."
+            description="Verifica que el mercado BTC está activo en Polymarket y los precios CLOB están disponibles. Ejecutado directamente desde Vercel — sin depender del bot."
             chipStatus={clobStatus}
           >
             <div style={S.row}>
@@ -308,24 +309,16 @@ function PreflightScreen({ onCancel, onConfirm }) {
                 background: "#060610", border: "1px solid #1a1a2a",
                 borderRadius: 3, fontSize: 9, color: "#666", lineHeight: 1.8,
               }}>
-                {clobResult.error
-                  ? <span style={{ color: "#ff4466" }}>Error: {clobResult.error}</span>
-                  : (
-                    <>
-                      <div>Latencia CLOB: <b style={{ color: "#4488ff" }}>{clobResult.latency_ms}ms</b></div>
-                      {clobResult.market_slug && (
-                        <div>Mercado activo: <b style={{ color: "#888" }}>{clobResult.market_slug}</b></div>
-                      )}
-                      {clobResult.yes_price != null && (
-                        <div>
-                          Precio YES: <b style={{ color: "#00ff88" }}>{(clobResult.yes_price * 100).toFixed(1)}¢</b>
-                          {" · "}
-                          NO: <b style={{ color: "#ff4466" }}>{(clobResult.no_price * 100).toFixed(1)}¢</b>
-                        </div>
-                      )}
-                    </>
-                  )
-                }
+                {clobResult.error ? (
+                  <span style={{ color: "#ff4466" }}>✗ {clobResult.error}</span>
+                ) : (
+                  <>
+                    <div>Mercado: <span style={{ color: "#888" }}>{clobResult.market_slug}</span></div>
+                    <div>YES: <span style={{ color: "#00ff88" }}>{clobResult.yes_price != null ? (clobResult.yes_price * 100).toFixed(1) + "¢" : "—"}</span></div>
+                    <div>NO:  <span style={{ color: "#ff4466" }}>{clobResult.no_price  != null ? (clobResult.no_price  * 100).toFixed(1) + "¢" : "—"}</span></div>
+                    <div>Latencia: <span style={{ color: "#888" }}>{clobResult.latency_ms}ms</span></div>
+                  </>
+                )}
               </div>
             )}
           </PreflightStep>
@@ -333,8 +326,8 @@ function PreflightScreen({ onCancel, onConfirm }) {
           {/* PASO 2: Balance */}
           <PreflightStep
             num={2}
-            title="Saldo USDC"
-            description="Consulta el balance de USDC disponible en la cartera de la cuenta de trading."
+            title="Balance de cartera"
+            description="Consulta el saldo USDC y POL en tu cartera de Polygon. Requiere que el bot esté activo en Railway."
             chipStatus={balanceStatus}
           >
             <div style={S.row}>
@@ -343,7 +336,7 @@ function PreflightScreen({ onCancel, onConfirm }) {
                 disabled={balanceStatus === "loading"}
                 style={S.btn("blue", balanceStatus === "loading")}
               >
-                {balanceStatus === "loading" ? "CONSULTANDO…" : "CONSULTAR SALDO"}
+                {balanceStatus === "loading" ? "CONSULTANDO…" : "CONSULTAR BALANCE"}
               </button>
             </div>
             {balanceResult && (
@@ -352,130 +345,61 @@ function PreflightScreen({ onCancel, onConfirm }) {
                 background: "#060610", border: "1px solid #1a1a2a",
                 borderRadius: 3, fontSize: 9, color: "#666", lineHeight: 1.8,
               }}>
-                {balanceResult.error
-                  ? (
-                    <>
-                      <span style={{ color: "#ff4466" }}>Error: {balanceResult.error}</span>
-                      {/* Diagnóstico de RPCs incluso en error */}
-                      {balanceResult.rpc_attempts?.length > 0 && (
-                        <div style={{ marginTop: 6, borderTop: "1px solid #111", paddingTop: 5 }}>
-                          <div style={{ color: "#333", marginBottom: 3, letterSpacing: "0.1em" }}>INTENTOS RPC:</div>
-                          {balanceResult.rpc_attempts.map((a, i) => (
-                            <div key={i} style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
-                              <span style={{
-                                color: a.ok ? "#00ff88" : "#ff4466",
-                                overflow: "hidden", textOverflow: "ellipsis",
-                                whiteSpace: "nowrap", maxWidth: 260,
-                              }}>
-                                {a.ok ? "✓" : "✗"} {a.rpc}
-                              </span>
-                              <span style={{ color: a.ok ? "#4488ff" : "#333", flexShrink: 0 }}>
-                                {a.latency_ms}ms
-                              </span>
-                            </div>
-                          ))}
-                        </div>
-                      )}
-                    </>
-                  )
-                  : (
-                    <>
-                      {/* v1.2 FIX: campos "usdc" y "pol" (backend v1.3) */}
-                      {balanceResult.usdc != null && (
-                        <div>USDC: <b style={{ color: "#00ff88" }}>${balanceResult.usdc.toFixed(2)}</b></div>
-                      )}
-                      {balanceResult.pol != null && (
-                        <div>POL (gas): <b style={{ color: "#888" }}>{balanceResult.pol.toFixed(4)}</b></div>
-                      )}
-                      {balanceResult.rpc_used && (
-                        <div style={{ marginTop: 2 }}>
-                          RPC: <b style={{ color: "#4488ff" }}>
-                            {balanceResult.rpc_used.replace("https://", "")}
-                          </b>
-                          {balanceResult.rpc_latency_ms != null && (
-                            <span style={{ color: "#333" }}> · {balanceResult.rpc_latency_ms}ms</span>
-                          )}
-                        </div>
-                      )}
-                      {/* v1.2 NUEVO: diagnóstico completo de RPCs */}
-                      {balanceResult.rpc_attempts?.length > 1 && (
-                        <div style={{ marginTop: 6, borderTop: "1px solid #111", paddingTop: 5 }}>
-                          <div style={{ color: "#333", marginBottom: 3, letterSpacing: "0.1em" }}>
-                            TODOS LOS RPCs ({balanceResult.rpc_attempts.filter(a => a.ok).length}/{balanceResult.rpc_attempts.length} OK):
-                          </div>
-                          {balanceResult.rpc_attempts.map((a, i) => (
-                            <div key={i} style={{
-                              display: "flex", justifyContent: "space-between", gap: 8,
-                              opacity: a.ok ? 1 : 0.5,
-                            }}>
-                              <span style={{
-                                color: a.ok ? "#00ff88" : "#ff4466",
-                                overflow: "hidden", textOverflow: "ellipsis",
-                                whiteSpace: "nowrap", maxWidth: 260,
-                                fontSize: 8,
-                              }}>
-                                {a.ok ? "✓" : "✗"} {a.rpc.replace("https://", "")}
-                              </span>
-                              <span style={{ color: a.ok ? "#4488ff" : "#2a2a3a", flexShrink: 0, fontSize: 8 }}>
-                                {a.latency_ms}ms
-                                {!a.ok && a.error && (
-                                  <span style={{ color: "#333" }}> — {a.error.slice(0, 30)}</span>
-                                )}
-                              </span>
-                            </div>
-                          ))}
-                        </div>
-                      )}
-                    </>
-                  )
-                }
+                {balanceResult.error ? (
+                  <span style={{ color: "#ff4466" }}>✗ {balanceResult.error}</span>
+                ) : (
+                  <>
+                    <div>USDC: <span style={{ color: "#00ff88" }}>${parseFloat(balanceResult.usdc || 0).toFixed(2)}</span></div>
+                    <div>POL:  <span style={{ color: "#888" }}>{parseFloat(balanceResult.pol || 0).toFixed(4)}</span></div>
+                    {balanceResult.rpc_attempts && (
+                      <div style={{ color: "#444" }}>RPC: {balanceResult.rpc_attempts}</div>
+                    )}
+                  </>
+                )}
               </div>
             )}
           </PreflightStep>
 
-          {/* PASO 3: Orden de prueba (opcional) */}
+          {/* PASO 3: Orden de prueba */}
           <PreflightStep
             num={3}
             title="Orden de prueba (opcional)"
-            description="Ejecuta una orden REAL mínima para confirmar que las credenciales Level 2 y el saldo son suficientes. Esta orden USA FONDOS REALES."
+            description="Ejecuta una orden real mínima para verificar L2 auth y conectividad completa con el CLOB. Usa fondos reales."
             chipStatus={testStatus}
           >
-            <div style={{ ...S.row, flexWrap: "wrap", gap: 8, marginBottom: 8 }}>
-              {["UP", "DOWN"].map(d => (
-                <button key={d} onClick={() => setTestDir(d)} style={{
-                  ...S.btn(testDir === d ? (d === "UP" ? "primary" : "danger") : "default"),
-                  padding: "5px 14px",
-                }}>
-                  {d === "UP" ? "▲ UP" : "▼ DOWN"}
-                </button>
-              ))}
-              <div style={{ ...S.row, gap: 4 }}>
-                <span style={{ fontSize: 9, color: "#444" }}>STAKE:</span>
-                <input
-                  type="number" min="0.5" max="10" step="0.5"
-                  value={testStake}
-                  onChange={e => setTestStake(e.target.value)}
-                  style={{
-                    width: 60, padding: "4px 8px",
-                    background: "#07070f", border: "1px solid #2a2a3a",
-                    color: "#888", fontSize: 10, borderRadius: 3,
-                    fontFamily: "inherit",
-                  }}
-                />
-                <span style={{ fontSize: 9, color: "#444" }}>USDC</span>
-              </div>
-            </div>
             <div style={S.row}>
+              <select
+                value={testDir}
+                onChange={e => setTestDir(e.target.value)}
+                style={{
+                  background: "#060610", border: "1px solid #2a2a3a",
+                  color: "#888", fontSize: 10, padding: "6px 8px",
+                  borderRadius: 3, fontFamily: "inherit",
+                }}
+              >
+                <option value="UP">UP</option>
+                <option value="DOWN">DOWN</option>
+              </select>
+              <input
+                type="number"
+                value={testStake}
+                onChange={e => setTestStake(e.target.value)}
+                placeholder="1.00"
+                min="0.5" max="10" step="0.5"
+                style={{
+                  width: 80, background: "#060610",
+                  border: "1px solid #2a2a3a", color: "#888",
+                  fontSize: 10, padding: "6px 8px",
+                  borderRadius: 3, fontFamily: "inherit",
+                }}
+              />
               <button
                 onClick={runTestOrder}
-                disabled={testStatus === "loading" || clobStatus !== "ok"}
-                style={S.btn("danger", testStatus === "loading" || clobStatus !== "ok")}
+                disabled={testStatus === "loading"}
+                style={S.btn("danger", testStatus === "loading")}
               >
-                {testStatus === "loading" ? "EJECUTANDO…" : "EJECUTAR ORDEN PRUEBA"}
+                {testStatus === "loading" ? "EJECUTANDO…" : "TEST ORDER"}
               </button>
-              {clobStatus !== "ok" && (
-                <span style={{ fontSize: 9, color: "#444" }}>(requiere paso 1 OK)</span>
-              )}
             </div>
             {testResult && (
               <div style={{
@@ -483,48 +407,42 @@ function PreflightScreen({ onCancel, onConfirm }) {
                 background: "#060610", border: "1px solid #1a1a2a",
                 borderRadius: 3, fontSize: 9, color: "#666", lineHeight: 1.8,
               }}>
-                {testResult.error
-                  ? <span style={{ color: "#ff4466" }}>Error: {testResult.error}</span>
-                  : (
-                    <>
-                      <div>Order ID: <b style={{ color: "#4488ff" }}>{testResult.order_id || "—"}</b></div>
-                      <div>Status: <b style={{ color: "#00ff88" }}>{testResult.status || "—"}</b></div>
-                      {testResult.odds != null && (
-                        <div>Odds ejecutadas: <b style={{ color: "#888" }}>{(testResult.odds * 100).toFixed(1)}¢</b></div>
-                      )}
-                    </>
-                  )
-                }
+                {testResult.error ? (
+                  <span style={{ color: "#ff4466" }}>✗ {testResult.error}</span>
+                ) : (
+                  <>
+                    <div>Order ID: <span style={{ color: "#888" }}>{testResult.order_id}</span></div>
+                    <div>Status:   <span style={{ color: "#888" }}>{testResult.status}</span></div>
+                    <div>Odds:     <span style={{ color: "#00ff88" }}>{testResult.odds != null ? (testResult.odds * 100).toFixed(1) + "¢" : "—"}</span></div>
+                  </>
+                )}
               </div>
             )}
           </PreflightStep>
 
-          {/* PASO 4: Confirmación */}
+          {/* PASO 4: Confirmar */}
           <PreflightStep
             num={4}
             title="Confirmar activación"
-            description={`Escribe "REAL" para confirmar. El bot cambiará de modo en el próximo ciclo de polling (~60s).${clobStatus !== "ok" ? " ⚠ Requiere completar el paso 1." : ""}`}
+            description='Escribe "REAL" para confirmar que entiendes que el bot usará fondos reales.'
             chipStatus={canConfirm ? "ok" : "idle"}
           >
-            <div style={S.col}>
-              <div style={S.row}>
-                <input
-                  type="text"
-                  placeholder='Escribe "REAL"'
-                  value={confirmText}
-                  onChange={e => setConfirmText(e.target.value.toUpperCase())}
-                  disabled={clobStatus !== "ok"}
-                  style={{
-                    padding: "6px 12px", borderRadius: 3,
-                    background: "#07070f",
-                    border: `1px solid ${canConfirm ? "rgba(0,255,136,0.4)" : "#2a2a3a"}`,
-                    color: canConfirm ? "#00ff88" : "#555",
-                    fontSize: 11, width: 140,
-                    fontFamily: "inherit",
-                    opacity: clobStatus !== "ok" ? 0.4 : 1,
-                  }}
-                />
-              </div>
+            <div style={S.row}>
+              <input
+                type="text"
+                value={confirmText}
+                onChange={e => setConfirmText(e.target.value.toUpperCase())}
+                placeholder='Escribe "REAL"'
+                style={{
+                  background: "#060610",
+                  border: `1px solid ${canConfirm ? "rgba(0,255,136,0.4)" : "#2a2a3a"}`,
+                  color: canConfirm ? "#00ff88" : "#555",
+                  fontSize: 11, width: 140,
+                  padding: "6px 10px", borderRadius: 3,
+                  fontFamily: "inherit",
+                  opacity: clobStatus !== "ok" ? 0.4 : 1,
+                }}
+              />
               <button
                 onClick={() => { cancel(); onConfirm(); }}
                 disabled={!canConfirm}
