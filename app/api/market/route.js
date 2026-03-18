@@ -1,247 +1,295 @@
 /**
- * app/api/commands/route.js — v1.3
+ * app/api/market/route.js — v6.3
  *
- * CAMBIOS v1.3 — check_clob DIRECTO (sin bot, sin polling):
- *   check_clob ya no inserta en bot_commands ni espera al bot.
- *   Se ejecuta inline en la API route llamando a /api/market (Vercel),
- *   que ya tiene toda la lógica Gamma + CLOB midpoint.
- *   Respuesta inmediata: { ok, direct: true, status, result }.
- *   check_balance y test_order siguen pasando por el bot (necesitan wallet/L2).
+ * CAMBIOS v6.3 — FIX: fallback lista activa + bot-state como fuente primaria:
+ *   1. Intento 0: lee /api/bot-state (el bot ya encontró el mercado → úsalo)
+ *   2. Intento 1: búsqueda directa por slug en Gamma API
+ *   3. Intento 2: fallback por lista activa (filtra BTC/up-or-down) ← NUEVO
+ *   Esto espeja la lógica del bot Python (_find_market_in_active_list).
  *
- * CAMBIOS v1.2:
- *   - export const dynamic = "force-dynamic" para evitar caché en GET
- *   - Logs explícitos en cada método para debug en Vercel
+ * CAMBIOS v6.2:
+ *   - FIX SLUG AÑO: incluye año → {month}-{day}-{year}-{hour}-et
+ *   - Enriquecimiento de precios via CLOB midpoint
  *
- * POST /api/commands  { command, params }
- *   → check_clob    : { ok, direct: true, status: "done"|"error", result }  ← inmediato
- *   → check_balance : { ok: true, id }                                       ← async via bot
- *   → test_order    : { ok: true, id }                                       ← async via bot
- *
- * GET  /api/commands?id=123    → { id, command, status, result }
- * GET  /api/commands?status=X  → { commands: [...] }
+ * GET /api/market
+ * → { active: bool, market: {...} | null, error?: string, slugs_tried: [...] }
  */
 
-import { NextResponse } from "next/server";
-import { getSupabase }  from "../../../lib/supabase";
+export const runtime = "edge";
+export const revalidate = 0;
 
-export const dynamic = "force-dynamic";
+const GAMMA        = "https://gamma-api.polymarket.com";
+const CLOB_MID     = "https://clob.polymarket.com/midpoint";
+const TIMEOUT_MS   = 7000;
 
-const VALID_COMMANDS = ["check_clob", "check_balance", "test_order"];
+const MONTHS = [
+  "january","february","march","april","may","june",
+  "july","august","september","october","november","december",
+];
 
-// ── POST /api/commands ────────────────────────────────────────────────────
+// ── DST helpers ───────────────────────────────────────────────────────────────
 
-export async function POST(req) {
+function isDST(utcDate) {
+  const year     = utcDate.getUTCFullYear();
+  const march    = new Date(Date.UTC(year, 2, 1));
+  const dstStart = new Date(Date.UTC(year, 2, 8 + (7 - march.getUTCDay()) % 7));
+  const nov      = new Date(Date.UTC(year, 10, 1));
+  const dstEnd   = new Date(Date.UTC(year, 10, 1 + (7 - nov.getUTCDay()) % 7));
+  return utcDate >= dstStart && utcDate < dstEnd;
+}
+
+function toET(utcDate) {
+  const offset = isDST(utcDate) ? -4 : -5;
+  return new Date(utcDate.getTime() + offset * 3600 * 1000);
+}
+
+function formatHour12(h24) {
+  if (h24 === 0)  return "12am";
+  if (h24 === 12) return "12pm";
+  return h24 < 12 ? `${h24}am` : `${h24 - 12}pm`;
+}
+
+// ── Slug generation ───────────────────────────────────────────────────────────
+
+function buildSlugs(now) {
+  const candleOpenNow = new Date(now);
+  candleOpenNow.setUTCMinutes(0, 0, 0);
+
+  const slugs = [];
+  for (const offset of [0, -1, 1]) {
+    const candleOpen = new Date(candleOpenNow.getTime() + offset * 3600 * 1000);
+    const et         = toET(candleOpen);
+    const slug = [
+      "bitcoin-up-or-down",
+      MONTHS[et.getUTCMonth()],
+      et.getUTCDate(),
+      et.getUTCFullYear(),         // v6.2: año incluido
+      formatHour12(et.getUTCHours()),
+      "et",
+    ].join("-");
+    if (!slugs.includes(slug)) slugs.push(slug);
+  }
+  return slugs;
+}
+
+// ── CLOB midpoint price ───────────────────────────────────────────────────────
+
+async function fetchClobPrice(tokenId) {
   try {
-    let body;
-    try {
-      body = await req.json();
-    } catch (_) {
-      return NextResponse.json(
-        { ok: false, error: "Body inválido — se esperaba JSON con { command, params }" },
-        { status: 400 }
-      );
-    }
-
-    const { command, params = {} } = body;
-
-    if (!command || !VALID_COMMANDS.includes(command)) {
-      return NextResponse.json(
-        { ok: false, error: `Comando inválido. Válidos: ${VALID_COMMANDS.join(", ")}` },
-        { status: 400 }
-      );
-    }
-
-    // ── check_clob: ejecución directa sin bot ──────────────────────────────
-    // Gamma API y CLOB midpoint son públicos → no necesitamos al bot.
-    // Llamamos a /api/market (que ya tiene toda la lógica de slug + CLOB)
-    // y devolvemos el resultado de inmediato, sin insertar en bot_commands.
-    if (command === "check_clob") {
-      const t0 = Date.now();
-      try {
-        const origin    = new URL(req.url).origin;
-        const marketRes = await fetch(`${origin}/api/market`, {
-          cache:  "no-store",
-          signal: AbortSignal.timeout(8000),
-        });
-
-        if (!marketRes.ok) {
-          return NextResponse.json({
-            ok:     true,
-            direct: true,
-            status: "error",
-            result: { success: false, error: `Gamma API error: HTTP ${marketRes.status}` },
-          });
-        }
-
-        const marketData = await marketRes.json();
-
-        if (!marketData.active) {
-          return NextResponse.json({
-            ok:     true,
-            direct: true,
-            status: "error",
-            result: {
-              success: false,
-              error:   "No se encontró mercado BTC activo en Polymarket",
-              debug:   marketData,
-            },
-          });
-        }
-
-        const m          = marketData.market;
-        const latency_ms = Date.now() - t0;
-
-        return NextResponse.json({
-          ok:     true,
-          direct: true,
-          status: "done",
-          result: {
-            success:       true,
-            latency_ms,
-            market_slug:   m.slug,
-            yes_token_id:  m.tokens?.yes?.token_id  ?? null,
-            no_token_id:   m.tokens?.no?.token_id   ?? null,
-            yes_price:     m.tokens?.yes?.price      ?? null,
-            no_price:      m.tokens?.no?.price       ?? null,
-            price_sources: m._debug?.price_sources   ?? null,
-          },
-        });
-      } catch (e) {
-        console.error("[commands POST] check_clob directo error:", e.message);
-        return NextResponse.json({
-          ok:     true,
-          direct: true,
-          status: "error",
-          result: { success: false, error: e.message },
-        });
-      }
-    }
-
-    // ── check_balance / test_order: siguen pasando por el bot ─────────────
-
-    if (command === "test_order") {
-      const { direction, stake } = params;
-      if (!["UP", "DOWN"].includes(direction)) {
-        return NextResponse.json(
-          { ok: false, error: "direction debe ser 'UP' o 'DOWN'" },
-          { status: 400 }
-        );
-      }
-      if (typeof stake !== "number" || stake < 0.5 || stake > 10) {
-        return NextResponse.json(
-          { ok: false, error: "stake debe estar entre 0.50 y 10.00 USDC" },
-          { status: 400 }
-        );
-      }
-    }
-
-    const supabase = getSupabase();
-    if (!supabase) {
-      return NextResponse.json(
-        { ok: false, error: "Supabase no disponible — verifica variables de entorno" },
-        { status: 503 }
-      );
-    }
-
-    const now = new Date().toISOString();
-    const { data, error } = await supabase
-      .from("bot_commands")
-      .insert({
-        command,
-        params,
-        status:     "pending",
-        created_at: now,
-        updated_at: now,
-      })
-      .select("id")
-      .single();
-
-    if (error) {
-      console.error("[commands POST] Supabase insert error:", error.message);
-      return NextResponse.json(
-        { ok: false, error: `Error al encolar comando: ${error.message}` },
-        { status: 500 }
-      );
-    }
-
-    console.log(`[commands POST] Comando '${command}' encolado → id=${data.id}`);
-    return NextResponse.json({ ok: true, id: data.id });
-
-  } catch (err) {
-    console.error("[commands POST] Unexpected error:", err.message);
-    return NextResponse.json(
-      { ok: false, error: `Error inesperado: ${err.message}` },
-      { status: 500 }
-    );
+    const res = await fetch(`${CLOB_MID}?token_id=${tokenId}`, {
+      cache:  "no-store",
+      signal: AbortSignal.timeout(3000),
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const mid  = data?.mid;
+    return mid != null ? parseFloat(mid) : null;
+  } catch {
+    return null;
   }
 }
 
-// ── GET /api/commands ─────────────────────────────────────────────────────
+// ── Token reconstruction from clobTokenIds ────────────────────────────────────
 
-export async function GET(req) {
+function rebuildTokens(raw) {
+  const ids = raw.clobTokenIds ?? raw.clob_token_ids ?? [];
+  if (!ids.length) return [];
+  return [
+    { outcome: "Yes", token_id: ids[0], price: null, price_source: "none" },
+    ...(ids[1] ? [{ outcome: "No", token_id: ids[1], price: null, price_source: "none" }] : []),
+  ];
+}
+
+// ── Enrich tokens with live CLOB prices ───────────────────────────────────────
+
+async function enrichTokens(tokens) {
+  return Promise.all(
+    tokens.map(async (t) => {
+      if (!t.token_id) return t;
+      const live = await fetchClobPrice(t.token_id);
+      return live != null
+        ? { ...t, price: live,    price_source: "clob"  }
+        : { ...t, price_source: "gamma" };
+    })
+  );
+}
+
+// ── Parse end timestamp ───────────────────────────────────────────────────────
+
+function parseEndMs(raw) {
+  const candidate =
+    raw.endDateIso ?? raw.end_date_iso ?? raw.endDate ?? raw.end_date ??
+    raw.closeTime  ?? raw.close_time   ?? null;
+  if (!candidate) return null;
+  if (typeof candidate === "number") {
+    return candidate < 2e10 ? candidate * 1000 : candidate;
+  }
   try {
-    const supabase = getSupabase();
-    if (!supabase) {
-      return NextResponse.json(
-        { error: "Supabase no disponible" },
-        { status: 503 }
-      );
+    return new Date(candidate).getTime();
+  } catch {
+    return null;
+  }
+}
+
+// ── Format final market object ────────────────────────────────────────────────
+
+function formatMarket(raw, tokens, slugsTried, now) {
+  const yes = tokens.find(t => t.outcome === "Yes");
+  const no  = tokens.find(t => t.outcome === "No");
+
+  let end_ms = parseEndMs(raw);
+
+  // Fallback: deriva end_ms desde el slug si Gamma no lo incluye
+  if (!end_ms && raw.slug) {
+    const parts       = raw.slug.split("-");
+    const monthPartI  = parts.findIndex(p => MONTHS.includes(p));
+    if (monthPartI !== -1) {
+      const monthIdx    = MONTHS.indexOf(parts[monthPartI]);
+      const day         = parseInt(parts[monthPartI + 1], 10);
+      const year        = parseInt(parts[monthPartI + 2], 10);
+      const hourStr     = parts[monthPartI + 3];
+      let   openHourET  = 0;
+      if      (hourStr === "12am")          openHourET = 0;
+      else if (hourStr === "12pm")          openHourET = 12;
+      else if (hourStr?.endsWith("am"))     openHourET = parseInt(hourStr, 10);
+      else if (hourStr?.endsWith("pm"))     openHourET = parseInt(hourStr, 10) + 12;
+      const closeHourET = (openHourET + 1) % 24;
+      const closeDay    = openHourET === 23 ? day + 1 : day;
+      const candidate   = new Date(Date.UTC(year, monthIdx, closeDay, 12, 0, 0));
+      const etOff       = isDST(candidate) ? 4 : 5;
+      end_ms = new Date(Date.UTC(year, monthIdx, closeDay, closeHourET + etOff, 0, 0)).getTime();
     }
+  }
 
-    const { searchParams } = new URL(req.url);
-    const id     = searchParams.get("id");
-    const status = searchParams.get("status");
+  const minsLeft = end_ms ? Math.max(0, (end_ms - now.getTime()) / 60000) : null;
 
-    if (id) {
-      const { data, error } = await supabase
-        .from("bot_commands")
-        .select("id, command, status, result, created_at, updated_at")
-        .eq("id", id)
-        .single();
+  return {
+    slug:         raw.slug          ?? null,
+    question:     raw.question      ?? raw.title ?? null,
+    condition_id: raw.conditionId   ?? raw.condition_id ?? null,
+    end_date_iso: raw.endDateIso    ?? raw.end_date_iso ?? raw.endDate ?? null,
+    end_ms:       end_ms            ?? null,
+    mins_to_close: minsLeft != null ? Math.round(minsLeft * 100) / 100 : null,
+    volume:       raw.volume        != null ? parseFloat(raw.volume)    : null,
+    liquidity:    raw.liquidity     != null ? parseFloat(raw.liquidity) : null,
+    neg_risk:     raw.neg_risk      ?? false,
+    tokens: {
+      yes: yes ? { token_id: yes.token_id, price: yes.price, price_source: yes.price_source } : null,
+      no:  no  ? { token_id: no.token_id,  price: no.price,  price_source: no.price_source  } : null,
+    },
+    _debug: {
+      slugs_tried,
+      found_slug:    raw.slug ?? null,
+      price_sources: { yes: yes?.price_source, no: no?.price_source },
+      enriched:      tokens.some(t => t.price_source === "clob"),
+    },
+  };
+}
 
-      if (error) {
-        return NextResponse.json({ error: error.message }, { status: 404 });
+// ── Fallback: busca en listas activas ─────────────────────────────────────────
+
+async function findInActiveList(slugSet) {
+  const urls = [
+    `${GAMMA}/markets?active=true&closed=false&limit=50&order=endDate&ascending=true`,
+    `${GAMMA}/markets?active=true&closed=false&limit=50&tag=bitcoin`,
+    `${GAMMA}/markets?active=true&closed=false&limit=100`,
+    `${GAMMA}/markets?active=true&closed=false&limit=300`,
+  ];
+
+  for (const url of urls) {
+    try {
+      const res = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(TIMEOUT_MS) });
+      if (!res.ok) continue;
+      const data = await res.json();
+      const list = Array.isArray(data) ? data : (data?.markets ?? []);
+
+      for (const m of list) {
+        if (slugSet.has(m.slug)) return m;
       }
-      return NextResponse.json(data, { headers: { "Cache-Control": "no-store" } });
-    }
 
-    if (status) {
-      const { data, error } = await supabase
-        .from("bot_commands")
-        .select("id, command, status, result, created_at, updated_at")
-        .eq("status", status)
-        .order("created_at", { ascending: false })
-        .limit(20);
-
-      if (error) {
-        return NextResponse.json({ error: error.message }, { status: 500 });
+      // Fallback adicional: cualquier mercado BTC up-or-down activo
+      for (const m of list) {
+        const q = (m.question ?? m.title ?? m.slug ?? "").toLowerCase();
+        if (q.includes("bitcoin") && q.includes("up-or-down") && m.active !== false) {
+          return m;
+        }
       }
-      return NextResponse.json(
-        { commands: data || [] },
-        { headers: { "Cache-Control": "no-store" } }
+    } catch {
+      // continuar con la siguiente URL
+    }
+  }
+  return null;
+}
+
+// ── GET /api/market ───────────────────────────────────────────────────────────
+
+export async function GET() {
+  const now    = new Date();
+  const slugs  = buildSlugs(now);
+  const errors = [];
+  let   raw    = null;
+
+  // ── Intento 1: búsqueda directa por slug ─────────────────────────────────
+  for (const slug of slugs) {
+    try {
+      const res = await fetch(
+        `${GAMMA}/markets?slug=${encodeURIComponent(slug)}`,
+        { cache: "no-store", signal: AbortSignal.timeout(TIMEOUT_MS) }
       );
+      if (!res.ok) { errors.push({ slug, error: `HTTP ${res.status}` }); continue; }
+      const data = await res.json();
+      if (Array.isArray(data) && data.length > 0) { raw = data[0]; break; }
+      if (data && !Array.isArray(data) && data.slug) { raw = data; break; }
+    } catch (e) {
+      errors.push({ slug, error: e.message });
     }
+  }
 
-    // Sin filtros → últimos 10 comandos
-    const { data, error } = await supabase
-      .from("bot_commands")
-      .select("id, command, status, result, created_at, updated_at")
-      .order("created_at", { ascending: false })
-      .limit(10);
+  // ── Intento 2: fallback por lista activa ─────────────────────────────────
+  if (!raw) {
+    raw = await findInActiveList(new Set(slugs));
+  }
 
-    if (error) {
-      return NextResponse.json({ error: error.message }, { status: 500 });
-    }
-    return NextResponse.json(
-      { commands: data || [] },
-      { headers: { "Cache-Control": "no-store" } }
-    );
-
-  } catch (err) {
-    console.error("[commands GET] Unexpected error:", err.message);
-    return NextResponse.json(
-      { error: `Error inesperado: ${err.message}` },
-      { status: 500 }
+  // ── No encontrado ─────────────────────────────────────────────────────────
+  if (!raw) {
+    return Response.json(
+      {
+        active:      false,
+        market:      null,
+        error:       "Mercado BTC no encontrado en Gamma API",
+        slugs_tried: slugs,
+        errors,
+        dst_active:  isDST(now),
+        now_utc:     now.toISOString(),
+      },
+      { status: 200 }
     );
   }
+
+  // ── Procesar tokens ───────────────────────────────────────────────────────
+  let tokens = Array.isArray(raw.tokens) ? [...raw.tokens] : [];
+
+  // Reconstruir desde clobTokenIds si Gamma devuelve tokens:[]
+  if (!tokens.length) {
+    tokens = rebuildTokens(raw);
+  }
+
+  // Normalizar campo token_id (Gamma a veces usa "token_id", a veces "tokenId")
+  tokens = tokens.map(t => ({
+    ...t,
+    token_id: t.token_id ?? t.tokenId ?? null,
+  }));
+
+  // Enriquecer con precios live del CLOB
+  tokens = await enrichTokens(tokens);
+
+  const market = formatMarket(raw, tokens, slugs, now);
+
+  return Response.json({
+    active:      true,
+    market,
+    dst_active:  isDST(now),
+    now_utc:     now.toISOString(),
+    slugs_tried: slugs,
+  });
 }
