@@ -1,6 +1,12 @@
 """
 notifier.py — Alertas Telegram para el bot de Polymarket BTC
 
+v6.2 — notify_stop_loss enriquecida:
+  - Muestra precio de compra, tokens comprados y total invertido
+  - Muestra precio de venta (CLOB exit), tokens y total recuperado
+  - Muestra resultado neto en USD y %
+  - Muestra la condición exacta que disparó el SL (token entry→exit, pérdida vs umbral)
+
 v6.1 — FIX CRÍTICO: añade notify_order_failed() que faltaba y causaba
        ImportError al arrancar, bloqueando todo el bot.
 
@@ -129,6 +135,7 @@ def notify_target_change(cfg: dict, old_target: float, new_target: float, mins_l
         f"Δ        : <code>{sign}${delta:,.2f}</code>\n"
         f"⏱ Quedan : <code>{mm} min</code>"
     ))
+
 
 def notify_target_failed(cfg: dict, hour_utc):
     try:
@@ -322,18 +329,39 @@ def notify_loss(cfg: dict, bet: dict, price: float, simulated: bool = False):
 
 
 def notify_stop_loss(cfg: dict, bet: dict, price: float, pnl_usd: float,
-                     simulated: bool = False):
-    sim     = simulated or bet.get("simulated", False)
-    sim_tag = "  <i>[SIMULADO]</i>" if sim else ""
-    odds_v  = bet.get("odds", 0.5)
-    stake   = bet.get("stake", 0)
-    tokens  = round(stake / max(odds_v, 0.001), 4)
-    sign    = "+" if pnl_usd >= 0 else ""
+                     pnl_pct: float = 0.0, exit_token_price: float = 0.0,
+                     stop_pct: float = 0.0, simulated: bool = False):
+    """
+    v6.2: mensaje completo de Stop Loss con desglose de la operación.
+    Muestra compra, venta, resultado neto y la condición exacta que disparó el SL.
+    """
+    sim         = simulated or bet.get("simulated", False)
+    sim_tag     = "  <i>[SIMULADO]</i>" if sim else ""
+    entry_odds  = bet.get("odds", 0.5)
+    stake       = bet.get("stake", 0)
+    tokens      = round(stake / max(entry_odds, 0.001), 4)
+    total_venta = round(tokens * exit_token_price, 2)
+    sign        = "+" if pnl_usd >= 0 else ""
+
     _send(cfg, (
         f"🛑 <b>STOP LOSS — {bet['direction']}</b>{sim_tag}\n"
-        f"BTC actual : <code>${price:,.2f}</code>\n"
-        f"Tokens     : <code>{tokens:.4f} × {odds_v:.4f}</code>\n"
-        f"P&L        : <code>{sign}${pnl_usd:.2f} USDC</code>"
+        f"\n"
+        f"📥 <b>Compra</b>\n"
+        f"  Precio  : <code>{entry_odds:.4f}</code>\n"
+        f"  Tokens  : <code>{tokens:.4f}</code>\n"
+        f"  Total   : <code>${stake:.2f} USDC</code>\n"
+        f"\n"
+        f"📤 <b>Venta</b>\n"
+        f"  Precio  : <code>{exit_token_price:.4f}</code>\n"
+        f"  Tokens  : <code>{tokens:.4f}</code>\n"
+        f"  Total   : <code>${total_venta:.2f} USDC</code>\n"
+        f"\n"
+        f"💰 <b>Resultado</b> : <code>{sign}${pnl_usd:.2f} USDC  ({sign}{pnl_pct:.1f}%)</code>\n"
+        f"\n"
+        f"⚠️ <b>Condición SL</b>\n"
+        f"  Token:   <code>{entry_odds:.4f}</code> → <code>{exit_token_price:.4f}</code>\n"
+        f"  Pérdida  <code>{abs(pnl_pct):.1f}%</code> ≥ umbral <code>{stop_pct:.0f}%</code>\n"
+        f"  BTC      : <code>${price:,.2f}</code>"
     ))
 
 
