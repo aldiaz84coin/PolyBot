@@ -1,40 +1,37 @@
 """
-command_handler.py — v1.3  (importaciones relativas — bot/modules/)
+command_handler.py — v1.4  (importaciones relativas — bot/modules/)
+
+Cambios v1.4:
+  - REVERT PERF: eliminado ThreadPoolExecutor (causaba cuelgue del módulo en Railway).
+    Vuelto a serial, pero con timeout reducido a 3s y short-circuit al primer éxito.
+    En la práctica el primer RPC bueno responde en <1s.
+  - Se mantiene "rpc_attempts" para diagnóstico en el UI.
+  - Se mantiene el fix de nombres "usdc"/"pol" de v1.3.
 
 Cambios v1.3:
   - FIX CRÍTICO: _handle_check_balance devolvía "usdc_balance"/"pol_balance"
     pero ModeSelector.jsx lee "usdc"/"pol" → saldo siempre aparecía como $0.00.
-    Ahora los campos se llaman "usdc" y "pol" (+ aliases _balance para back-compat).
-  - PERF: RPCs de Polygon probados en PARALELO con ThreadPoolExecutor en lugar de
-    en serie. Timeout por RPC reducido de 10s a 3s.
-    El primer RPC que responda gana; el resto se cancela.
-  - DIAGNÓSTICO: el resultado incluye "rpc_attempts" con latencia y estado de TODOS
-    los RPCs intentados, para que el UI pueda mostrar cuáles funcionan y el usuario
-    pueda reordenarlos como prioritarios.
 
 Cambios v1.2:
   - FIX CRÍTICO: _handle_check_clob y _handle_test_order leían market.get("clobTokenIds")
     que NO existe en el dict devuelto por get_active_market(). El scanner devuelve un dict
     procesado con clave "tokens" (lista de {"outcome","token_id","price",...}).
-    Ahora se extraen yes_token_id / no_token_id desde market["tokens"].
 
 Cambios v1.1:
-  - FIX: get_active_btc_market → get_active_market  (nombre real en market_scanner)
+  - FIX: get_active_btc_market → get_active_market
   - FIX: get_active_market ya no recibe cfg como argumento
-  - FIX: get_clob_price ahora importable (alias público añadido en market_scanner)
+  - FIX: get_clob_price ahora importable
   - FIX: _handle_check_balance intenta múltiples RPCs de Polygon
-         (polygon-rpc.com bloqueado en Railway con 401)
 """
 
 import logging
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
-# RPCs públicos de Polygon — se prueban en PARALELO, el más rápido gana.
-# Reordenar poniendo primero los que históricamente responden antes.
+# RPCs públicos de Polygon — se prueban en serie hasta el primero que responda.
+# Poner primero los que históricamente responden más rápido desde Railway.
 _POLYGON_RPCS = [
     "https://rpc.ankr.com/polygon",
     "https://polygon-bor-rpc.publicnode.com",
@@ -43,7 +40,7 @@ _POLYGON_RPCS = [
     "https://rpc-mainnet.matic.network",
 ]
 
-_RPC_TIMEOUT = 3  # segundos por RPC (era 10s → ahora 3s, probados en paralelo)
+_RPC_TIMEOUT = 3  # segundos por intento
 
 
 # ── Helpers Supabase ──────────────────────────────────────────────────────────
@@ -70,39 +67,6 @@ def _finish_command(client, cmd_id: int, success: bool, result: dict):
         logger.warning(f"[CMD] ⚠ finish_command [{cmd_id}]: {e}")
 
 
-# ── Helpers internos ──────────────────────────────────────────────────────────
-
-def _probe_rpc(rpc_url: str, addr_cs: str, usdc_contract_addr: str, erc20_abi: list) -> dict:
-    """
-    Intenta obtener saldo USDC y POL desde un único RPC.
-    Devuelve un dict con "ok", "rpc_url", "latency_ms", y si ok=True también
-    "raw_usdc" y "raw_pol". Si ok=False incluye "error".
-    """
-    from web3 import Web3
-    t0 = time.time()
-    try:
-        w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": _RPC_TIMEOUT}))
-        if not w3.is_connected():
-            return {"ok": False, "rpc_url": rpc_url,
-                    "latency_ms": round((time.time() - t0) * 1000),
-                    "error": "is_connected=False"}
-
-        usdc    = w3.eth.contract(address=Web3.to_checksum_address(usdc_contract_addr), abi=erc20_abi)
-        raw_usdc = usdc.functions.balanceOf(addr_cs).call()
-        raw_pol  = w3.eth.get_balance(addr_cs)
-        return {
-            "ok":         True,
-            "rpc_url":    rpc_url,
-            "latency_ms": round((time.time() - t0) * 1000),
-            "raw_usdc":   raw_usdc,
-            "raw_pol":    raw_pol,
-        }
-    except Exception as e:
-        return {"ok": False, "rpc_url": rpc_url,
-                "latency_ms": round((time.time() - t0) * 1000),
-                "error": str(e)}
-
-
 # ── Handlers de comandos ──────────────────────────────────────────────────────
 
 def _handle_check_clob(cfg: dict) -> tuple[bool, dict]:
@@ -110,10 +74,6 @@ def _handle_check_clob(cfg: dict) -> tuple[bool, dict]:
     Verifica conexión CLOB:
     1. Obtiene mercado activo via Gamma API
     2. Lee precio CLOB via midpoint endpoint
-    Devuelve (success, result_dict)
-
-    FIX v1.2: get_active_market() devuelve dict procesado con clave "tokens" (lista),
-              NO "clobTokenIds". Extraer token_ids desde market["tokens"].
     """
     try:
         from modules.market_scanner import get_active_market, get_clob_price
@@ -126,7 +86,6 @@ def _handle_check_clob(cfg: dict) -> tuple[bool, dict]:
 
         market_slug = market.get("slug", "—")
 
-        # FIX v1.2: tokens es lista [{"outcome":"Yes","token_id":...}, ...]
         tokens_list  = market.get("tokens", [])
         yes_token    = next((t for t in tokens_list if t.get("outcome") == "Yes"), None)
         no_token     = next((t for t in tokens_list if t.get("outcome") == "No"),  None)
@@ -134,10 +93,7 @@ def _handle_check_clob(cfg: dict) -> tuple[bool, dict]:
         no_token_id  = no_token.get("token_id")  if no_token  else None
 
         if not yes_token_id:
-            return False, {
-                "error":       "Mercado sin token YES",
-                "market_slug": market_slug,
-            }
+            return False, {"error": "Mercado sin token YES", "market_slug": market_slug}
 
         yes_price = get_clob_price(yes_token_id)
         no_price  = get_clob_price(no_token_id) if no_token_id else None
@@ -161,12 +117,9 @@ def _handle_check_balance(cfg: dict) -> tuple[bool, dict]:
     """
     Consulta saldo USDC (ERC-20 en Polygon) y POL (gas).
 
-    FIX v1.3:
-      - Campos renombrados a "usdc" y "pol" (ModeSelector.jsx los lee así).
-        Se mantienen aliases "usdc_balance"/"pol_balance" por back-compat.
-      - RPCs probados en PARALELO (ThreadPoolExecutor) con timeout de 3s.
-        El primero que responda gana; se incluye "rpc_attempts" con diagnóstico
-        de todos los intentos para poder identificar los más rápidos.
+    v1.4: serial con timeout=3s y short-circuit al primer éxito.
+          Devuelve "usdc"/"pol" (nombres que lee ModeSelector.jsx).
+          Incluye "rpc_attempts" con diagnóstico de todos los intentos.
     """
     try:
         from web3 import Web3
@@ -184,65 +137,58 @@ def _handle_check_balance(cfg: dict) -> tuple[bool, dict]:
             "type":     "function",
         }]
 
-        # Tomar RPC de cfg si está definido; ponerlo al frente de la lista
         cfg_rpc  = cfg.get("polymarket", {}).get("rpc_url", "")
         rpc_list = ([cfg_rpc] + _POLYGON_RPCS) if cfg_rpc else list(_POLYGON_RPCS)
 
-        addr_cs = Web3.to_checksum_address(funder_addr)
+        addr_cs  = Web3.to_checksum_address(funder_addr)
+        attempts = []
 
-        attempts   = []   # registro de todos los intentos para diagnóstico
-        winner     = None
+        for rpc_url in rpc_list:
+            t0 = time.time()
+            try:
+                w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": _RPC_TIMEOUT}))
 
-        # ── Prueba en PARALELO ────────────────────────────────────────────
-        with ThreadPoolExecutor(max_workers=len(rpc_list)) as executor:
-            futures = {
-                executor.submit(_probe_rpc, rpc_url, addr_cs, USDC_POLYGON, ERC20_ABI): rpc_url
-                for rpc_url in rpc_list
-            }
-            for future in as_completed(futures):
-                result = future.result()
-                attempts.append({
-                    "rpc":        result["rpc_url"],
-                    "ok":         result["ok"],
-                    "latency_ms": result["latency_ms"],
-                    "error":      result.get("error"),
-                })
-                if result["ok"] and winner is None:
-                    winner = result
-                    logger.info(
-                        f"[CMD] ✅ Balance obtenido via {result['rpc_url']} "
-                        f"({result['latency_ms']}ms)"
-                    )
-                else:
-                    if not result["ok"]:
-                        logger.warning(
-                            f"[CMD] ⚠ Balance RPC falló ({result['rpc_url']} "
-                            f"{result['latency_ms']}ms): {result.get('error')}"
-                        )
+                if not w3.is_connected():
+                    elapsed = round((time.time() - t0) * 1000)
+                    attempts.append({"rpc": rpc_url, "ok": False,
+                                     "latency_ms": elapsed, "error": "is_connected=False"})
+                    logger.warning(f"[CMD] ⚠ RPC no conectado: {rpc_url} ({elapsed}ms)")
+                    continue
 
-        # Ordenar intentos por latencia para que el UI los muestre de mejor a peor
-        attempts.sort(key=lambda a: (not a["ok"], a["latency_ms"]))
+                usdc     = w3.eth.contract(address=Web3.to_checksum_address(USDC_POLYGON), abi=ERC20_ABI)
+                raw_usdc = usdc.functions.balanceOf(addr_cs).call()
+                raw_pol  = w3.eth.get_balance(addr_cs)
+                elapsed  = round((time.time() - t0) * 1000)
 
-        if winner is None:
-            return False, {
-                "error":        "Todos los RPCs fallaron",
-                "rpc_attempts": attempts,
-            }
+                attempts.append({"rpc": rpc_url, "ok": True, "latency_ms": elapsed})
+                logger.info(f"[CMD] ✅ Balance obtenido via {rpc_url} ({elapsed}ms)")
 
-        usdc_val = round(winner["raw_usdc"] / 1_000_000, 4)
-        pol_val  = round(winner["raw_pol"]  / 1e18,      6)
+                usdc_val = round(raw_usdc / 1_000_000, 4)
+                pol_val  = round(raw_pol  / 1e18,      6)
 
-        return True, {
-            # ── Campos que lee el UI (ModeSelector.jsx) ──────────────────
-            "usdc":         usdc_val,
-            "pol":          pol_val,
-            # ── Aliases back-compat ───────────────────────────────────────
-            "usdc_balance": usdc_val,
-            "pol_balance":  pol_val,
-            # ── Diagnóstico ───────────────────────────────────────────────
-            "wallet":       funder_addr[:10] + "…",
-            "rpc_used":     winner["rpc_url"],
-            "rpc_latency_ms": winner["latency_ms"],
+                return True, {
+                    # campos que lee ModeSelector.jsx
+                    "usdc":           usdc_val,
+                    "pol":            pol_val,
+                    # aliases back-compat
+                    "usdc_balance":   usdc_val,
+                    "pol_balance":    pol_val,
+                    # diagnóstico
+                    "wallet":         funder_addr[:10] + "…",
+                    "rpc_used":       rpc_url,
+                    "rpc_latency_ms": elapsed,
+                    "rpc_attempts":   attempts,
+                }
+
+            except Exception as rpc_err:
+                elapsed = round((time.time() - t0) * 1000)
+                attempts.append({"rpc": rpc_url, "ok": False,
+                                 "latency_ms": elapsed, "error": str(rpc_err)[:80]})
+                logger.warning(f"[CMD] ⚠ RPC falló ({rpc_url} {elapsed}ms): {rpc_err}")
+                continue
+
+        return False, {
+            "error":        "Todos los RPCs fallaron",
             "rpc_attempts": attempts,
         }
 
@@ -255,9 +201,6 @@ def _handle_test_order(cfg: dict, params: dict) -> tuple[bool, dict]:
     """
     Coloca una orden de prueba real (SIMULATE_MODE ignorado).
     params: { direction: 'UP'|'DOWN', stake: float }
-
-    FIX v1.2: igual que _handle_check_clob — leer tokens desde market["tokens"],
-              no desde market["clobTokenIds"].
     """
     try:
         from modules.market_scanner import get_active_market, get_clob_price
@@ -271,7 +214,6 @@ def _handle_test_order(cfg: dict, params: dict) -> tuple[bool, dict]:
         if stake < 0.5 or stake > 10:
             return False, {"error": "stake fuera de rango (0.50 – 10.00 USDC)"}
 
-        # Forzamos modo NO simulado para la prueba
         test_cfg = {**cfg}
         test_cfg.setdefault("strategy", {})
         test_cfg["strategy"] = {**test_cfg["strategy"], "simulate_mode": False}
@@ -280,7 +222,6 @@ def _handle_test_order(cfg: dict, params: dict) -> tuple[bool, dict]:
         if not market:
             return False, {"error": "No se encontró mercado BTC activo"}
 
-        # FIX v1.2: tokens es lista [{"outcome":"Yes","token_id":...}, ...]
         tokens_list = market.get("tokens", [])
         yes_token   = next((t for t in tokens_list if t.get("outcome") == "Yes"), None)
         no_token    = next((t for t in tokens_list if t.get("outcome") == "No"),  None)
