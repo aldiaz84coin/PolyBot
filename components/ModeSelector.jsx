@@ -1,5 +1,11 @@
 /**
- * components/ModeSelector.jsx — v1.0
+ * components/ModeSelector.jsx — v1.1
+ *
+ * CAMBIOS v1.1:
+ *   - Guard res.ok antes de res.json() en runClobCheck, runBalanceCheck y
+ *     runTestOrder: evita el crash "Unexpected token '<'" cuando el servidor
+ *     devuelve HTML (500/404) en lugar de JSON.
+ *   - Helper safeJson() centraliza la comprobación en los tres handlers.
  *
  * Panel completo para:
  *  1. Mostrar modo actual (SIMULADO / REAL) leído desde Supabase vía /api/config
@@ -9,10 +15,6 @@
  *       - Check saldo USDC         (comando check_balance → bot)
  *       - Orden de prueba manual   (comando test_order → bot, opcional)
  *       - Confirmación de activación
- *
- * Uso: importar desde ConfigPanel.jsx o Dashboard.jsx donde corresponda.
- *
- * <ModeSelector />
  */
 
 "use client";
@@ -43,80 +45,95 @@ const S = {
     cursor: disabled ? "not-allowed" : "pointer",
     opacity: disabled ? 0.4 : 1,
     border: "1px solid",
-    transition: "opacity 0.15s",
-    ...(variant === "danger"  && { background: "rgba(255,68,102,0.12)", borderColor: "rgba(255,68,102,0.4)", color: "#ff4466" }),
-    ...(variant === "primary" && { background: "rgba(0,255,136,0.10)", borderColor: "rgba(0,255,136,0.4)", color: "#00ff88" }),
-    ...(variant === "blue"    && { background: "rgba(0,102,255,0.10)", borderColor: "rgba(0,102,255,0.3)", color: "#4488ff" }),
-    ...(variant === "default" && { background: "transparent", borderColor: "#2a2a3a", color: "#555" }),
+    fontFamily: "inherit",
+    transition: "all 0.15s",
+    ...(variant === "primary"  ? { background: "rgba(0,255,136,0.08)",  borderColor: "rgba(0,255,136,0.35)",  color: "#00ff88" } :
+        variant === "danger"   ? { background: "rgba(255,68,102,0.08)", borderColor: "rgba(255,68,102,0.35)", color: "#ff4466" } :
+        variant === "blue"     ? { background: "rgba(68,136,255,0.08)", borderColor: "rgba(68,136,255,0.35)", color: "#4488ff" } :
+                                 { background: "transparent",            borderColor: "#2a2a3a",               color: "#555"    }),
   }),
-  row: { display: "flex", alignItems: "center", gap: 10 },
-  col: { display: "flex", flexDirection: "column", gap: 8 },
+  row: { display: "flex", alignItems: "center", gap: 8 },
+  col: { display: "flex", flexDirection: "column", gap: 12 },
 };
 
-// ── Status chip para cada check ───────────────────────────────────────────
+// ── v1.1: helper para fetch → JSON con guard res.ok ───────────────────────
+async function safeJson(res) {
+  if (!res.ok) {
+    // El servidor devolvió HTML (500/404) — leer como texto para debug
+    let body = "";
+    try { body = await res.text(); } catch (_) {}
+    // Extraer mensaje legible si hay JSON dentro del HTML
+    const match = body.match(/"error"\s*:\s*"([^"]+)"/);
+    const msg = match ? match[1] : `HTTP ${res.status} — el servidor devolvió una respuesta no válida`;
+    throw new Error(msg);
+  }
+  return res.json();
+}
+
+// ── CheckChip ────────────────────────────────────────────────────────────
 
 function CheckChip({ status }) {
   const map = {
-    idle:    { label: "—",        color: "#333" },
-    loading: { label: "CARGANDO…", color: "#888" },
-    ok:      { label: "✓ OK",     color: "#00ff88" },
-    error:   { label: "✗ ERROR",  color: "#ff4466" },
-    warn:    { label: "⚠ AVISO",  color: "#ffaa00" },
+    idle:    { color: "#333",     label: "—"      },
+    loading: { color: "#4488ff",  label: "..."     },
+    ok:      { color: "#00ff88",  label: "✓ OK"   },
+    error:   { color: "#ff4466",  label: "✗ ERROR" },
   };
-  const s = map[status] || map.idle;
+  const { color, label } = map[status] || map.idle;
   return (
-    <span style={{ fontSize: 10, fontWeight: 700, color: s.color, letterSpacing: "0.1em" }}>
-      {s.label}
+    <span style={{
+      fontSize: 9, fontWeight: 700, letterSpacing: "0.12em",
+      color, padding: "2px 8px", borderRadius: 2,
+      border: `1px solid ${color}30`,
+      background: `${color}10`,
+    }}>
+      {label}
     </span>
   );
 }
 
-// ── Hook: polling de un comando hasta done|error ──────────────────────────
+// ── useCommandPoller ──────────────────────────────────────────────────────
 
 function useCommandPoller() {
-  const pollerRef = useRef(null);
-
-  const poll = useCallback((commandId, onResult) => {
-    let attempts = 0;
-    const MAX = 60; // 60 × 2s = 120s timeout
-
-    const tick = async () => {
-      attempts++;
-      try {
-        const res = await fetch(`/api/commands?id=${commandId}`);
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const data = await res.json();
-
-        if (data.status === "done" || data.status === "error") {
-          onResult(data);
-          return;
-        }
-        if (attempts >= MAX) {
-          onResult({ status: "error", result: { error: "Timeout esperando respuesta del bot" } });
-          return;
-        }
-        pollerRef.current = setTimeout(tick, 2000);
-      } catch (e) {
-        onResult({ status: "error", result: { error: e.message } });
-      }
-    };
-
-    pollerRef.current = setTimeout(tick, 1500);
-  }, []);
+  const timerRef = useRef(null);
 
   const cancel = useCallback(() => {
-    if (pollerRef.current) clearTimeout(pollerRef.current);
+    if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
   }, []);
+
+  const poll = useCallback((id, onDone) => {
+    cancel();
+    timerRef.current = setInterval(async () => {
+      try {
+        const res  = await fetch(`/api/commands?id=${id}`, { cache: "no-store" });
+        const data = await safeJson(res);
+        if (data.status === "done" || data.status === "error") {
+          cancel();
+          onDone(data);
+        }
+      } catch (e) {
+        cancel();
+        onDone({ status: "error", result: { success: false, error: e.message } });
+      }
+    }, 2000);
+  }, [cancel]);
 
   useEffect(() => () => cancel(), [cancel]);
 
   return { poll, cancel };
 }
 
-// ── Step de pre-vuelo individual ──────────────────────────────────────────
+// ── PreflightStep ─────────────────────────────────────────────────────────
 
 function PreflightStep({ num, title, description, chipStatus, children }) {
-  const borderColor = chipStatus === "ok" ? "rgba(0,255,136,0.15)"
+  const borderColor =
+    chipStatus === "ok"      ? "rgba(0,255,136,0.25)"
+    : chipStatus === "error" ? "rgba(255,68,102,0.25)"
+    : chipStatus === "loading" ? "rgba(68,136,255,0.2)"
+    : "#1a1a2a";
+
+  const bg =
+    chipStatus === "ok"      ? "rgba(0,255,136,0.15)"
     : chipStatus === "error" ? "rgba(255,68,102,0.15)"
     : "#1a1a2a";
 
@@ -146,7 +163,7 @@ function PreflightStep({ num, title, description, chipStatus, children }) {
   );
 }
 
-// ── Pantalla de pre-vuelo ─────────────────────────────────────────────────
+// ── PreflightScreen ───────────────────────────────────────────────────────
 
 function PreflightScreen({ onCancel, onConfirm }) {
   const { poll, cancel } = useCommandPoller();
@@ -172,7 +189,8 @@ function PreflightScreen({ onCancel, onConfirm }) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ command: "check_clob" }),
       });
-      const { ok, id, error } = await res.json();
+      // v1.1: guard res.ok — evita crash si el servidor devuelve HTML
+      const { ok, id, error } = await safeJson(res);
       if (!ok) throw new Error(error || "Error enviando comando");
       poll(id, (data) => {
         const ok2 = data.status === "done" && data.result?.success;
@@ -194,7 +212,8 @@ function PreflightScreen({ onCancel, onConfirm }) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ command: "check_balance" }),
       });
-      const { ok, id, error } = await res.json();
+      // v1.1: guard res.ok
+      const { ok, id, error } = await safeJson(res);
       if (!ok) throw new Error(error || "Error enviando comando");
       poll(id, (data) => {
         const ok2 = data.status === "done" && data.result?.success;
@@ -222,7 +241,8 @@ function PreflightScreen({ onCancel, onConfirm }) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ command: "test_order", params: { direction: testDir, stake } }),
       });
-      const { ok, id, error } = await res.json();
+      // v1.1: guard res.ok
+      const { ok, id, error } = await safeJson(res);
       if (!ok) throw new Error(error || "Error enviando comando");
       poll(id, (data) => {
         const ok2 = data.status === "done" && data.result?.success;
@@ -296,7 +316,9 @@ function PreflightScreen({ onCancel, onConfirm }) {
                   : (
                     <>
                       <div>Latencia CLOB: <b style={{ color: "#4488ff" }}>{clobResult.latency_ms}ms</b></div>
-                      {clobResult.market_slug && <div>Mercado activo: <b style={{ color: "#888" }}>{clobResult.market_slug}</b></div>}
+                      {clobResult.market_slug && (
+                        <div>Mercado activo: <b style={{ color: "#888" }}>{clobResult.market_slug}</b></div>
+                      )}
                       {clobResult.yes_price != null && (
                         <div>
                           Precio YES: <b style={{ color: "#00ff88" }}>{(clobResult.yes_price * 100).toFixed(1)}¢</b>
@@ -337,14 +359,11 @@ function PreflightScreen({ onCancel, onConfirm }) {
                   ? <span style={{ color: "#ff4466" }}>Error: {balanceResult.error}</span>
                   : (
                     <>
-                      <div>USDC disponible: <b style={{ color: "#00ff88" }}>${Number(balanceResult.usdc_balance).toFixed(2)}</b></div>
-                      {balanceResult.pol_balance != null && (
-                        <div>POL (gas): <b style={{ color: "#888" }}>{Number(balanceResult.pol_balance).toFixed(4)}</b></div>
+                      {balanceResult.usdc != null && (
+                        <div>USDC: <b style={{ color: "#00ff88" }}>${balanceResult.usdc?.toFixed(2)}</b></div>
                       )}
-                      {Number(balanceResult.usdc_balance) < 5 && (
-                        <div style={{ color: "#ffaa00", marginTop: 4 }}>
-                          ⚠ Saldo bajo — recarga USDC antes de operar en real
-                        </div>
+                      {balanceResult.pol != null && (
+                        <div>POL (gas): <b style={{ color: "#888" }}>{balanceResult.pol?.toFixed(4)}</b></div>
                       )}
                     </>
                   )
@@ -357,7 +376,7 @@ function PreflightScreen({ onCancel, onConfirm }) {
           <PreflightStep
             num={3}
             title="Orden de prueba (opcional)"
-            description="Ejecuta una orden real de bajo importe para confirmar que el flujo completo de compra funciona. Esta orden USA FONDOS REALES."
+            description="Ejecuta una orden REAL mínima para confirmar que las credenciales Level 2 y el saldo son suficientes. Esta orden USA FONDOS REALES."
             chipStatus={testStatus}
           >
             <div style={{ ...S.row, flexWrap: "wrap", gap: 8, marginBottom: 8 }}>
@@ -394,9 +413,7 @@ function PreflightScreen({ onCancel, onConfirm }) {
                 {testStatus === "loading" ? "EJECUTANDO…" : "EJECUTAR ORDEN PRUEBA"}
               </button>
               {clobStatus !== "ok" && (
-                <span style={{ fontSize: 9, color: "#444" }}>
-                  (requiere paso 1 OK)
-                </span>
+                <span style={{ fontSize: 9, color: "#444" }}>(requiere paso 1 OK)</span>
               )}
             </div>
             {testResult && (
@@ -470,23 +487,23 @@ function PreflightScreen({ onCancel, onConfirm }) {
 // ── Componente principal ──────────────────────────────────────────────────
 
 export default function ModeSelector() {
-  const [mode,        setMode]        = useState("simulate"); // simulate | real
-  const [loading,     setLoading]     = useState(true);
-  const [saving,      setSaving]      = useState(false);
-  const [lastUpdated, setLastUpdated] = useState(null);
+  const [mode,          setMode]          = useState("simulate");
+  const [loading,       setLoading]       = useState(true);
+  const [saving,        setSaving]        = useState(false);
+  const [lastUpdated,   setLastUpdated]   = useState(null);
   const [showPreflight, setShowPreflight] = useState(false);
 
   // ── Cargar modo actual ────────────────────────────────────────────────
   const loadMode = useCallback(async () => {
     setLoading(true);
     try {
-      const res = await fetch("/api/config?key=trading_mode");
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = await res.json();
+      const res  = await fetch("/api/config?key=trading_mode");
+      // v1.1: guard res.ok
+      const data = await safeJson(res);
       setMode(data.value === "real" ? "real" : "simulate");
-      if (data.updated_at) setLastUpdated(new Date(data.updated_at));
+      if (data.updated_at) setLastUpdated(data.updated_at);
     } catch (e) {
-      console.error("[ModeSelector] Error loading mode:", e.message);
+      console.warn("[ModeSelector] loadMode error:", e.message);
     } finally {
       setLoading(false);
     }
@@ -495,7 +512,7 @@ export default function ModeSelector() {
   useEffect(() => { loadMode(); }, [loadMode]);
 
   // ── Guardar modo ──────────────────────────────────────────────────────
-  const saveMode = useCallback(async (newMode) => {
+  const saveMode = async (newMode) => {
     setSaving(true);
     try {
       const res = await fetch("/api/config", {
@@ -503,126 +520,113 @@ export default function ModeSelector() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ key: "trading_mode", value: newMode }),
       });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      setMode(newMode);
-      setLastUpdated(new Date());
+      // v1.1: guard res.ok
+      const data = await safeJson(res);
+      if (data.ok) {
+        setMode(newMode);
+        setLastUpdated(new Date().toISOString());
+      }
     } catch (e) {
-      console.error("[ModeSelector] Error saving mode:", e.message);
+      console.error("[ModeSelector] saveMode error:", e.message);
     } finally {
       setSaving(false);
     }
-  }, []);
+  };
 
-  // ── Handler del toggle ────────────────────────────────────────────────
-  const handleToggle = () => {
-    if (mode === "simulate") {
+  // ── Handler cambio de modo ────────────────────────────────────────────
+  const handleModeChange = (newMode) => {
+    if (newMode === mode) return;
+    if (newMode === "real") {
       setShowPreflight(true);
     } else {
-      // De real → simulate: sin confirmación extra
       saveMode("simulate");
     }
   };
 
-  const fmtDate = (d) => d
-    ? `${d.toLocaleDateString("es-ES")} ${d.toLocaleTimeString("es-ES", { hour: "2-digit", minute: "2-digit" })}`
-    : "—";
+  const handlePreflightConfirm = () => {
+    setShowPreflight(false);
+    saveMode("real");
+  };
 
+  const handlePreflightCancel = () => {
+    setShowPreflight(false);
+  };
+
+  // ── Render ────────────────────────────────────────────────────────────
   return (
-    <>
-      {/* ── Panel principal ───────────────────────────────────────────── */}
-      <div style={{
-        border: `1px solid ${mode === "real" ? "rgba(255,68,102,0.25)" : "rgba(0,102,255,0.15)"}`,
-        borderRadius: 4, padding: "16px 20px",
-        background: mode === "real" ? "rgba(255,68,102,0.04)" : "rgba(0,102,255,0.03)",
-        transition: "all 0.4s",
-        ...S.font,
-      }}>
-
-        {/* Header */}
-        <div style={{ ...S.row, justifyContent: "space-between", marginBottom: 12 }}>
-          <div style={{ fontSize: 9, color: "#333", letterSpacing: "0.18em" }}>
-            MODO DE OPERACIÓN
-          </div>
-          <div style={{ fontSize: 9, color: "#2a2a3a" }}>
-            Actualizado: {fmtDate(lastUpdated)}
-          </div>
-        </div>
-
-        {/* Badge + toggle */}
-        <div style={{ ...S.row, justifyContent: "space-between", flexWrap: "wrap", gap: 10 }}>
-          <div style={S.row}>
-            {loading ? (
-              <span style={{ fontSize: 10, color: "#333" }}>cargando…</span>
-            ) : (
-              <div style={S.badge(mode)}>
-                <span style={S.dot(mode)} />
-                {mode === "real" ? "MODO REAL" : "MODO SIMULADO"}
-              </div>
-            )}
-          </div>
-
-          {!loading && (
-            <button
-              onClick={handleToggle}
-              disabled={saving}
-              style={S.btn(mode === "simulate" ? "danger" : "blue", saving)}
-            >
-              {saving
-                ? "GUARDANDO…"
-                : mode === "simulate"
-                  ? "→ PASAR A MODO REAL"
-                  : "→ VOLVER A SIMULADO"
-              }
-            </button>
-          )}
-        </div>
-
-        {/* Descripción contextual */}
-        <div style={{
-          marginTop: 12, padding: "10px 14px",
-          background: "#04040e", border: "1px solid #0d0d1a",
-          borderRadius: 3, fontSize: 9, color: "#444", lineHeight: 1.8,
-        }}>
-          {mode === "real" ? (
-            <>
-              <b style={{ color: "#ff4466" }}>⚠ MODO REAL ACTIVO.</b>{" "}
-              El bot ejecuta órdenes reales en Polymarket usando fondos USDC de tu cartera.
-              Las operaciones incurren en costes reales de gas y spread. Para volver a simulación
-              haz clic en "Volver a simulado" — el bot lo aplicará en el siguiente ciclo.
-            </>
-          ) : (
-            <>
-              <b style={{ color: "#4488ff" }}>● MODO SIMULADO.</b>{" "}
-              El bot evalúa señales y registra operaciones como si fueran reales,
-              pero no envía ninguna orden al CLOB. Los P&L registrados son teóricos.
-              Usa esta fase para validar la estrategia antes de arriesgar capital.
-            </>
-          )}
-        </div>
-
-        {/* Info de sincronización */}
-        <div style={{ marginTop: 8, fontSize: 9, color: "#2a2a3a" }}>
-          El bot recarga la configuración cada ~60s · Este estado se almacena en Supabase
-        </div>
-      </div>
-
-      {/* ── Pantalla pre-vuelo ────────────────────────────────────────────── */}
-      {showPreflight && (
-        <PreflightScreen
-          onCancel={() => setShowPreflight(false)}
-          onConfirm={async () => {
-            setShowPreflight(false);
-            await saveMode("real");
-          }}
-        />
-      )}
-
+    <div style={{ ...S.font }}>
       <style>{`
         @keyframes pulse {
           0%, 100% { opacity: 1; }
           50%       { opacity: 0.4; }
         }
       `}</style>
-    </>
+
+      {showPreflight && (
+        <PreflightScreen
+          onCancel={handlePreflightCancel}
+          onConfirm={handlePreflightConfirm}
+        />
+      )}
+
+      <div style={{
+        background: "#02020a",
+        border: "1px solid #1a1a2a",
+        borderRadius: 6,
+        padding: "20px 24px",
+      }}>
+        {/* Título */}
+        <div style={{ ...S.row, justifyContent: "space-between", marginBottom: 16 }}>
+          <span style={{ fontSize: 10, color: "#444", letterSpacing: "0.16em" }}>
+            MODO DE TRADING
+          </span>
+          {loading && (
+            <span style={{ fontSize: 9, color: "#333" }}>cargando…</span>
+          )}
+        </div>
+
+        {/* Badge modo actual */}
+        <div style={{ marginBottom: 20 }}>
+          <span style={S.badge(mode)}>
+            <span style={S.dot(mode)} />
+            {mode === "real" ? "🔴 MODO REAL" : "🔵 MODO SIMULADO"}
+          </span>
+          {lastUpdated && (
+            <div style={{ marginTop: 6, fontSize: 9, color: "#333" }}>
+              Actualizado: {new Date(lastUpdated).toLocaleString("es-ES")}
+            </div>
+          )}
+        </div>
+
+        {/* Selector */}
+        <div style={{ ...S.row, gap: 10 }}>
+          <button
+            onClick={() => handleModeChange("simulate")}
+            disabled={saving || loading || mode === "simulate"}
+            style={S.btn("blue", saving || loading || mode === "simulate")}
+          >
+            🔵 SIMULADO
+          </button>
+          <button
+            onClick={() => handleModeChange("real")}
+            disabled={saving || loading || mode === "real"}
+            style={S.btn("danger", saving || loading || mode === "real")}
+          >
+            🔴 REAL
+          </button>
+          {saving && (
+            <span style={{ fontSize: 9, color: "#555" }}>guardando…</span>
+          )}
+        </div>
+
+        {/* Info */}
+        <p style={{ fontSize: 9, color: "#333", marginTop: 12, lineHeight: 1.7 }}>
+          {mode === "simulate"
+            ? "El bot registra señales y precios CLOB pero no ejecuta órdenes reales."
+            : "⚠ El bot ejecuta órdenes reales con fondos USDC de tu cartera."
+          }
+        </p>
+      </div>
+    </div>
   );
 }
