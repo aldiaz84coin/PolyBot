@@ -1,6 +1,20 @@
 """
 strategy.py — Lógica de decisión UP/DOWN y ejecución de órdenes CLOB
 
+v8.1 — FIX CRÍTICO: id único en execute_order
+  - Modo simulado (simulate_mode=True): genera uuid propio → cada operación
+    tiene id distinto → upsert_operation no sobrescribe filas anteriores.
+  - Modo simulado por ImportError: igual, uuid generado.
+  - Modo real (CLOB): normaliza id desde resp.get("orderID") o resp.get("id");
+    si ninguno presente, genera uuid para garantizar unicidad.
+  Sin este fix, todas las ops compartían id="" y solo se veía la última en Supabase.
+
+v8.0 cambios:
+  - min_retorno_pct: retorno mínimo estimado para entrar en una apuesta.
+    Aplica en modo simulado Y real. Si odds implican retorno < umbral,
+    execute_order() devuelve None sin ejecutar.
+    Configurar en config.yaml: strategy.min_retorno_pct (0 = desactivado).
+
 v3.0 cambios:
   - Modo SIMULADO explícito vía cfg["strategy"]["simulate_mode"] (env SIMULATE_MODE=true).
     Ya no dependemos de ImportError de py_clob_client para simular.
@@ -8,6 +22,7 @@ v3.0 cambios:
   - Log claro [SIMULADO] en todas las operaciones simuladas.
 """
 import logging
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -134,12 +149,19 @@ def execute_order(signal: Signal, market: dict, cfg: dict) -> dict | None:
     Ejecuta una orden Market FOK en el CLOB de Polymarket.
 
     Devuelve el resultado de la orden o None si falla.
-    Siempre incluye "odds" = precio real del token en Polymarket.
+    Siempre incluye:
+      - "id"        : identificador único (uuid si simulado o CLOB no devuelve id)
+      - "odds"      : precio real del token en Polymarket
+      - "simulated" : bool
 
     MODO SIMULADO (cfg["strategy"]["simulate_mode"] = True):
       No se conecta al CLOB. Registra la operación como si fuera real,
       con la misma estructura de respuesta, marcada con simulated=True.
       Activar con env var SIMULATE_MODE=true en Railway.
+
+    MARGEN MÍNIMO (cfg["strategy"]["min_retorno_pct"]):
+      Si el retorno estimado (1/odds - 1)*100 es inferior al mínimo,
+      la orden se descarta (devuelve None) antes de ejecutarse.
     """
     simulate_mode = cfg.get("strategy", {}).get("simulate_mode", False)
     stake         = cfg["capital"]["stake_usdc"]
@@ -169,6 +191,22 @@ def execute_order(signal: Signal, market: dict, cfg: dict) -> dict | None:
     entry_odds = float(token.get("price", 0.5))
     size       = round(stake / max(entry_odds, 0.001), 4)
 
+    # ── v8.0: Margen mínimo de retorno ────────────────────────────────────
+    min_retorno_pct = cfg.get("strategy", {}).get("min_retorno_pct", 0.0)
+    if min_retorno_pct > 0.0:
+        retorno_est = (1.0 / max(entry_odds, 0.001) - 1.0) * 100
+        if retorno_est < min_retorno_pct:
+            logger.info(
+                f"[ORDER] ⏭ Retorno estimado {retorno_est:.1f}% < mínimo {min_retorno_pct:.1f}% "
+                f"(odds={entry_odds:.4f}) — apuesta descartada por margen insuficiente"
+            )
+            return None
+        logger.info(
+            f"[ORDER] ✅ Retorno estimado {retorno_est:.1f}% ≥ mínimo {min_retorno_pct:.1f}% "
+            f"(odds={entry_odds:.4f}) — margen OK"
+        )
+    # ─────────────────────────────────────────────────────────────────────
+
     logger.info(
         f"[ORDER] Parámetros CLOB:\n"
         f"         Token ID  : {token_id}\n"
@@ -179,11 +217,14 @@ def execute_order(signal: Signal, market: dict, cfg: dict) -> dict | None:
 
     # ── MODO SIMULADO: no llamar al CLOB ─────────────────────────────────
     if simulate_mode:
+        op_id = str(uuid.uuid4())   # v8.1 FIX: id único por operación
         logger.warning(
             f"[ORDER] 🟡 [SIMULADO] Orden NO enviada al CLOB\n"
+            f"         ID        : {op_id}\n"
             f"         {signal.direction.value} {size:.4f} tokens × {entry_odds:.4f} = ${stake} USDC"
         )
         return {
+            "id":        op_id,
             "simulated": True,
             "direction": signal.direction.value,
             "stake":     stake,
@@ -253,7 +294,12 @@ def execute_order(signal: Signal, market: dict, cfg: dict) -> dict | None:
             CreateOrderOptions(neg_risk=neg_risk, tick_size=None),
         )
 
-        order_id = resp.get("orderID", resp.get("id", "—"))
+        # v8.1 FIX: normalizar id — CLOB puede devolver "orderID" o "id"
+        order_id = (
+            resp.get("orderID")
+            or resp.get("id")
+            or str(uuid.uuid4())   # fallback: garantizar unicidad
+        )
         status   = resp.get("status", "—")
         filled   = resp.get("sizeFilled", resp.get("size_filled", "—"))
 
@@ -269,15 +315,19 @@ def execute_order(signal: Signal, market: dict, cfg: dict) -> dict | None:
             f"         Raw resp  : {resp}"
         )
 
-        return {**resp, "odds": actual_odds}
+        # v8.1: devolver siempre "id" normalizado (sea orderID o uuid fallback)
+        return {**resp, "id": order_id, "odds": actual_odds, "simulated": False}
 
     except ImportError:
+        op_id = str(uuid.uuid4())   # v8.1 FIX: id único
         logger.warning(
             f"[ORDER] ⚠ py-clob-client no instalado — ejecutando en modo SIMULACIÓN\n"
+            f"         ID        : {op_id}\n"
             f"         Orden simulada: {signal.direction.value} ${stake} USDC  "
             f"Odds: {entry_odds:.4f}"
         )
         return {
+            "id":        op_id,
             "simulated": True,
             "direction": signal.direction.value,
             "stake":     stake,

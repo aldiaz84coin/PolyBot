@@ -1,27 +1,15 @@
 """
 monitor.py — Loop principal del bot: ventana horaria, stop loss, resolución
 
-v10.5 — notify_stop_loss enriquecida con desglose completo de la operación:
-  - Precio y total de compra (entry_odds × tokens × stake)
-  - Precio y total de venta (exit_token_price × tokens)
-  - Resultado neto en USD y %
-  - Condición exacta que disparó el SL (token entry→exit, pérdida vs umbral)
+v10.6 — FIX notify_new_hour: target y config de estrategia
+  - Pre-fetch de get_open_1h_binance() ANTES de llamar notify_new_hour.
+    Antes se pasaba target=None (recién reseteado) → mostraba "—" en Telegram.
+  - notify_new_hour recibe ahora stop_pct, stake y umbrales T20/T15/T10/T5.
+  - La carga normal del target más abajo en el ciclo sigue activa como siempre.
 
+v10.5 — notify_stop_loss enriquecida con desglose completo de la operación
 v10.4 — FIX KeyError 'name' + corrección de API evaluate / execute_order / notify
-  - Bloque de evaluación de señal completamente reescrito con la API correcta:
-    · evaluate(price, target, mins_left, cfg)  ← elimina active_window["name"]
-    · execute_order(signal, market, cfg)        ← firma corregida
-    · notify_order_failed(cfg, signal)          ← sin args extra
-    · notify_signal_eval con kwargs posicionales correctos
-    · db.log_signal con kwargs en vez de dict
-    · active_bet["direction"] almacena signal.direction.value (string, no enum)
-  - _t5_hf_active: log explícito de entrada/salida del modo T-5 HF
-
-v10.3 — FIX: tokens es lista, no dict
-  - get_active_market() devuelve tokens como lista de dicts con "outcome".
-  - Fix: _tokens_to_dict() convierte la lista a dict indexado por outcome
-    antes de usarlo en stop-loss y resolución de fin de hora.
-
+v10.3 — FIX: tokens es lista, no dict (_tokens_to_dict helper)
 v10.2 — DASHBOARD READONLY: publica stake_usdc en bot_config al arrancar
 v10.1 — FIX P&L SIMULADO: precio real CLOB en modo simulado
 v10.0 — MODO SIMULADO/REAL DINÁMICO DESDE BD
@@ -296,6 +284,44 @@ def _log_hour_table(hour_ops: list):
     logger.info(_SEPARATOR)
 
 
+def _log_hour_ops(hour_utc: int, hour_ops: list, hist_stats: dict):
+    if not hour_ops:
+        return
+    logger.info(_SEPARATOR)
+    logger.info(f"[MONITOR] 📋 RESUMEN HORA {hour_utc:02d}:00 UTC — {len(hour_ops)} operación(es)")
+    logger.info(
+        f"[MONITOR] {'#':>2}  {'Dir':<5} {'Ventana':<6}  "
+        f"{'BTC compra':>10}  {'Tokens':>8}  {'Odds E':>6}  "
+        f"{'Odds S':>6}  {'BTC cierre':>10}  {'Resultado':<6}  {'P&L':>10}"
+    )
+    logger.info(_SEPARATOR2)
+    total_pnl = 0.0
+    for i, op in enumerate(hour_ops, 1):
+        direction  = op.get("direction", "—")
+        window     = op.get("window", "—")
+        entry_btc  = op.get("entry_btc", 0)
+        entry_odds = op.get("entry_odds", 0)
+        tokens     = op.get("tokens", 0)
+        exit_odds  = op.get("exit_odds", 0)
+        exit_btc   = op.get("exit_btc", 0)
+        result     = op.get("result", "—")
+        pnl        = op.get("pnl_usd", 0)
+        sim        = " [SIM]" if op.get("simulated") else ""
+        total_pnl += pnl
+        pnl_str = f"{'+' if pnl >= 0 else ''}{pnl:,.2f}"
+        logger.info(
+            f"[MONITOR] {i:>2}.  {direction:<5} {window:<6}  "
+            f"${entry_btc:>9,.0f}  {tokens:>8.4f}  {entry_odds:>6.4f}  "
+            f"{exit_odds:>6.4f}  ${exit_btc:>9,.0f}  {result:<6}{sim}  ${pnl_str:>9}"
+        )
+    logger.info(_SEPARATOR2)
+    sign = "+" if total_pnl >= 0 else ""
+    logger.info(f"[MONITOR] P&L hora: {sign}${total_pnl:,.2f} USDC")
+    logger.info(_SEPARATOR)
+    _log_accumulated_stats(hist_stats, label="ACUMULADO")
+    logger.info(_SEPARATOR)
+
+
 # ── Sincronización de sesión horaria ─────────────────────────────────────────
 
 def _session_id(dt: datetime) -> str:
@@ -431,7 +457,7 @@ def run(cfg: dict):
     target        = None
     price         = None
     cycle_n       = 0
-    _t5_hf_active = False   # v10.4: tracking para log de entrada/salida T-5 HF
+    _t5_hf_active = False
 
     try:
         while True:
@@ -454,7 +480,7 @@ def run(cfg: dict):
             if db_ok and cycle_n % _SNAPSHOT_EVERY_N_CYCLES == 0:
                 try:
                     db.log_price_snapshot(
-                        price_btc   = price,
+                        btc_price   = price,
                         market_slug = slug or "",
                         simulado    = simulate,
                     )
@@ -464,7 +490,7 @@ def run(cfg: dict):
             mins_left = _mins_to_close()
             now_utc   = datetime.now(timezone.utc)
             cur_hour  = now_utc.hour
-            hour_utc  = cur_hour   # alias para uso en log_signal / notify
+            hour_utc  = cur_hour
 
             # ── Detección de nueva hora ────────────────────────────────────
             if cur_hour != last_hour:
@@ -498,9 +524,34 @@ def run(cfg: dict):
                 ops_hoy       = 0
                 fired_window  = None
                 last_hour     = cur_hour
-                target        = None   # forzar recarga del target para la nueva hora
+                active_bet    = None
+                last_notified_signal_key = None
 
-                notify_new_hour(cfg, cur_hour, slug, target)
+                # v10.6 FIX: pre-fetch target ANTES de notify_new_hour
+                # (antes target=None recién reseteado → mostraba "—" en Telegram)
+                target = None
+                try:
+                    target = get_open_1h_binance()
+                    if target:
+                        logger.info(f"[MONITOR] 🎯 Target nueva hora: ${target:,.2f}")
+                    else:
+                        logger.warning("[MONITOR] ⚠ Pre-fetch target nueva hora: sin datos")
+                except Exception as _e:
+                    logger.warning(f"[MONITOR] ⚠ Pre-fetch target nueva hora: {_e}")
+
+                # Config de estrategia para la notificación
+                _umbrales_notif = {
+                    "t20": cfg.get("strategy", {}).get("t20_umbral_usd", "—"),
+                    "t15": cfg.get("strategy", {}).get("t15_umbral_usd", "—"),
+                    "t10": cfg.get("strategy", {}).get("t10_umbral_usd", "—"),
+                    "t5":  cfg.get("strategy", {}).get("t5_umbral_usd",  "—"),
+                }
+                notify_new_hour(
+                    cfg, cur_hour, slug, target,
+                    stop_pct  = stop_pct,
+                    stake     = stake,
+                    umbrales  = _umbrales_notif,
+                )
                 logger.info(_SEPARATOR)
 
             # ── Mercado activo ─────────────────────────────────────────────
@@ -520,6 +571,7 @@ def run(cfg: dict):
                 continue
 
             # ── Target (Price to Beat) ─────────────────────────────────────
+            # Carga normal si no se cargó en el pre-fetch de nueva hora
             target_retries = 0
             while not target and target_retries < MAX_TARGET_RETRIES:
                 target = get_open_1h_binance()
@@ -534,6 +586,7 @@ def run(cfg: dict):
                 time.sleep(interval)
                 continue
 
+            # Detectar cambio de target dentro de la hora (poco frecuente)
             new_target = get_open_1h_binance()
             if new_target and abs((new_target - target) / target) > 0.001:
                 notify_target_change(cfg, target, new_target, mins_left)
@@ -662,7 +715,7 @@ def run(cfg: dict):
                 else:
                     exit_odds = real_exit_odds_val
 
-                retorno_real = tokens_held * exit_odds
+                retorno_real = round(tokens_held * exit_odds, 4)
                 pnl_usd      = round(retorno_real - stake_, 4)
                 pnl_pct      = round((pnl_usd / stake_) * 100, 2) if stake_ > 0 else 0.0
                 result       = "WIN" if won else "LOSS"
@@ -670,12 +723,17 @@ def run(cfg: dict):
                 if won:
                     session_wins += 1
                     hour_wins    += 1
-                    notify_win(cfg, active_bet, price, simulated=sim_)
+                    notify_win(cfg, active_bet, price, pnl_usd=pnl_usd, simulated=sim_)
                     logger.info(
                         f"[MONITOR] {'[SIMULADO] ' if sim_ else ''}✅ WIN — "
                         f"Tokens: {tokens_held:.4f} × {exit_odds:.4f} = ${retorno_real:.2f}  "
-                        f"P&L: ${pnl_usd:.2f} ({pnl_pct:.1f}%)"
+                        f"P&L: +${pnl_usd:.2f} (+{pnl_pct:.1f}%)"
                     )
+                    if not sim_:
+                        try:
+                            redimir_posicion(cfg, active_bet)
+                        except Exception as e:
+                            logger.warning(f"[MONITOR] ⚠ redimir_posicion: {e}")
                 else:
                     session_losses += 1
                     hour_losses    += 1
@@ -731,10 +789,7 @@ def run(cfg: dict):
                 sign_s = "+" if session_pnl >= 0 else ""
                 logger.info(
                     f"[MONITOR]    P&L sesión : {sign_s}${session_pnl:,.2f} USDC  "
-                    f"(invertido ${session_invested:,.2f})\n"
-                    f"[MONITOR]    Acumulado  : "
-                    f"{'+' if hist_stats.get('pnl_total', 0) >= 0 else ''}"
-                    f"${hist_stats.get('pnl_total', 0):,.2f} USDC"
+                    f"(invertido ${session_invested:,.2f})"
                 )
 
                 active_bet               = None
@@ -746,7 +801,10 @@ def run(cfg: dict):
             # ── Evaluación de señal ────────────────────────────────────────
             # v10.4 FIX: evaluate() recibe (price, target, mins_left, cfg)
             # Devuelve Signal (con .window, .direction, .is_actionable) o None.
-            # Ya NO se itera WINDOWS manualmente ni se usa active_window["name"].
+            if not target:
+                time.sleep(interval)
+                continue
+
             signal = evaluate(price, target, mins_left, cfg)
 
             if signal:
