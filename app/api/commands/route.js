@@ -1,37 +1,48 @@
 /**
- * app/api/commands/route.js — v1.4
+ * app/api/commands/route.js — v1.5
  *
- * CAMBIOS v1.4 — FIX CRÍTICO: HTTP 401 en check_clob
- *   - runCheckClobInline ya NO hace fetch HTTP a ${origin}/api/market.
- *     Ese fetch server-to-server era bloqueado por Vercel con 401.
- *   - Ahora importa fetchActiveMarket() desde lib/market-fetch.js y la
- *     llama directamente, sin pasar por la capa HTTP.
- *   - Eliminado parámetro requestUrl (ya no es necesario).
+ * CAMBIOS v1.5 — check_balance INLINE (sin bot, sin Railway)
+ *   - check_balance ya NO pasa por el bot. Ejecuta inline desde Vercel igual
+ *     que check_clob, usando llamadas JSON-RPC directas a Polygon.
+ *   - El bot publica "funder_address" en bot_config al arrancar (monitor.py v10.8).
+ *     Vercel la lee de Supabase y consulta el balance directamente on-chain.
+ *   - Eliminada la dependencia de web3.py en Railway para esta operación.
+ *   - Eliminado el timeout de 35s que antes afectaba a check_balance.
+ *   - Usa AbortSignal.timeout(5000) por RPC con fallback a 3 endpoints.
  *
- * CAMBIOS v1.3 (referencia):
- *   - check_clob ejecuta INLINE desde Vercel (sin bot, sin Supabase).
- *   - check_balance y test_order siguen usando Supabase + polling.
+ * CAMBIOS v1.4 (referencia):
+ *   - check_clob ejecuta inline desde Vercel (sin bot).
+ *   - runCheckClobInline importa fetchActiveMarket() directamente.
  *
  * POST /api/commands  { command, params }
- *   check_clob    → { ok, direct: true, status, result }   (sin bot)
- *   check_balance → { ok, id }                             (requiere bot)
+ *   check_clob    → { ok, direct: true, status, result }   (inline Vercel)
+ *   check_balance → { ok, direct: true, status, result }   (inline Vercel)
  *   test_order    → { ok, id }                             (requiere bot)
  *
  * GET /api/commands?id=123         → { id, command, status, result }
  * GET /api/commands?status=pending → { commands: [...] }
  */
 
-import { NextResponse }       from "next/server";
-import { getSupabase }        from "../../../lib/supabase";
-import { fetchActiveMarket }  from "../../../lib/market-fetch";
+import { NextResponse }      from "next/server";
+import { getSupabase }       from "../../../lib/supabase";
+import { fetchActiveMarket } from "../../../lib/market-fetch";
 
 export const dynamic = "force-dynamic";
 
 const VALID_COMMANDS = ["check_clob", "check_balance", "test_order"];
 
-// ── check_clob inline — sin llamada HTTP interna ──────────────────────────
-// Llama fetchActiveMarket() directamente (Gamma + CLOB) sin hacer fetch
-// a ${origin}/api/market, evitando el 401 de Vercel en llamadas internas.
+// Dirección USDC en Polygon
+const USDC_POLYGON = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
+
+// RPCs de Polygon a intentar en orden
+const POLYGON_RPCS = [
+  "https://polygon-rpc.com",
+  "https://rpc.ankr.com/polygon",
+  "https://polygon-bor-rpc.publicnode.com",
+  "https://1rpc.io/matic",
+];
+
+// ── check_clob inline ──────────────────────────────────────────────────────
 
 async function runCheckClobInline() {
   const t0 = Date.now();
@@ -66,6 +77,113 @@ async function runCheckClobInline() {
   }
 }
 
+// ── check_balance inline — Polygon JSON-RPC directo desde Vercel ──────────
+//
+// No depende del bot. Solo necesita la funder address publicada en bot_config.
+// Usa llamadas JSON-RPC puras (sin web3) → compatible con cualquier entorno.
+
+async function runCheckBalanceInline(supabase) {
+  const t0 = Date.now();
+  try {
+    // 1. Leer funder_address desde bot_config (publicada por monitor.py al arrancar)
+    const { data: cfgRow } = await supabase
+      .from("bot_config")
+      .select("value")
+      .eq("key", "funder_address")
+      .maybeSingle();
+
+    if (!cfgRow?.value) {
+      return {
+        success:    false,
+        error:      "funder_address no encontrada en bot_config. El bot debe haber arrancado al menos una vez con v10.8+.",
+        latency_ms: Date.now() - t0,
+      };
+    }
+
+    const wallet = cfgRow.value.trim();
+
+    // 2. Codificar llamada balanceOf(address) para USDC
+    //    Selector keccak256("balanceOf(address)")[0:4] = 0x70a08231
+    const paddedAddr = wallet.toLowerCase().replace("0x", "").padStart(64, "0");
+    const callData   = "0x70a08231" + paddedAddr;
+
+    let lastError = null;
+
+    // 3. Intentar cada RPC hasta el primero que responda
+    for (const rpc of POLYGON_RPCS) {
+      try {
+        const body = JSON.stringify([
+          {
+            jsonrpc: "2.0", id: 1,
+            method:  "eth_getBalance",
+            params:  [wallet, "latest"],
+          },
+          {
+            jsonrpc: "2.0", id: 2,
+            method:  "eth_call",
+            params:  [{ to: USDC_POLYGON, data: callData }, "latest"],
+          },
+        ]);
+
+        const res = await fetch(rpc, {
+          method:  "POST",
+          headers: { "Content-Type": "application/json" },
+          body,
+          signal: AbortSignal.timeout(5000), // 5s por RPC
+        });
+
+        if (!res.ok) throw new Error(`HTTP ${res.status} de ${rpc}`);
+
+        const results = await res.json();
+
+        const polHex  = results.find(r => r.id === 1)?.result;
+        const usdcHex = results.find(r => r.id === 2)?.result;
+
+        if (!polHex || !usdcHex) throw new Error("Respuesta RPC incompleta");
+        if (polHex === "0x" || usdcHex === "0x") throw new Error("RPC devolvió 0x — posible nodo caído");
+
+        const polWei  = BigInt(polHex);
+        const usdcRaw = BigInt(usdcHex);
+
+        const pol  = Number(polWei)  / 1e18;
+        const usdc = Number(usdcRaw) / 1e6;
+
+        return {
+          success:      true,
+          // nombres que lee ModeSelector.jsx
+          usdc:         Math.round(usdc * 10000) / 10000,
+          pol:          Math.round(pol  * 1000000) / 1000000,
+          // aliases back-compat
+          usdc_balance: Math.round(usdc * 10000) / 10000,
+          pol_balance:  Math.round(pol  * 1000000) / 1000000,
+          // diagnóstico
+          wallet:       wallet.slice(0, 10) + "…",
+          rpc_used:     rpc,
+          latency_ms:   Date.now() - t0,
+        };
+
+      } catch (e) {
+        lastError = e.message;
+        console.warn(`[balance] RPC ${rpc} falló: ${e.message}`);
+        continue;
+      }
+    }
+
+    return {
+      success:    false,
+      error:      `Todos los RPCs de Polygon fallaron. Último error: ${lastError}`,
+      latency_ms: Date.now() - t0,
+    };
+
+  } catch (e) {
+    return {
+      success:    false,
+      error:      e.message || "Error desconocido en check_balance",
+      latency_ms: Date.now() - t0,
+    };
+  }
+}
+
 // ── POST /api/commands ────────────────────────────────────────────────────
 
 export async function POST(req) {
@@ -89,11 +207,10 @@ export async function POST(req) {
       );
     }
 
-    // ── check_clob: ejecución inline, sin bot, sin Supabase ──────────────
+    // ── check_clob: inline desde Vercel ─────────────────────────────────
     if (command === "check_clob") {
-      console.log("[commands POST] check_clob → ejecutando inline (v1.4, sin HTTP interno)");
+      console.log("[commands POST] check_clob → inline v1.5");
       const result = await runCheckClobInline();
-      console.log("[commands POST] check_clob result:", JSON.stringify(result));
       return NextResponse.json({
         ok:     true,
         direct: true,
@@ -102,7 +219,27 @@ export async function POST(req) {
       });
     }
 
-    // ── check_balance / test_order: requieren el bot (wallet/L2 auth) ────
+    // ── check_balance: inline desde Vercel via Polygon RPC ───────────────
+    if (command === "check_balance") {
+      console.log("[commands POST] check_balance → inline v1.5 (Polygon JSON-RPC)");
+      const supabase = getSupabase();
+      if (!supabase) {
+        return NextResponse.json(
+          { ok: false, error: "Supabase no disponible — no se puede leer funder_address" },
+          { status: 503 }
+        );
+      }
+      const result = await runCheckBalanceInline(supabase);
+      console.log("[commands POST] check_balance result:", JSON.stringify(result));
+      return NextResponse.json({
+        ok:     true,
+        direct: true,
+        status: result.success ? "done" : "error",
+        result,
+      });
+    }
+
+    // ── test_order: sigue requiriendo el bot (necesita L2 auth) ─────────
     if (command === "test_order") {
       const { direction, stake } = params;
       if (!["UP", "DOWN"].includes(direction)) {
