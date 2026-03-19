@@ -429,6 +429,7 @@ def run(cfg: dict):
         db.set_config("bot_started_at", datetime.now(timezone.utc).isoformat())
         # v10.2: publicar stake para que el dashboard lo lea
         db.set_config("stake_usdc", str(stake))
+        db.set_config("funder_address", cfg.get("polymarket", {}).get("funder", ""))  # v10.8 — para check_balance inline
 
     last_config_check = time.time()
 
