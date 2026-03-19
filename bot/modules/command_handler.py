@@ -1,5 +1,15 @@
 """
-command_handler.py — v1.4  (importaciones relativas — bot/modules/)
+command_handler.py — v1.5  (importaciones relativas — bot/modules/)
+
+Cambios v1.5:
+  - FIX CRÍTICO: eliminado w3.is_connected() en _handle_check_balance.
+    is_connected() hace su propia llamada RPC (eth_chainId / web3_clientVersion)
+    que NO respeta request_kwargs={"timeout": _RPC_TIMEOUT} en todas las
+    versiones de web3.py → colgaba el hilo del bot → el comando quedaba
+    en status="running" para siempre y el dashboard agotaba su polling.
+    Fix: saltar directo a balanceOf.call() + get_balance(); si el RPC está
+    caído, el timeout del HTTPProvider dispara la excepción igualmente y
+    el loop continúa con el siguiente RPC.
 
 Cambios v1.4:
   - REVERT PERF: eliminado ThreadPoolExecutor (causaba cuelgue del módulo en Railway).
@@ -40,7 +50,7 @@ _POLYGON_RPCS = [
     "https://rpc-mainnet.matic.network",
 ]
 
-_RPC_TIMEOUT = 3  # segundos por intento
+_RPC_TIMEOUT = 4  # segundos por intento (subido ligeramente de 3 → 4 para RPCs lentos)
 
 
 # ── Helpers Supabase ──────────────────────────────────────────────────────────
@@ -117,9 +127,13 @@ def _handle_check_balance(cfg: dict) -> tuple[bool, dict]:
     """
     Consulta saldo USDC (ERC-20 en Polygon) y POL (gas).
 
-    v1.4: serial con timeout=3s y short-circuit al primer éxito.
-          Devuelve "usdc"/"pol" (nombres que lee ModeSelector.jsx).
-          Incluye "rpc_attempts" con diagnóstico de todos los intentos.
+    v1.5: eliminado w3.is_connected() — hacía una llamada RPC adicional que
+          no respetaba el timeout y bloqueaba el hilo del bot indefinidamente.
+          Ahora saltamos directo a balanceOf.call(); si el RPC está caído,
+          el timeout del HTTPProvider lanza excepción y pasamos al siguiente.
+
+    Devuelve "usdc"/"pol" (nombres que lee ModeSelector.jsx).
+    Incluye "rpc_attempts" con diagnóstico de todos los intentos.
     """
     try:
         from web3 import Web3
@@ -148,12 +162,10 @@ def _handle_check_balance(cfg: dict) -> tuple[bool, dict]:
             try:
                 w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": _RPC_TIMEOUT}))
 
-                if not w3.is_connected():
-                    elapsed = round((time.time() - t0) * 1000)
-                    attempts.append({"rpc": rpc_url, "ok": False,
-                                     "latency_ms": elapsed, "error": "is_connected=False"})
-                    logger.warning(f"[CMD] ⚠ RPC no conectado: {rpc_url} ({elapsed}ms)")
-                    continue
+                # v1.5: NO llamamos w3.is_connected() — hace su propio RPC
+                # que no respeta el timeout y bloquea el loop.
+                # Saltamos directo a las llamadas útiles; si el RPC está caído
+                # el timeout del HTTPProvider lanzará excepción aquí.
 
                 usdc     = w3.eth.contract(address=Web3.to_checksum_address(USDC_POLYGON), abi=ERC20_ABI)
                 raw_usdc = usdc.functions.balanceOf(addr_cs).call()
