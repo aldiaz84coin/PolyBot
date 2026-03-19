@@ -1,20 +1,14 @@
 """
 monitor.py — Loop principal del bot: ventana horaria, stop loss, resolución
 
+v10.9 — FIX CRÍTICO: sincronizar cfg tras cambio de modo
+  - Añadida línea cfg["strategy"]["simulate_mode"] = simulate en los dos
+    sitios donde simulate se actualiza desde BD (arranque y polling).
+    Sin este fix, execute_order() leía el valor original del cfg aunque
+    simulate ya fuera False → siempre ejecutaba en modo simulado.
+
 v10.8 — MODO VISIBLE EN CICLO + NOTIFICACIÓN TELEGRAM AL CAMBIAR
-  - _log_cycle(): añadido parámetro simulate, cambiado a logger.info,
-    prefijo [SIM]/[REAL] en cada línea de ciclo.
-  - _read_simulate_mode_from_db(): acepta cfg para llamar notify_mode_change()
-    cuando detecta cambio de modo en BD.
-  - report_state(): incluye simulate_mode=simulate para que el dashboard
-    muestre el modo activo real del bot.
-  - Import notify_mode_change desde .notifier.
-
 v10.7 — DASHBOARD STATE REPORTING
-  - Importa report_state / report_offline desde state_reporter.py.
-  - Llama report_state() en cada ciclo tras _log_cycle().
-  - Llama report_offline() al detener el bot.
-
 v10.6 — FIX notify_new_hour: target y config de estrategia
 v10.5 — notify_stop_loss enriquecida con desglose completo de la operación
 v10.4 — FIX KeyError 'name' + corrección de API evaluate / execute_order / notify
@@ -57,10 +51,10 @@ from .notifier        import (
     notify_error,
     notify_startup_summary,
     notify_order_failed,
-    notify_mode_change,        # v10.8
+    notify_mode_change,
 )
 from .command_handler  import process_pending_commands
-from .state_reporter   import report_state, report_offline   # v10.7
+from .state_reporter   import report_state, report_offline
 from .                 import db
 
 logger = logging.getLogger(__name__)
@@ -72,7 +66,7 @@ MAX_TARGET_RETRIES       = 5
 TARGET_RETRY_WAIT        = 10
 _CLOB_MIDPOINT           = "https://clob.polymarket.com/midpoint"
 _SNAPSHOT_EVERY_N_CYCLES = 10
-_CONFIG_POLL_INTERVAL    = 60   # segundos entre lecturas de bot_config
+_CONFIG_POLL_INTERVAL    = 60
 
 
 # ── Helpers de tiempo ─────────────────────────────────────────────────────────
@@ -90,7 +84,6 @@ def _mins_to_close() -> float:
 
 
 def _log_cycle(price, target, mins_left, ops_hoy, max_ops, simulate: bool = True):
-    """v10.8: muestra modo [SIM]/[REAL] en cada ciclo. Nivel INFO (siempre visible)."""
     dist_str = "—"
     if price and target:
         dist     = price - target
@@ -171,7 +164,6 @@ def _build_trade_row(bet, result, ts_cierre, pnl_usd, pnl_pct, real_exit_odds=No
 # ── Precio CLOB de salida ─────────────────────────────────────────────────────
 
 def _fetch_exit_token_price(token_id: str) -> float:
-    """Lee el precio CLOB live para calcular P&L real al cerrar posición."""
     if not token_id:
         return 0.0
     try:
@@ -190,13 +182,6 @@ def _fetch_exit_token_price(token_id: str) -> float:
 # ── FIX v10.3: helper para normalizar tokens (lista → dict) ──────────────────
 
 def _tokens_to_dict(tokens_raw) -> dict:
-    """
-    get_active_market() devuelve tokens como lista:
-      [{"outcome": "Yes", "token_id": "...", "price": 0.62}, ...]
-    Convierte a dict indexado por outcome en minúsculas:
-      {"yes": {"token_id": "...", ...}, "no": {...}}
-    Acepta también dict (retrocompatibilidad) y None.
-    """
     if isinstance(tokens_raw, dict):
         return tokens_raw
     if isinstance(tokens_raw, list):
@@ -207,7 +192,6 @@ def _tokens_to_dict(tokens_raw) -> dict:
 # ── Estadísticas históricas ───────────────────────────────────────────────────
 
 def _load_historical_stats(csv_path: str) -> dict:
-    """Intenta BD primero; si no disponible, cae a CSV local."""
     if db.is_enabled():
         try:
             s = db.fetch_historical_stats()
@@ -226,7 +210,6 @@ def _load_historical_stats(csv_path: str) -> dict:
         except Exception as e:
             logger.debug(f"[MONITOR] _load_historical_stats BD: {e}")
 
-    # Fallback CSV
     stats = {"total_ops": 0, "wins": 0, "losses": 0, "stops": 0,
              "total": 0, "win_rate": 0, "total_pnl": 0.0, "invested": 0.0}
     _ensure_csv(csv_path)
@@ -366,7 +349,7 @@ def _read_simulate_mode_from_db(current_simulate: bool, cfg: dict) -> bool:
             )
             db.set_config("bot_simulate_active", str(new_simulate).lower())
             db.set_config("bot_mode_ack_at", datetime.now(timezone.utc).isoformat())
-            notify_mode_change(cfg, label_old, label_new)   # v10.8 — Telegram
+            notify_mode_change(cfg, label_old, label_new)
         return new_simulate
     except Exception as e:
         logger.debug(f"[MONITOR] _read_simulate_mode_from_db: {e}")
@@ -396,10 +379,12 @@ def run(cfg: dict):
 
     # v10.0: leer modo desde BD (sobreescribe env var si BD disponible)
     if db_ok:
-        simulate = _read_simulate_mode_from_db(simulate, cfg)   # v10.8: pasa cfg
+        simulate = _read_simulate_mode_from_db(simulate, cfg)
+        # v10.9 FIX: sincronizar cfg para que execute_order() lea el modo correcto
+        cfg.setdefault("strategy", {})["simulate_mode"] = simulate
         db.set_config("bot_simulate_active", str(simulate).lower())
         db.set_config("bot_started_at", datetime.now(timezone.utc).isoformat())
-        db.set_config("stake_usdc", str(stake))                 # v10.2
+        db.set_config("stake_usdc", str(stake))
         db.set_config("funder_address", cfg.get("polymarket", {}).get("funder", ""))
 
     last_config_check = time.time()
@@ -451,7 +436,9 @@ def run(cfg: dict):
 
             # ── Modo: polling desde BD cada _CONFIG_POLL_INTERVAL segundos ─
             if db_ok and (time.time() - last_config_check) >= _CONFIG_POLL_INTERVAL:
-                simulate          = _read_simulate_mode_from_db(simulate, cfg)   # v10.8
+                simulate = _read_simulate_mode_from_db(simulate, cfg)
+                # v10.9 FIX: sincronizar cfg para que execute_order() lea el modo correcto
+                cfg.setdefault("strategy", {})["simulate_mode"] = simulate
                 last_config_check = time.time()
                 process_pending_commands(cfg)
 
@@ -500,7 +487,6 @@ def run(cfg: dict):
                         hour_pnl, hour_invested, simulate,
                     )
 
-                # Reset contadores horarios
                 hour_wins     = 0
                 hour_losses   = 0
                 hour_stops    = 0
@@ -513,7 +499,6 @@ def run(cfg: dict):
                 active_bet    = None
                 last_notified_signal_key = None
 
-                # v10.6 FIX: pre-fetch target ANTES de notify_new_hour
                 target = None
                 try:
                     target = get_open_1h_binance()
@@ -569,15 +554,14 @@ def run(cfg: dict):
                 time.sleep(interval)
                 continue
 
-            # Detectar cambio de target dentro de la hora (poco frecuente)
             new_target = get_open_1h_binance()
             if new_target and abs((new_target - target) / target) > 0.001:
                 notify_target_change(cfg, target, new_target, mins_left)
                 target = new_target
 
-            _log_cycle(price, target, mins_left, ops_hoy, max_ops, simulate)   # v10.8
+            _log_cycle(price, target, mins_left, ops_hoy, max_ops, simulate)
 
-            # ── v10.8: Reportar estado al dashboard (con simulate_mode) ───
+            # ── v10.8: Reportar estado al dashboard ───────────────────────
             report_state(
                 market        = market,
                 target        = target,
@@ -585,7 +569,7 @@ def run(cfg: dict):
                 direction     = active_bet.get("direction") if active_bet else None,
                 ops_today     = ops_hoy,
                 bet_active    = bool(active_bet),
-                simulate_mode = simulate,   # v10.8
+                simulate_mode = simulate,
             )
 
             # ── Stop loss (posición abierta) ───────────────────────────────
@@ -607,7 +591,6 @@ def run(cfg: dict):
                 exit_token_price   = _fetch_exit_token_price(real_exit_token_id) if real_exit_token_id else 0.0
                 real_exit_odds_val = exit_token_price if exit_token_price > 0 else None
 
-                # P&L estimado a precio actual del token
                 if exit_token_price > 0:
                     retorno_actual = tokens_held * exit_token_price
                     pnl_usd        = retorno_actual - stake_
@@ -701,12 +684,10 @@ def run(cfg: dict):
                 exit_token_price   = _fetch_exit_token_price(real_exit_token_id) if real_exit_token_id else 0.0
                 real_exit_odds_val = exit_token_price if exit_token_price > 0 else None
 
-                # Determinar resultado por precio de cierre del token
                 if exit_token_price > 0:
                     won       = exit_token_price >= 0.95
                     exit_odds = exit_token_price
                 else:
-                    # Fallback si no hay CLOB: decidir por precio BTC vs target
                     won       = (dir_ == "UP" and price > (active_bet.get("target") or price)) or \
                                 (dir_ == "DOWN" and price < (active_bet.get("target") or price))
                     exit_odds = 0.98 if won else 0.02
@@ -918,9 +899,9 @@ def run(cfg: dict):
     except KeyboardInterrupt:
         logger.info("[MONITOR] 🛑 Detenido por el usuario")
         notify_stop(cfg)
-        report_offline()   # v10.7
+        report_offline()
     except Exception as e:
         logger.error(f"[MONITOR] ❌ Error fatal: {e}", exc_info=True)
         notify_error(cfg, str(e))
-        report_offline()   # v10.7
+        report_offline()
         raise
