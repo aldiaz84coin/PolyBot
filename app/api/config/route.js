@@ -1,126 +1,158 @@
 /**
- * app/api/commands/route.js — v1.0
- * Canal de comandos dashboard → bot.
+ * app/api/config/route.js — v1.1
  *
- * POST /api/commands  { command, params }   → { ok, id }
- * GET  /api/commands?id=123                 → { id, command, status, result, ... }
- * GET  /api/commands?status=pending         → { commands: [...] }
+ * Endpoint de configuración compartida bot ↔ dashboard.
+ * Lee y escribe en la tabla bot_config de Supabase.
  *
- * Comandos soportados:
- *   check_clob      → bot prueba conectividad CLOB y devuelve latencia + token_id
- *   check_balance   → bot consulta saldo USDC en cartera
- *   test_order      → bot ejecuta una orden real de prueba
- *                     params: { direction: 'UP'|'DOWN', stake: 1.0 }
+ * El bot lee trading_mode cada 60s via db.get_config("trading_mode").
+ * El dashboard escribe aquí → el bot lo recoge en el siguiente ciclo.
+ *
+ * GET  /api/config?key=trading_mode   → { key, value, updated_at }
+ * POST /api/config  { key, value }    → { ok, key, value }
  */
 
 import { NextResponse } from "next/server";
-import { getSupabase } from "../../../lib/supabase";
+import { getSupabase }  from "../../../lib/supabase";
 
-const VALID_COMMANDS = ["check_clob", "check_balance", "test_order"];
+export const dynamic = "force-dynamic";
 
-export async function POST(req) {
-  try {
-    const { command, params = {} } = await req.json();
+// Claves permitidas (whitelist de seguridad)
+const ALLOWED_KEYS = new Set([
+  "trading_mode",
+  "stake_usdc",
+  "bot_simulate_active",
+  "bot_started_at",
+  "funder_address",
+  "mode_changed_by",
+  "mode_changed_at",
+]);
 
-    if (!VALID_COMMANDS.includes(command)) {
-      return NextResponse.json(
-        { ok: false, error: `Comando inválido. Válidos: ${VALID_COMMANDS.join(", ")}` },
-        { status: 400 }
-      );
-    }
-
-    // Validaciones específicas por comando
-    if (command === "test_order") {
-      if (!["UP", "DOWN"].includes(params?.direction)) {
-        return NextResponse.json(
-          { ok: false, error: "test_order requiere params.direction = 'UP' | 'DOWN'" },
-          { status: 400 }
-        );
-      }
-      const stake = parseFloat(params?.stake);
-      if (isNaN(stake) || stake < 0.5 || stake > 10) {
-        return NextResponse.json(
-          { ok: false, error: "test_order requiere params.stake entre 0.50 y 10.00 USDC" },
-          { status: 400 }
-        );
-      }
-    }
-
-    const sb = getSupabase();
-    if (!sb) {
-      return NextResponse.json(
-        { ok: false, error: "Supabase no configurado — no se puede enviar comandos al bot" },
-        { status: 503 }
-      );
-    }
-
-    const now = new Date().toISOString();
-    const { data, error } = await sb
-      .from("bot_commands")
-      .insert({ command, params, status: "pending", created_at: now, updated_at: now })
-      .select("id")
-      .single();
-
-    if (error) throw error;
-
-    return NextResponse.json({ ok: true, id: data.id, command, status: "pending" });
-  } catch (e) {
-    console.error("[commands/POST] Error:", e.message);
-    return NextResponse.json({ ok: false, error: e.message }, { status: 500 });
-  }
-}
+// ── GET /api/config?key=xxx ───────────────────────────────────────────────────
 
 export async function GET(req) {
   const { searchParams } = new URL(req.url);
-  const id     = searchParams.get("id");
-  const status = searchParams.get("status");
+  const key = searchParams.get("key");
+
+  if (!key) {
+    return NextResponse.json(
+      { ok: false, error: "Parámetro 'key' requerido" },
+      { status: 400 }
+    );
+  }
+
+  const sb = getSupabase();
+  if (!sb) {
+    // Sin Supabase: devolver defaults útiles en vez de error
+    const defaults = { trading_mode: "simulate", stake_usdc: "10" };
+    return NextResponse.json(
+      { key, value: defaults[key] ?? null, source: "default" },
+      { headers: { "Cache-Control": "no-store" } }
+    );
+  }
+
+  try {
+    const { data, error } = await sb
+      .from("bot_config")
+      .select("key, value, updated_at")
+      .eq("key", key)
+      .maybeSingle();
+
+    if (error) throw error;
+
+    return NextResponse.json(
+      {
+        key,
+        value:      data?.value      ?? null,
+        updated_at: data?.updated_at ?? null,
+        source:     data ? "supabase" : "not_found",
+      },
+      { headers: { "Cache-Control": "no-store" } }
+    );
+  } catch (e) {
+    console.error("[config/GET] Error:", e.message);
+    return NextResponse.json(
+      { ok: false, error: e.message },
+      { status: 500, headers: { "Cache-Control": "no-store" } }
+    );
+  }
+}
+
+// ── POST /api/config  { key, value } ─────────────────────────────────────────
+
+export async function POST(req) {
+  let body;
+  try {
+    body = await req.json();
+  } catch (_) {
+    return NextResponse.json(
+      { ok: false, error: "Body JSON inválido" },
+      { status: 400 }
+    );
+  }
+
+  const { key, value } = body;
+
+  if (!key || value === undefined) {
+    return NextResponse.json(
+      { ok: false, error: "Se requieren 'key' y 'value'" },
+      { status: 400 }
+    );
+  }
+
+  if (!ALLOWED_KEYS.has(key)) {
+    return NextResponse.json(
+      { ok: false, error: `Clave no permitida: ${key}` },
+      { status: 403 }
+    );
+  }
+
+  // Validación específica para trading_mode
+  if (key === "trading_mode" && !["simulate", "real"].includes(value)) {
+    return NextResponse.json(
+      { ok: false, error: "trading_mode debe ser 'simulate' o 'real'" },
+      { status: 400 }
+    );
+  }
 
   const sb = getSupabase();
   if (!sb) {
     return NextResponse.json(
-      { ok: false, error: "Supabase no configurado" },
+      { ok: false, error: "Supabase no configurado — añade SUPABASE_URL y SUPABASE_SERVICE_KEY en Vercel" },
       { status: 503 }
     );
   }
 
   try {
-    if (id) {
-      const { data, error } = await sb
-        .from("bot_commands")
-        .select("*")
-        .eq("id", id)
-        .single();
-      if (error) throw error;
-      return NextResponse.json(data, { headers: { "Cache-Control": "no-store" } });
-    }
+    const now = new Date().toISOString();
 
-    if (status) {
-      const { data, error } = await sb
-        .from("bot_commands")
-        .select("*")
-        .eq("status", status)
-        .order("created_at", { ascending: false })
-        .limit(20);
-      if (error) throw error;
-      return NextResponse.json(
-        { commands: data || [] },
-        { headers: { "Cache-Control": "no-store" } }
+    const { error } = await sb
+      .from("bot_config")
+      .upsert(
+        { key, value: String(value), updated_at: now },
+        { onConflict: "key" }
       );
+
+    if (error) throw error;
+
+    // Si es un cambio de modo, registrar también quién lo cambió y cuándo
+    if (key === "trading_mode") {
+      await sb.from("bot_config").upsert([
+        { key: "mode_changed_by",  value: "dashboard",  updated_at: now },
+        { key: "mode_changed_at",  value: now,          updated_at: now },
+      ], { onConflict: "key" });
+
+      console.log(`[config/POST] trading_mode → ${value}`);
     }
 
-    // Sin filtros → últimos 10 comandos
-    const { data, error } = await sb
-      .from("bot_commands")
-      .select("*")
-      .order("created_at", { ascending: false })
-      .limit(10);
-    if (error) throw error;
     return NextResponse.json(
-      { commands: data || [] },
+      { ok: true, key, value, updated_at: now },
       { headers: { "Cache-Control": "no-store" } }
     );
   } catch (e) {
-    console.error("[commands/GET] Error:", e.message);
-    return NextResponse.json({ ok: false, error: e.message }, { status: 500 });
+    console.error("[config/POST] Error:", e.message);
+    return NextResponse.json(
+      { ok: false, error: e.message },
+      { status: 500 }
+    );
   }
 }
