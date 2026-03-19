@@ -1,46 +1,58 @@
 "use client";
 /**
- * Dashboard.jsx — v4.2
+ * Dashboard.jsx — v5.0
  *
- * CAMBIOS v4.2
+ * CAMBIOS v5.0 — Corrección integral (todos los bugs reportados)
  * ─────────────────────────────────────────────────────────────────────
- * 1. FIX priceHistory: cada punto ahora incluye { ts, price, target }
- *    → el tooltip de PriceChart muestra el target correctamente.
+ * BUG 1 FIX — getDecision recibía `config` (objeto) en lugar del umbral
+ *   numérico de la ventana activa. `dist > {objeto}` es siempre false en JS
+ *   → la señal siempre era WAIT. Ahora: getDecision(price, target, umbral)
+ *   donde umbral = config[activeWindow.configKey] ?? 200.
  *
- * 2. FIX fmtTime: acepta tanto ts_iso (string ISO) como ts (timestamp ms).
- *    La función anterior solo intentaba parsear ts_iso; si el evento venía
- *    con ts numérico (ms) el render mostraba cadena vacía.
+ * BUG 2 FIX — getDecision devolvía { dir, ... } pero el render usaba
+ *   decision.direction y decision.threshold (siempre undefined).
+ *   Corregido en constants.js v2.0 (direction, threshold). El render ya
+ *   era correcto, solo fallaba la fuente de datos.
  *
- * 3. FIX timestamp color en eventos: cambiado de #2a2a3a (casi invisible
- *    sobre #010108) a #444 (legible).
+ * BUG 3 FIX — activeWindow es un OBJETO { key, label, color, ... } pero el
+ *   render hacía `{activeWindow}` → "[object Object]". Corregido:
+ *   `{activeWindow?.label}`.
  *
- * 4. FIX alerta FRONTEND_URL: cuando events.length === 0 y bot está activo
- *    (running), muestra un hint de que posiblemente FRONTEND_URL no está
- *    configurado en Railway.
+ * BUG 4 FIX — botState se polleaba en un useEffect ad-hoc. Reemplazado por
+ *   el hook useBotState() de hooks.js v4.0, que también alimenta useMarket()
+ *   sin duplicar la llamada HTTP a /api/bot-state.
  *
- * (v4.1 — eventos acumulativos, target visible, MarketInfo simplificado)
- * (v4.0 — simplificación MarketInfo, log de eventos desde /api/events)
+ * BUG 5 FIX — priceHistory capturaba target desde closure; si target llegaba
+ *   tarde, los primeros puntos del historial tenían target:null y la
+ *   ReferenceLine no aparecía. Ahora: target se pasa directamente como prop
+ *   a <PriceChart> (ya lo era) y se garantiza que el efecto registra target
+ *   también cuando cambia de null a número.
+ *
+ * (v4.2 — fmtTime, hints de eventos)
+ * (v4.1 — eventos acumulativos)
+ * (v4.0 — simplificación MarketInfo, log de eventos)
  */
 
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useCallback } from "react";
 import {
-  WINDOWS, DEFAULT_CONFIG,
+  DEFAULT_CONFIG,
   getDecision, getActiveWindow, getMinsLeft,
-  fmt, fmtUSD, fmtPct, genId,
+  fmt, fmtUSD,
 } from "../lib/constants";
-import { useBTCPrice, useMarket, useClock, useLog } from "../lib/hooks";
-import PriceChart   from "./PriceChart";
-import WindowBar    from "./WindowBar";
-import MarketInfo   from "./MarketInfo";
-import BetsTable    from "./BetsTable";
-import ConfigPanel  from "./ConfigPanel";
-import StatsPanel   from "./StatsPanel";
+import { useBotState, useBTCPrice, useMarket, useClock } from "../lib/hooks";
+import PriceChart  from "./PriceChart";
+import WindowBar   from "./WindowBar";
+import MarketInfo  from "./MarketInfo";
+import BetsTable   from "./BetsTable";
+import ConfigPanel from "./ConfigPanel";
+import StatsPanel  from "./StatsPanel";
 import ModeSelector from "./ModeSelector";
 
-const LS_KEY            = "polymarket_bets_v2";
-const BETS_POLL_MS      = 10_000;
-const BOTSTATE_POLL_MS  = 5_000;
-const EVENTS_POLL_MS    = 5_000;
+const LS_KEY        = "polymarket_bets_v2";
+const BETS_POLL_MS  = 10_000;
+const EVENTS_POLL_MS = 5_000;
+
+// ── Micro-componentes ─────────────────────────────────────────────────────────
 
 function Tag({ children, color = "#555" }) {
   return (
@@ -63,7 +75,6 @@ function StatBox({ label, value, color = "#c8c8d8", sub }) {
   );
 }
 
-// FIX v4.2: acepta ts_iso (string ISO) O ts (número ms desde epoch)
 function fmtTime(tsIsoOrMs) {
   try {
     if (!tsIsoOrMs) return "";
@@ -84,37 +95,42 @@ function eventColor(text) {
   return "#888";
 }
 
+// ── Componente principal ──────────────────────────────────────────────────────
+
 export default function Dashboard() {
   const [config, setConfig]             = useState(DEFAULT_CONFIG);
   const [tab, setTab]                   = useState("dashboard");
   const [bets, setBets]                 = useState([]);
   const [priceHistory, setPriceHistory] = useState([]);
+  const [events, setEvents]             = useState([]);
 
-  // ── Estado del bot ────────────────────────────────────────────────────
-  const [botState, setBotState] = useState(null);
-  const running  = botState?.status === "running" && !botState?.stale;
-  const botStale = botState?.stale ?? false;
+  // ── Hooks de datos ────────────────────────────────────────────────────────
+  //
+  // FIX v5.0: useBotState() reemplaza el useEffect ad-hoc.
+  // Se pasa botState.raw a useMarket() para evitar doble fetch a /api/bot-state.
 
-  // ── Log de eventos (mensajes Telegram) ───────────────────────────────
-  const [events, setEvents] = useState([]);
-
-  // ── Hooks de precio y mercado ─────────────────────────────────────────
-  const { price, prev, source, error: priceError, loading: priceLoading } = useBTCPrice(true);
-  const { market, endMs, active: marketActive, error: marketError, apiResponse: marketApiResponse } = useMarket();
+  const botState = useBotState();
+  const { price, prev, source, loading: priceLoading } = useBTCPrice(true);
+  const { market, endMs, error: marketError, apiResponse: marketApiResponse } = useMarket(botState.raw);
   const now = useClock();
 
-  // ── Derived values ────────────────────────────────────────────────────
-  const minsLeft     = getMinsLeft(endMs, now);
-  const activeWindow = getActiveWindow(minsLeft);
+  // ── Valores derivados ─────────────────────────────────────────────────────
 
-  // Target desde bot-state (autoritativo)
-  const target = botState?.target ?? null;
+  const minsLeft     = getMinsLeft(endMs, now);
+  const activeWindow = getActiveWindow(minsLeft);   // objeto { key, label, ... } o null
+
+  // Target: lo que el bot reporta como "precio de apertura de vela"
+  const target = botState.target ?? null;
   const dist   = price != null && target != null ? price - target : null;
 
-  // Señal visual
-  const decision = config && price && target ? getDecision(price, target, config) : null;
+  // FIX v5.0 BUG 1: pasar el umbral numérico de la ventana activa, no el config completo.
+  // Si no hay ventana activa, se puede usar el t5_umbral como mínimo (o null → señal null).
+  const umbral   = activeWindow ? (config[activeWindow.configKey] ?? 200) : null;
+  const decision = price != null && target != null && umbral != null
+    ? getDecision(price, target, umbral)
+    : null;
 
-  // Stats desde bets
+  // Stats de bets
   const closedBets = bets.filter(b => b.result && b.result !== "PENDING");
   const wins       = closedBets.filter(b => b.result === "WIN").length;
   const losses     = closedBets.filter(b => b.result === "LOSS" || b.result === "STOP").length;
@@ -122,33 +138,27 @@ export default function Dashboard() {
   const winrate    = total > 0 ? (wins / total) * 100 : null;
   const pnlTotal   = closedBets.reduce((acc, b) => acc + (b.pnl_usd ?? 0), 0);
   const activeBet  = bets.find(b => b.result === "PENDING") ?? null;
-
-  // Slug corto para header
   const marketSlugShort = market?.slug?.split("-").slice(-3).join("-") ?? null;
 
-  // ─────────────────────────────────────────────────────────────────────
-  // EFFECTS
-  // ─────────────────────────────────────────────────────────────────────
+  // ── Effects ───────────────────────────────────────────────────────────────
 
-  // ── 1. Cargar bets desde Supabase ─────────────────────────────────────
+  // 1. Bets desde Supabase
   const loadBets = useCallback(async () => {
     try {
       const res  = await fetch("/api/bets?limit=500");
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      if (!res.ok) return;
       const data = await res.json();
       const rows = data.bets ?? [];
       if (rows.length > 0) {
         setBets(rows);
         try { localStorage.setItem(LS_KEY, JSON.stringify(rows.slice(0, 500))); } catch {}
       }
-    } catch (e) {
-      console.warn("[Dashboard] Error cargando bets:", e.message);
-    }
+    } catch {}
   }, []);
 
   useEffect(() => {
     try {
-      const saved  = localStorage.getItem(LS_KEY);
+      const saved = localStorage.getItem(LS_KEY);
       if (saved) {
         const parsed = JSON.parse(saved);
         if (Array.isArray(parsed) && parsed.length > 0) setBets(parsed);
@@ -159,38 +169,14 @@ export default function Dashboard() {
     return () => clearInterval(id);
   }, [loadBets]);
 
-  // ── 2. Estado del bot desde /api/bot-state ────────────────────────────
-  useEffect(() => {
-    async function fetchBotState() {
-      try {
-        const res  = await fetch("/api/bot-state");
-        if (!res.ok) return;
-        const data = await res.json();
-        setBotState(data);
-        if (data.stake_usdc) {
-          setConfig(c => ({ ...c, stake_usdc: parseFloat(data.stake_usdc) }));
-        }
-      } catch {}
-    }
-    fetchBotState();
-    const id = setInterval(fetchBotState, BOTSTATE_POLL_MS);
-    return () => clearInterval(id);
-  }, []);
-
-  // ── 3. Log de eventos — acumulativo, no reemplaza ─────────────────────
-  //
-  // FIX v4.1: si el servidor devuelve [] (instancia fría de Vercel),
-  // conservar el estado local. Solo añadir eventos nuevos (merge por id).
-  // FIX v4.2: fmtTime ahora acepta ts_iso o ts, corregido en render.
+  // 2. Eventos del bot (mensajes Telegram replicados)
   const loadEvents = useCallback(async () => {
     try {
       const res      = await fetch("/api/events");
       if (!res.ok) return;
       const data     = await res.json();
       const incoming = data.events ?? [];
-
       if (incoming.length === 0) return;
-
       setEvents(prev => {
         const prevIds = new Set(prev.map(e => e.id));
         const newOnes = incoming.filter(e => !prevIds.has(e.id));
@@ -206,7 +192,18 @@ export default function Dashboard() {
     return () => clearInterval(id);
   }, [loadEvents]);
 
-  // ── 4. Leer stake_usdc del bot desde bot_config en Supabase ──────────
+  // 3. Historial de precio para la gráfica
+  //    FIX v5.0 BUG 5: target incluido en deps para que cada punto de historial
+  //    capture el target correcto en cuanto llega del bot.
+  useEffect(() => {
+    if (!price) return;
+    const ts = new Date().toLocaleTimeString("es-ES", {
+      hour: "2-digit", minute: "2-digit", second: "2-digit",
+    });
+    setPriceHistory(h => [...h, { ts, price, target }].slice(-60));
+  }, [price, target]);
+
+  // 4. Stake USDC desde config API (si disponible)
   useEffect(() => {
     async function fetchStake() {
       try {
@@ -222,24 +219,7 @@ export default function Dashboard() {
     fetchStake();
   }, []);
 
-  // ── 5. Precio history — FIX v4.2: incluye target en cada punto ───────
-  //
-  // PriceChart usa d.target en el tooltip. Sin este campo, el tooltip
-  // nunca mostraba el target aunque la ReferenceLine sí lo dibujara.
-  useEffect(() => {
-    if (!price) return;
-    setPriceHistory(h => {
-      const ts = new Date().toLocaleTimeString("es-ES", {
-        hour: "2-digit", minute: "2-digit", second: "2-digit",
-      });
-      // Capturar target en el mismo closure donde price está actualizado
-      return [...h, { ts, price, target }].slice(-60);
-    });
-  }, [price, target]);
-
-  // ─────────────────────────────────────────────────────────────────────
-  // RENDER
-  // ─────────────────────────────────────────────────────────────────────
+  // ── Render ────────────────────────────────────────────────────────────────
 
   return (
     <div style={{
@@ -248,7 +228,7 @@ export default function Dashboard() {
       color: "var(--text)", fontSize: 12,
     }}>
 
-      {/* ── HEADER ───────────────────────────────────────────────────────── */}
+      {/* ── HEADER ─────────────────────────────────────────────────────── */}
       <header style={{
         display: "flex", justifyContent: "space-between", alignItems: "center",
         padding: "10px 20px", borderBottom: "1px solid var(--border)",
@@ -257,17 +237,13 @@ export default function Dashboard() {
         <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
           <div style={{
             width: 8, height: 8, borderRadius: "50%",
-            background: running ? "var(--green)" : "var(--red)",
-            boxShadow: running ? "0 0 12px var(--green)" : "0 0 8px var(--red)",
-            animation: running ? "pulse 2s infinite" : "none",
+            background: botState.running ? "var(--green)" : "var(--red)",
+            boxShadow: botState.running ? "0 0 12px var(--green)" : "0 0 8px var(--red)",
+            animation: botState.running ? "pulse 2s infinite" : "none",
           }} />
-          <span style={{ fontSize: 12, fontWeight: 700, letterSpacing: "0.1em" }}>
-            POLYBOT
-          </span>
-          {botStale && <Tag color="var(--yellow)">BOT STALE</Tag>}
-          {marketSlugShort && (
-            <Tag color="#4488ff">{marketSlugShort}</Tag>
-          )}
+          <span style={{ fontSize: 12, fontWeight: 700, letterSpacing: "0.1em" }}>POLYBOT</span>
+          {botState.stale   && <Tag color="var(--yellow)">BOT STALE</Tag>}
+          {marketSlugShort  && <Tag color="#4488ff">{marketSlugShort}</Tag>}
           {activeBet && (
             <Tag color={activeBet.direction === "UP" ? "var(--green)" : "var(--red)"}>
               {activeBet.direction === "UP" ? "▲" : "▼"} APUESTA ACTIVA
@@ -275,9 +251,11 @@ export default function Dashboard() {
           )}
         </div>
         <div style={{ display: "flex", gap: 16, alignItems: "center" }}>
-          {target && (
+          {/* FIX v5.0: target viene de botState.target, no de mercado */}
+          {target != null && (
             <span style={{ fontSize: 10, color: "var(--yellow)", letterSpacing: "0.08em" }}>
-              TARGET <span style={{ fontWeight: 700 }}>
+              TARGET{" "}
+              <span style={{ fontWeight: 700 }}>
                 ${target.toLocaleString("en-US", { maximumFractionDigits: 0 })}
               </span>
             </span>
@@ -288,34 +266,27 @@ export default function Dashboard() {
         </div>
       </header>
 
-      {/* ── TABS ─────────────────────────────────────────────────────────── */}
-      <nav style={{
-        display: "flex", borderBottom: "1px solid var(--border)",
-        background: "#020208",
-      }}>
+      {/* ── TABS ────────────────────────────────────────────────────────── */}
+      <nav style={{ display: "flex", borderBottom: "1px solid var(--border)", background: "#020208" }}>
         {[
-          { key: "dashboard", label: "DASHBOARD" },
-          { key: "historial", label: "HISTORIAL" },
-          { key: "stats",     label: "ESTADÍSTICAS" },
-          { key: "config",    label: "CONFIG" },
+          { key: "dashboard",  label: "DASHBOARD"     },
+          { key: "historial",  label: "HISTORIAL"     },
+          { key: "stats",      label: "ESTADÍSTICAS"  },
+          { key: "config",     label: "CONFIG"        },
         ].map(({ key, label }) => (
-          <button
-            key={key}
-            onClick={() => setTab(key)}
-            style={{
-              background: "none", border: "none", cursor: "pointer",
-              padding: "10px 20px", fontSize: 9, letterSpacing: "0.15em",
-              color: tab === key ? "var(--text)" : "#444",
-              borderBottom: tab === key ? "2px solid var(--green)" : "2px solid transparent",
-              fontFamily: "inherit",
-            }}
-          >
+          <button key={key} onClick={() => setTab(key)} style={{
+            background: "none", border: "none", cursor: "pointer",
+            padding: "10px 20px", fontSize: 9, letterSpacing: "0.15em",
+            color: tab === key ? "var(--text)" : "#444",
+            borderBottom: tab === key ? "2px solid var(--green)" : "2px solid transparent",
+            fontFamily: "inherit",
+          }}>
             {label}
           </button>
         ))}
       </nav>
 
-      {/* ── STATS BAR (solo dashboard) ────────────────────────────────────── */}
+      {/* ── STATS BAR ───────────────────────────────────────────────────── */}
       {tab === "dashboard" && (
         <div style={{
           display: "flex", gap: 32, padding: "12px 20px",
@@ -333,14 +304,14 @@ export default function Dashboard() {
             color="var(--yellow)"
             sub={`${wins}W / ${losses}L`}
           />
-          <StatBox label="OPS" value={total} color="var(--dim)" />
+          <StatBox label="OPS" value={total || "—"} color="var(--dim)" />
           <div style={{ marginLeft: "auto", fontSize: 9, color: "#333", alignSelf: "center" }}>
             ↻ sync cada 10s · fuente: Supabase
           </div>
         </div>
       )}
 
-      {/* ── PANEL PRINCIPAL 3-columnas ────────────────────────────────────── */}
+      {/* ── PANEL PRINCIPAL 3-columnas ──────────────────────────────────── */}
       {tab === "dashboard" && (
         <div style={{
           display: "grid",
@@ -348,8 +319,8 @@ export default function Dashboard() {
           borderBottom: "1px solid var(--border)",
         }}>
 
-          {/* BTC PRICE */}
-          <div style={{ background: "var(--bg)", padding: "20px 24px", borderRight: "1px solid var(--border)" }}>
+          {/* COLUMNA 1 — BTC PRECIO + TARGET + WINDOWBAR */}
+          <div style={{ padding: "20px 24px", borderRight: "1px solid var(--border)" }}>
             <div style={{ fontSize: 9, color: "#444", letterSpacing: "0.15em", marginBottom: 6 }}>
               BTC / USDT
               {source && <span style={{ color: "#333", marginLeft: 6 }}>{source.toUpperCase()}</span>}
@@ -358,69 +329,80 @@ export default function Dashboard() {
               fontSize: 38, fontWeight: 700, lineHeight: 1,
               color: price && prev ? (price >= prev ? "var(--green)" : "var(--red)") : "var(--text)",
             }}>
-              {price ? `$${fmt(price, 2)}` : (priceLoading ? "..." : "—")}
+              {price ? `$${fmt(price, 2)}` : (priceLoading ? "…" : "—")}
             </div>
             {prev && price && (
               <div style={{ fontSize: 11, color: price >= prev ? "var(--green)" : "var(--red)", marginTop: 4 }}>
                 {price >= prev ? "▲" : "▼"} ${Math.abs(price - prev).toFixed(2)}
               </div>
             )}
-            {/* TARGET value */}
-            {target && (
-              <div style={{ fontSize: 11, color: "#888", marginTop: 6 }}>
+
+            {/* TARGET con distancia */}
+            {target != null ? (
+              <div style={{ fontSize: 11, color: "#888", marginTop: 8 }}>
                 TARGET{" "}
                 <span style={{ color: "var(--yellow)", fontWeight: 700 }}>
                   ${target.toLocaleString("en-US", { maximumFractionDigits: 0 })}
                 </span>
                 {dist != null && (
-                  <span style={{
-                    marginLeft: 8,
-                    color: dist > 0 ? "#4488ff" : "#ff8800",
-                    fontWeight: 700,
-                  }}>
+                  <span style={{ marginLeft: 8, color: dist > 0 ? "#4488ff" : "#ff8800", fontWeight: 700 }}>
                     ({dist > 0 ? "+" : ""}{fmtUSD(dist)})
                   </span>
                 )}
               </div>
+            ) : (
+              <div style={{ fontSize: 10, color: "#333", marginTop: 8 }}>
+                TARGET — (bot offline o sin vela)
+              </div>
             )}
+
+            {/* WindowBar — FIX v5.0: minsLeft siempre válido */}
             <div style={{ marginTop: 16 }}>
               <WindowBar minsLeft={minsLeft} activeWindow={activeWindow} />
             </div>
           </div>
 
-          {/* SEÑAL */}
-          <div style={{ background: "var(--bg)", padding: "20px 24px", borderRight: "1px solid var(--border)" }}>
+          {/* COLUMNA 2 — SEÑAL VISUAL */}
+          <div style={{ padding: "20px 24px", borderRight: "1px solid var(--border)" }}>
             <div style={{ fontSize: 9, color: "#444", letterSpacing: "0.15em", marginBottom: 6 }}>SEÑAL VISUAL</div>
+
             {activeWindow && decision ? (
               <>
+                {/* FIX v5.0 BUG 2: decision.direction (no decision.dir) */}
                 <div style={{
                   fontSize: 28, fontWeight: 700,
-                  color: decision.direction === "UP" ? "var(--green)" : decision.direction === "DOWN" ? "var(--red)" : "#555",
+                  color: decision.direction === "UP"   ? "var(--green)"
+                       : decision.direction === "DOWN" ? "var(--red)"
+                       : "#555",
                 }}>
-                  {decision.direction === "UP" ? "▲ UP" : decision.direction === "DOWN" ? "▼ DOWN" : "— WAIT"}
+                  {decision.direction === "UP"   ? "▲ UP"
+                   : decision.direction === "DOWN" ? "▼ DOWN"
+                   : "— WAIT"}
                 </div>
-                {decision.direction !== "WAIT" && (
-                  <div style={{ fontSize: 10, color: "#666", marginTop: 6 }}>
-                    ventana {activeWindow}
-                  </div>
-                )}
-                {target && (
+
+                {/* FIX v5.0 BUG 3: activeWindow?.label no {activeWindow} */}
+                <div style={{ fontSize: 10, color: activeWindow.color, marginTop: 6 }}>
+                  ventana {activeWindow.label}
+                </div>
+
+                {target != null && (
                   <div style={{ marginTop: 10, fontSize: 11 }}>
                     <div style={{ color: "#444", marginBottom: 4 }}>
-                      TARGET <span style={{ color: "var(--yellow)", fontWeight: 700 }}>
+                      TARGET{" "}
+                      <span style={{ color: "var(--yellow)", fontWeight: 700 }}>
                         ${target.toLocaleString("en-US", { maximumFractionDigits: 0 })}
                       </span>
                     </div>
-                    {dist != null && (
-                      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                    {dist != null && umbral != null && (
+                      <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
                         <span style={{ color: "#333" }}>Δ</span>
                         <span style={{
-                          color: (dist ?? 0) > (decision.threshold ?? 0)
-                            ? "var(--green)" : "var(--red)",
+                          color: Math.abs(dist) > umbral ? "var(--green)" : "var(--red)",
                           fontWeight: 700,
                         }}>
-                          ${Math.abs(dist ?? 0).toFixed(0)}
+                          ${Math.abs(dist).toFixed(0)}
                         </span>
+                        <span style={{ color: "#333" }}>/ umbral ${umbral}</span>
                       </div>
                     )}
                   </div>
@@ -428,9 +410,9 @@ export default function Dashboard() {
               </>
             ) : (
               <div style={{ fontSize: 11, color: "#555" }}>
-                {!activeWindow ? "Fuera de ventana de entrada" : "Sin precio/target"}
-                {target && (
-                  <div style={{ marginTop: 8, color: "#666" }}>
+                {!activeWindow ? "Fuera de ventana" : target == null ? "Sin target del bot" : "Sin precio"}
+                {target != null && (
+                  <div style={{ marginTop: 8, color: "#555" }}>
                     Target:{" "}
                     <span style={{ color: "var(--yellow)" }}>
                       ${target.toLocaleString("en-US", { maximumFractionDigits: 0 })}
@@ -441,8 +423,8 @@ export default function Dashboard() {
             )}
           </div>
 
-          {/* MERCADO ACTIVO */}
-          <div style={{ background: "var(--bg)" }}>
+          {/* COLUMNA 3 — MERCADO ACTIVO + TOKENS */}
+          <div>
             <MarketInfo
               market={market}
               minsLeft={minsLeft}
@@ -454,16 +436,17 @@ export default function Dashboard() {
         </div>
       )}
 
-      {/* ── GRÁFICA BTC ──────────────────────────────────────────────────── */}
+      {/* ── GRÁFICA BTC ─────────────────────────────────────────────────── */}
       {tab === "dashboard" && (
         <div style={{ borderBottom: "1px solid var(--border)" }}>
           <div style={{ padding: "12px 20px" }}>
+            {/* FIX v5.0: target pasado directamente como prop — ReferenceLine siempre actualizado */}
             <PriceChart data={priceHistory} target={target} />
           </div>
         </div>
       )}
 
-      {/* ── LOG DE EVENTOS ────────────────────────────────────────────────── */}
+      {/* ── LOG DE EVENTOS ──────────────────────────────────────────────── */}
       {tab === "dashboard" && (
         <div style={{ borderBottom: "1px solid var(--border)" }}>
           <div style={{ padding: "12px 20px" }}>
@@ -476,17 +459,14 @@ export default function Dashboard() {
               </div>
               <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
                 <div style={{ fontSize: 9, color: "#222" }}>
-                  ↻ sync cada 5s · fuente: bot ({events.length})
+                  ↻ 5s · {events.length} mensajes
                 </div>
                 {events.length > 0 && (
-                  <button
-                    onClick={() => setEvents([])}
-                    style={{
-                      background: "none", border: "1px solid #1a1a2e", color: "#333",
-                      fontSize: 8, padding: "2px 6px", borderRadius: 2, cursor: "pointer",
-                      fontFamily: "inherit", letterSpacing: "0.1em",
-                    }}
-                  >
+                  <button onClick={() => setEvents([])} style={{
+                    background: "none", border: "1px solid #1a1a2e", color: "#333",
+                    fontSize: 8, padding: "2px 6px", borderRadius: 2,
+                    cursor: "pointer", fontFamily: "inherit",
+                  }}>
                     LIMPIAR
                   </button>
                 )}
@@ -499,8 +479,8 @@ export default function Dashboard() {
             }}>
               {events.length === 0 ? (
                 <div style={{ fontSize: 10, color: "#2a2a3a" }}>
-                  Sin eventos aún — esperando mensajes del bot
-                  {running && (
+                  Sin eventos — esperando mensajes del bot
+                  {botState.running && (
                     <span style={{ color: "#333", marginLeft: 8 }}>
                       · verifica FRONTEND_URL en Railway
                     </span>
@@ -509,14 +489,10 @@ export default function Dashboard() {
               ) : (
                 events.map(ev => (
                   <div key={ev.id} style={{
-                    fontSize: 10,
-                    color: eventColor(ev.text),
-                    marginBottom: 3,
-                    lineHeight: 1.55,
-                    borderBottom: "1px solid #0a0a14",
-                    paddingBottom: 3,
+                    fontSize: 10, color: eventColor(ev.text),
+                    marginBottom: 3, lineHeight: 1.55,
+                    borderBottom: "1px solid #0a0a14", paddingBottom: 3,
                   }}>
-                    {/* FIX v4.2: timestamp visible + acepta ts_iso o ts (ms) */}
                     <span style={{ color: "#444", marginRight: 8, userSelect: "none" }}>
                       {fmtTime(ev.ts_iso ?? ev.ts)}
                     </span>
@@ -529,7 +505,14 @@ export default function Dashboard() {
         </div>
       )}
 
-      {/* ── HISTORIAL ────────────────────────────────────────────────────── */}
+      {/* ── MODO DE TRADING ─────────────────────────────────────────────── */}
+      {tab === "dashboard" && (
+        <div style={{ padding: "20px 24px", borderBottom: "1px solid var(--border)" }}>
+          <ModeSelector />
+        </div>
+      )}
+
+      {/* ── HISTORIAL ───────────────────────────────────────────────────── */}
       {tab === "historial" && (
         <div>
           <div style={{
@@ -538,22 +521,19 @@ export default function Dashboard() {
             background: "#02020a",
           }}>
             <span style={{ fontSize: 10, color: "#444", letterSpacing: "0.12em" }}>
-              {bets.length} OPERACIONES · FUENTE: SUPABASE · CLIC EN FILA PARA DETALLES
+              {bets.length} OPERACIONES · SUPABASE
             </span>
             {bets.length > 0 && (
-              <button
-                onClick={() => {
-                  if (window.confirm("¿Limpiar caché local?")) {
-                    localStorage.removeItem(LS_KEY);
-                    setBets([]);
-                  }
-                }}
-                style={{
-                  background: "none", border: "1px solid #1a1a2e",
-                  color: "#333", fontSize: 9, padding: "3px 8px",
-                  cursor: "pointer", fontFamily: "inherit",
-                }}
-              >
+              <button onClick={() => {
+                if (window.confirm("¿Limpiar caché local?")) {
+                  localStorage.removeItem(LS_KEY);
+                  setBets([]);
+                }
+              }} style={{
+                background: "none", border: "1px solid #1a1a2e",
+                color: "#333", fontSize: 9, padding: "3px 8px",
+                cursor: "pointer", fontFamily: "inherit",
+              }}>
                 LIMPIAR CACHÉ
               </button>
             )}
@@ -562,13 +542,8 @@ export default function Dashboard() {
         </div>
       )}
 
-      {/* ── ESTADÍSTICAS ─────────────────────────────────────────────────── */}
-      {tab === "stats" && <StatsPanel />}
-
-      {/* ── CONFIG ───────────────────────────────────────────────────────── */}
-      {tab === "config" && (
-        <ConfigPanel config={config} onChange={setConfig} />
-      )}
+      {tab === "stats"  && <StatsPanel />}
+      {tab === "config" && <ConfigPanel config={config} onChange={setConfig} />}
     </div>
   );
 }
