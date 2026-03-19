@@ -1,22 +1,30 @@
 "use client";
 /**
- * components/ModeSelector.jsx — v2.3
+ * components/ModeSelector.jsx — v2.4
+ *
+ * CAMBIOS v2.4:
+ *   - Muestra el modo REAL que el bot está ejecutando en runtime (simulate_mode
+ *     publicado por state_reporter.py vía /api/bot-state) con badge separado.
+ *   - Si el modo configurado difiere del modo activo en el bot (lag de ~60s de
+ *     propagación), muestra un aviso "propagando…" para no confundir al usuario.
+ *   - Reemplaza useBotStatus() interno por useBotState() de lib/hooks (evita
+ *     duplicar el fetch a /api/bot-state que ya hace hooks.js).
+ *   - El botón 🔵 SIMULADO ya funciona siempre para volver de modo real.
  *
  * CAMBIOS v2.3 — check_balance INLINE (sin bot, sin Railway):
  *   - runBalanceCheck detecta respuesta directa (data.direct === true) y aplica
  *     el resultado inmediatamente sin iniciar polling.
- *   - Eliminado el aviso "Bot inactivo" del paso 2 — ya no es necesario porque
- *     check_balance ahora ejecuta inline desde Vercel via Polygon JSON-RPC.
- *   - El texto descriptivo del paso 2 actualizado: ya no dice "requiere bot".
- *   - El botón ya no muestra el countdown de timeout (no hay espera).
  *
  * CAMBIOS v2.2 — Timeout en poller + aviso bot inactivo.
  * CAMBIOS v2.1 — check_clob DIRECTO.
  * CAMBIOS v2.0 — Preflight screen para cambio a modo real.
  * CAMBIOS v1.1 — safeJson con guard res.ok.
+ *
+ * Destino: components/ModeSelector.jsx
  */
 
 import { useState, useEffect, useRef, useCallback } from "react";
+import { useBotState } from "../lib/hooks";
 
 // ── Estilos ───────────────────────────────────────────────────────────────
 
@@ -32,6 +40,24 @@ const S = {
     background: mode === "real" ? "rgba(255,68,102,0.1)" : "rgba(68,136,255,0.1)",
     border:     mode === "real" ? "1px solid rgba(255,68,102,0.3)" : "1px solid rgba(68,136,255,0.3)",
     color:      mode === "real" ? "#ff4466" : "#4488ff",
+  }),
+  badgeRuntime: (simulateMode) => ({
+    display: "inline-flex", alignItems: "center", gap: 6,
+    fontSize: 10, fontWeight: 600, letterSpacing: "0.08em",
+    padding: "3px 10px", borderRadius: 3,
+    ...(simulateMode === true  ? {
+      background: "rgba(68,136,255,0.07)",
+      border: "1px solid rgba(68,136,255,0.25)",
+      color: "#4488ff",
+    } : simulateMode === false ? {
+      background: "rgba(255,68,102,0.07)",
+      border: "1px solid rgba(255,68,102,0.25)",
+      color: "#ff4466",
+    } : {
+      background: "rgba(255,255,255,0.03)",
+      border: "1px solid #222",
+      color: "#444",
+    }),
   }),
   dot: (mode) => ({
     width: 6, height: 6, borderRadius: "50%",
@@ -65,40 +91,37 @@ async function safeJson(res) {
     let body = "";
     try { body = await res.text(); } catch (_) {}
     const match = body.match(/"error"\s*:\s*"([^"]+)"/);
-    const msg = match
-      ? match[1]
-      : `HTTP ${res.status} — el servidor devolvió una respuesta no válida`;
-    throw new Error(msg);
+    const msg = match ? match[1] : `HTTP ${res.status}`;
+    return { ok: false, error: msg };
   }
-  return res.json();
+  try { return await res.json(); } catch (_) { return { ok: false, error: "JSON inválido" }; }
 }
 
 // ── CheckChip ─────────────────────────────────────────────────────────────
 
 function CheckChip({ status }) {
-  const map = {
-    idle:    { color: "#333",    label: "—"        },
-    loading: { color: "#4488ff", label: "..."       },
-    ok:      { color: "#00ff88", label: "✓ OK"     },
-    error:   { color: "#ff4466", label: "✗ ERROR"  },
-  };
-  const { color, label } = map[status] || map.idle;
+  const cfg = {
+    idle:    { color: "#333",     label: "PENDIENTE" },
+    loading: { color: "#4488ff",  label: "COMPROBANDO…" },
+    ok:      { color: "#00ff88",  label: "OK" },
+    error:   { color: "#ff4466",  label: "ERROR" },
+  }[status] ?? { color: "#333", label: "—" };
+
   return (
     <span style={{
       fontSize: 9, fontWeight: 700, letterSpacing: "0.12em",
-      color, padding: "2px 8px", borderRadius: 2,
-      border: `1px solid ${color}30`,
-      background: `${color}10`,
+      color: cfg.color, padding: "2px 7px", borderRadius: 2,
+      border: `1px solid ${cfg.color}40`,
+      background: `${cfg.color}0d`,
     }}>
-      {label}
+      {cfg.label}
     </span>
   );
 }
 
 // ── BotStatusBadge ────────────────────────────────────────────────────────
 
-function BotStatusBadge({ botRunning, botChecked }) {
-  if (!botChecked) return null;
+function BotStatusBadge({ botRunning }) {
   const color = botRunning ? "#00ff88" : "#ff8800";
   const label = botRunning ? "● BOT ACTIVO" : "○ BOT INACTIVO";
   return (
@@ -114,8 +137,6 @@ function BotStatusBadge({ botRunning, botChecked }) {
 }
 
 // ── useCommandPoller ──────────────────────────────────────────────────────
-// Solo usado para test_order (pasa por el bot).
-// Incluye timeout: si el bot no responde en POLL_TIMEOUT_MS, resuelve con error.
 
 function useCommandPoller() {
   const timerRef    = useRef(null);
@@ -134,20 +155,18 @@ function useCommandPoller() {
     deadlineRef.current = Date.now() + POLL_TIMEOUT_MS;
 
     timerRef.current = setInterval(async () => {
-      // ── Timeout guard ───────────────────────────────────────────────
       if (Date.now() > deadlineRef.current) {
         cancel();
         onDone({
           status: "error",
           result: {
             success: false,
-            error:   `Sin respuesta del bot tras ${POLL_TIMEOUT_MS / 1000}s. Verifica que Railway esté activo y el bot corriendo.`,
+            error: `Sin respuesta del bot tras ${POLL_TIMEOUT_MS / 1000}s. Verifica que Railway esté activo y el bot corriendo.`,
           },
         });
         return;
       }
 
-      // ── Poll Supabase ────────────────────────────────────────────────
       try {
         const res  = await fetch(`/api/commands?id=${id}`, { cache: "no-store" });
         const data = await safeJson(res);
@@ -157,10 +176,7 @@ function useCommandPoller() {
         }
       } catch (e) {
         cancel();
-        onDone({
-          status: "error",
-          result: { success: false, error: e.message },
-        });
+        onDone({ status: "error", result: { success: false, error: e.message } });
       }
     }, 2000);
   }, [cancel]);
@@ -168,31 +184,6 @@ function useCommandPoller() {
   useEffect(() => () => cancel(), [cancel]);
 
   return { poll, cancel };
-}
-
-// ── useBotStatus ──────────────────────────────────────────────────────────
-
-function useBotStatus() {
-  const [running,  setRunning]  = useState(false);
-  const [checked,  setChecked]  = useState(false);
-
-  useEffect(() => {
-    async function check() {
-      try {
-        const res  = await fetch("/api/bot-state", { cache: "no-store" });
-        if (!res.ok) { setChecked(true); return; }
-        const data = await res.json();
-        setRunning(data?.status === "running" && !data?.stale);
-      } catch (_) {
-        // bot inaccesible → asumir inactivo
-      } finally {
-        setChecked(true);
-      }
-    }
-    check();
-  }, []);
-
-  return { running, checked };
 }
 
 // ── PreflightStep ─────────────────────────────────────────────────────────
@@ -232,9 +223,8 @@ function PreflightStep({ num, title, description, chipStatus, children }) {
 
 // ── PreflightScreen ───────────────────────────────────────────────────────
 
-function PreflightScreen({ onCancel, onConfirm }) {
-  const { poll, cancel }       = useCommandPoller();
-  const { running: botRunning, checked: botChecked } = useBotStatus();
+function PreflightScreen({ onCancel, onConfirm, botRunning }) {
+  const { poll, cancel } = useCommandPoller();
 
   const [clobStatus,    setClobStatus]    = useState("idle");
   const [clobResult,    setClobResult]    = useState(null);
@@ -248,14 +238,14 @@ function PreflightScreen({ onCancel, onConfirm }) {
 
   const canConfirm = clobStatus === "ok" && confirmText === "REAL";
 
-  // ── Check CLOB — inline desde Vercel, sin bot ─────────────────────────────
+  // ── Check CLOB ────────────────────────────────────────────────────────────
   const runClobCheck = async () => {
     setClobStatus("loading"); setClobResult(null);
     try {
       const res = await fetch("/api/commands", {
-        method:  "POST",
+        method: "POST",
         headers: { "Content-Type": "application/json" },
-        body:    JSON.stringify({ command: "check_clob" }),
+        body: JSON.stringify({ command: "check_clob" }),
       });
       const data = await safeJson(res);
       if (!data.ok) throw new Error(data.error || "Error enviando comando");
@@ -266,7 +256,6 @@ function PreflightScreen({ onCancel, onConfirm }) {
         setClobResult(data.result);
         return;
       }
-      // Fallback legacy
       if (data.id) {
         poll(data.id, (pollData) => {
           const ok = pollData.status === "done" && pollData.result?.success;
@@ -280,31 +269,28 @@ function PreflightScreen({ onCancel, onConfirm }) {
     }
   };
 
-  // ── Check Balance — v2.3: inline desde Vercel via Polygon JSON-RPC ────────
-  // Ya no pasa por el bot. Respuesta directa en < 2s.
+  // ── Check Balance ─────────────────────────────────────────────────────────
   const runBalanceCheck = async () => {
     setBalanceStatus("loading"); setBalanceResult(null);
     try {
       const res = await fetch("/api/commands", {
-        method:  "POST",
+        method: "POST",
         headers: { "Content-Type": "application/json" },
-        body:    JSON.stringify({ command: "check_balance" }),
+        body: JSON.stringify({ command: "check_balance" }),
       });
       const data = await safeJson(res);
       if (!data.ok) throw new Error(data.error || "Error enviando comando");
 
-      // Respuesta directa — route.js v1.5 ejecuta inline sin bot
       if (data.direct) {
-        const ok2 = data.status === "done" && data.result?.success;
-        setBalanceStatus(ok2 ? "ok" : "error");
+        const ok = data.status === "done" && data.result?.success;
+        setBalanceStatus(ok ? "ok" : "error");
         setBalanceResult(data.result);
         return;
       }
-      // Fallback legacy polling (no debería llegar aquí con route.js v1.5+)
       if (data.id) {
         poll(data.id, (pollData) => {
-          const ok2 = pollData.status === "done" && pollData.result?.success;
-          setBalanceStatus(ok2 ? "ok" : "error");
+          const ok = pollData.status === "done" && pollData.result?.success;
+          setBalanceStatus(ok ? "ok" : "error");
           setBalanceResult(pollData.result);
         });
       }
@@ -314,35 +300,33 @@ function PreflightScreen({ onCancel, onConfirm }) {
     }
   };
 
-  // ── Orden de prueba — pasa por el bot (necesita L2 auth) ─────────────────
+  // ── Test Order ────────────────────────────────────────────────────────────
   const runTestOrder = async () => {
     setTestStatus("loading"); setTestResult(null);
-    const stake = parseFloat(testStake);
-    if (isNaN(stake) || stake < 0.5 || stake > 10) {
-      setTestStatus("error");
-      setTestResult({ error: "Stake debe estar entre 0.50 y 10.00 USDC" });
-      return;
-    }
     try {
       const res = await fetch("/api/commands", {
-        method:  "POST",
+        method: "POST",
         headers: { "Content-Type": "application/json" },
-        body:    JSON.stringify({ command: "test_order", params: { direction: testDir, stake } }),
+        body: JSON.stringify({
+          command: "test_order",
+          params: { direction: testDir, stake: parseFloat(testStake) },
+        }),
       });
-      const { ok, id, error } = await safeJson(res);
-      if (!ok) throw new Error(error || "Error enviando comando");
-      poll(id, (data) => {
-        const ok2 = data.status === "done" && data.result?.success;
-        setTestStatus(ok2 ? "ok" : "error");
-        setTestResult(data.result);
-      });
+      const data = await safeJson(res);
+      if (!data.ok) throw new Error(data.error || "Error enviando comando");
+      if (data.id) {
+        poll(data.id, (pollData) => {
+          const ok = pollData.status === "done" && pollData.result?.success;
+          setTestStatus(ok ? "ok" : "error");
+          setTestResult(pollData.result);
+        });
+      }
     } catch (e) {
       setTestStatus("error");
       setTestResult({ error: e.message });
     }
   };
 
-  // ── Render ────────────────────────────────────────────────────────────────
   return (
     <div style={{
       position: "fixed", inset: 0,
@@ -375,7 +359,7 @@ function PreflightScreen({ onCancel, onConfirm }) {
 
         <div style={S.col}>
 
-          {/* PASO 1: Conectividad CLOB */}
+          {/* PASO 1: CLOB */}
           <PreflightStep
             num={1}
             title="Conectividad CLOB"
@@ -411,20 +395,20 @@ function PreflightScreen({ onCancel, onConfirm }) {
             )}
           </PreflightStep>
 
-          {/* PASO 2: Balance — v2.3: inline desde Vercel, sin bot */}
+          {/* PASO 2: Balance */}
           <PreflightStep
             num={2}
-            title="Balance de cartera"
-            description="Consulta el saldo USDC y POL en tu cartera de Polygon directamente on-chain."
+            title="Saldo USDC"
+            description="Consulta el saldo de tu cartera en Polygon via JSON-RPC público. No requiere bot activo."
             chipStatus={balanceStatus}
           >
             <div style={S.row}>
               <button
                 onClick={runBalanceCheck}
                 disabled={balanceStatus === "loading"}
-                style={S.btn("blue", balanceStatus === "loading")}
+                style={S.btn("primary", balanceStatus === "loading")}
               >
-                {balanceStatus === "loading" ? "CONSULTANDO…" : "CONSULTAR BALANCE"}
+                {balanceStatus === "loading" ? "CONSULTANDO…" : "VER SALDO"}
               </button>
             </div>
             {balanceResult && (
@@ -437,34 +421,31 @@ function PreflightScreen({ onCancel, onConfirm }) {
                   <span style={{ color: "#ff4466" }}>✗ {balanceResult.error}</span>
                 ) : (
                   <>
-                    <div>USDC: <span style={{ color: "#00ff88" }}>${parseFloat(balanceResult.usdc ?? balanceResult.usdc_balance ?? 0).toFixed(2)}</span></div>
-                    <div>POL:  <span style={{ color: "#888" }}>{parseFloat(balanceResult.pol ?? balanceResult.pol_balance ?? 0).toFixed(4)}</span></div>
-                    <div style={{ color: "#333" }}>
-                      Via: {balanceResult.rpc_used ?? "—"} · {balanceResult.latency_ms}ms
-                    </div>
+                    <div>USDC: <span style={{ color: "#00ff88" }}>${balanceResult.usdc?.toFixed(2)}</span></div>
+                    <div>POL:  <span style={{ color: "#888" }}>{balanceResult.pol?.toFixed(4)}</span></div>
+                    <div>Wallet: <span style={{ color: "#555" }}>{balanceResult.wallet}</span></div>
+                    <div>Latencia: <span style={{ color: "#555" }}>{balanceResult.rpc_latency_ms}ms · {balanceResult.rpc_used?.split("/")[2] ?? "—"}</span></div>
                   </>
                 )}
               </div>
             )}
           </PreflightStep>
 
-          {/* PASO 3: Orden de prueba (opcional) */}
+          {/* PASO 3: Orden de prueba */}
           <PreflightStep
             num={3}
             title="Orden de prueba (opcional)"
             description="Ejecuta una orden real mínima para verificar L2 auth y conectividad completa con el CLOB. Usa fondos reales. Requiere bot activo en Railway."
             chipStatus={testStatus}
           >
-            {/* Indicador estado del bot — relevante solo aquí */}
             <div style={{ ...S.row, marginBottom: 8 }}>
-              <BotStatusBadge botRunning={botRunning} botChecked={botChecked} />
-              {botChecked && !botRunning && testStatus === "idle" && (
+              <BotStatusBadge botRunning={botRunning} />
+              {!botRunning && testStatus === "idle" && (
                 <span style={{ fontSize: 9, color: "#ff8800" }}>
                   ⚠ Bot inactivo — la orden no podrá ejecutarse
                 </span>
               )}
             </div>
-
             <div style={S.row}>
               <select
                 value={testDir}
@@ -496,9 +477,7 @@ function PreflightScreen({ onCancel, onConfirm }) {
                 disabled={testStatus === "loading"}
                 style={S.btn("danger", testStatus === "loading")}
               >
-                {testStatus === "loading"
-                  ? `EJECUTANDO… (${POLL_TIMEOUT_MS / 1000}s)`
-                  : "TEST ORDER"}
+                {testStatus === "loading" ? `EJECUTANDO… (${POLL_TIMEOUT_MS / 1000}s)` : "TEST ORDER"}
               </button>
             </div>
             {testResult && (
@@ -546,11 +525,7 @@ function PreflightScreen({ onCancel, onConfirm }) {
               <button
                 onClick={() => { cancel(); onConfirm(); }}
                 disabled={!canConfirm}
-                style={{
-                  ...S.btn("danger", !canConfirm),
-                  padding: "9px 24px",
-                  fontSize: 11,
-                }}
+                style={{ ...S.btn("danger", !canConfirm), padding: "9px 24px", fontSize: 11 }}
               >
                 🔴 ACTIVAR MODO REAL
               </button>
@@ -572,7 +547,13 @@ export default function ModeSelector() {
   const [lastUpdated,   setLastUpdated]   = useState(null);
   const [showPreflight, setShowPreflight] = useState(false);
 
-  // ── Cargar modo actual ────────────────────────────────────────────────
+  // v2.4: leer modo runtime real del bot vía bot-state
+  const botState = useBotState();
+  const botRunning     = botState.running;
+  const botSimMode     = botState.simulate_mode;  // true | false | null
+  const botModeKnown   = botRunning && botSimMode !== null;
+
+  // ── Cargar modo configurado ───────────────────────────────────────────
   const loadMode = useCallback(async () => {
     setLoading(true);
     try {
@@ -625,9 +606,10 @@ export default function ModeSelector() {
     saveMode("real");
   };
 
-  const handlePreflightCancel = () => {
-    setShowPreflight(false);
-  };
+  // ── ¿El modo configurado coincide con el modo activo en el bot? ───────
+  // Solo relevante si el bot está corriendo y reporta simulate_mode.
+  const configuredSimulate = mode === "simulate";
+  const modeInSync = !botModeKnown || (botSimMode === configuredSimulate);
 
   // ── Render ────────────────────────────────────────────────────────────
   return (
@@ -641,8 +623,9 @@ export default function ModeSelector() {
 
       {showPreflight && (
         <PreflightScreen
-          onCancel={handlePreflightCancel}
+          onCancel={() => setShowPreflight(false)}
           onConfirm={handlePreflightConfirm}
+          botRunning={botRunning}
         />
       )}
 
@@ -657,25 +640,54 @@ export default function ModeSelector() {
           <span style={{ fontSize: 10, color: "#444", letterSpacing: "0.16em" }}>
             MODO DE TRADING
           </span>
-          {loading && (
-            <span style={{ fontSize: 9, color: "#333" }}>cargando…</span>
-          )}
+          {loading && <span style={{ fontSize: 9, color: "#333" }}>cargando…</span>}
         </div>
 
-        {/* Badge modo actual */}
-        <div style={{ marginBottom: 20 }}>
+        {/* ── Badge: modo configurado ─────────────────────────────────── */}
+        <div style={{ marginBottom: 12 }}>
+          <div style={{ fontSize: 9, color: "#333", marginBottom: 5, letterSpacing: "0.1em" }}>
+            CONFIGURADO
+          </div>
           <span style={S.badge(mode)}>
             <span style={S.dot(mode)} />
             {mode === "real" ? "🔴 MODO REAL" : "🔵 MODO SIMULADO"}
           </span>
           {lastUpdated && (
-            <div style={{ marginTop: 6, fontSize: 9, color: "#333" }}>
-              Actualizado: {new Date(lastUpdated).toLocaleString("es-ES")}
+            <div style={{ marginTop: 5, fontSize: 9, color: "#2a2a2a" }}>
+              {new Date(lastUpdated).toLocaleString("es-ES")}
             </div>
           )}
         </div>
 
-        {/* Selector */}
+        {/* ── Badge: modo activo en el bot (runtime) ─────────────────── */}
+        <div style={{ marginBottom: 20 }}>
+          <div style={{ fontSize: 9, color: "#333", marginBottom: 5, letterSpacing: "0.1em" }}>
+            BOT ACTIVO EN
+          </div>
+          <span style={S.badgeRuntime(botModeKnown ? botSimMode : null)}>
+            {!botRunning
+              ? "○ BOT OFFLINE"
+              : botSimMode === null
+              ? "— DESCONOCIDO"
+              : botSimMode
+              ? "🔵 SIMULADO"
+              : "🔴 REAL"
+            }
+          </span>
+          {/* Aviso de propagación pendiente */}
+          {botModeKnown && !modeInSync && (
+            <div style={{ marginTop: 6, fontSize: 9, color: "#ff8800" }}>
+              ⏳ Propagando cambio al bot (~60s)…
+            </div>
+          )}
+          {botModeKnown && modeInSync && (
+            <div style={{ marginTop: 6, fontSize: 9, color: "#2a2a2a" }}>
+              ✓ En sincronía con el bot
+            </div>
+          )}
+        </div>
+
+        {/* ── Botones de cambio de modo ──────────────────────────────── */}
         <div style={{ ...S.row, gap: 10 }}>
           <button
             onClick={() => handleModeChange("simulate")}
@@ -691,12 +703,10 @@ export default function ModeSelector() {
           >
             🔴 REAL
           </button>
-          {saving && (
-            <span style={{ fontSize: 9, color: "#555" }}>guardando…</span>
-          )}
+          {saving && <span style={{ fontSize: 9, color: "#555" }}>guardando…</span>}
         </div>
 
-        {/* Info */}
+        {/* ── Info contextual ────────────────────────────────────────── */}
         <p style={{ fontSize: 9, color: "#333", marginTop: 12, lineHeight: 1.7 }}>
           {mode === "simulate"
             ? "El bot registra señales y precios CLOB pero no ejecuta órdenes reales."
