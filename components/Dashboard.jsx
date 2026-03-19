@@ -1,19 +1,24 @@
 "use client";
 /**
- * Dashboard.jsx — v4.1
+ * Dashboard.jsx — v4.2
  *
- * FIXES v4.1
- * ─────────────────────────────────────────────────────────────
- * 1. EVENTOS PERSISTENTES (Bug 3):
- *    setEvents() ya NO sobreescribe con el array vacío del servidor.
- *    Si el servidor devuelve [] (instancia fría de Vercel), el cliente
- *    conserva su caché local. Solo se añaden eventos nuevos (merge por id).
+ * CAMBIOS v4.2
+ * ─────────────────────────────────────────────────────────────────────
+ * 1. FIX priceHistory: cada punto ahora incluye { ts, price, target }
+ *    → el tooltip de PriceChart muestra el target correctamente.
  *
- * 2. TARGET VISIBLE EN DASHBOARD (Bug 1 — lado UI):
- *    Panel SEÑAL ahora muestra el valor del target en $XXXXX con color
- *    amarillo visible. Antes los colores eran #444/#666 (casi invisibles).
- *    El panel BTC también muestra "TARGET $XXXXX" sobre el windowbar.
+ * 2. FIX fmtTime: acepta tanto ts_iso (string ISO) como ts (timestamp ms).
+ *    La función anterior solo intentaba parsear ts_iso; si el evento venía
+ *    con ts numérico (ms) el render mostraba cadena vacía.
  *
+ * 3. FIX timestamp color en eventos: cambiado de #2a2a3a (casi invisible
+ *    sobre #010108) a #444 (legible).
+ *
+ * 4. FIX alerta FRONTEND_URL: cuando events.length === 0 y bot está activo
+ *    (running), muestra un hint de que posiblemente FRONTEND_URL no está
+ *    configurado en Railway.
+ *
+ * (v4.1 — eventos acumulativos, target visible, MarketInfo simplificado)
  * (v4.0 — simplificación MarketInfo, log de eventos desde /api/events)
  */
 
@@ -58,9 +63,14 @@ function StatBox({ label, value, color = "#c8c8d8", sub }) {
   );
 }
 
-function fmtTime(tsIso) {
+// FIX v4.2: acepta ts_iso (string ISO) O ts (número ms desde epoch)
+function fmtTime(tsIsoOrMs) {
   try {
-    const d = new Date(tsIso);
+    if (!tsIsoOrMs) return "";
+    const d = typeof tsIsoOrMs === "number"
+      ? new Date(tsIsoOrMs)
+      : new Date(tsIsoOrMs);
+    if (isNaN(d.getTime())) return "";
     return d.toLocaleTimeString("es-ES", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
   } catch { return ""; }
 }
@@ -167,29 +177,25 @@ export default function Dashboard() {
     return () => clearInterval(id);
   }, []);
 
-  // ── 3. Log de eventos — FIX v4.1: acumulativo, no reemplaza ──────────
+  // ── 3. Log de eventos — acumulativo, no reemplaza ─────────────────────
   //
-  // PROBLEMA ORIGINAL: setEvents(data.events ?? []) reemplazaba todo.
-  // Cuando Vercel levanta una instancia fría, globalThis._botEvents = []
-  // → el cliente veía "Sin eventos" aunque ya tuviera un historial local.
-  //
-  // FIX: si el servidor devuelve vacío, conservar el estado local.
-  // Si devuelve eventos, hacer merge por id (solo añadir los nuevos).
+  // FIX v4.1: si el servidor devuelve [] (instancia fría de Vercel),
+  // conservar el estado local. Solo añadir eventos nuevos (merge por id).
+  // FIX v4.2: fmtTime ahora acepta ts_iso o ts, corregido en render.
   const loadEvents = useCallback(async () => {
     try {
-      const res  = await fetch("/api/events");
+      const res      = await fetch("/api/events");
       if (!res.ok) return;
-      const data    = await res.json();
+      const data     = await res.json();
       const incoming = data.events ?? [];
 
-      // Si el servidor devuelve vacío (instancia fría), NO sobreescribir
       if (incoming.length === 0) return;
 
       setEvents(prev => {
         const prevIds = new Set(prev.map(e => e.id));
         const newOnes = incoming.filter(e => !prevIds.has(e.id));
-        if (newOnes.length === 0) return prev;            // nada nuevo
-        return [...newOnes, ...prev].slice(0, 100);       // cap 100
+        if (newOnes.length === 0) return prev;
+        return [...newOnes, ...prev].slice(0, 100);
       });
     } catch {}
   }, []);
@@ -216,16 +222,20 @@ export default function Dashboard() {
     fetchStake();
   }, []);
 
-  // ── 5. Precio history ─────────────────────────────────────────────────
+  // ── 5. Precio history — FIX v4.2: incluye target en cada punto ───────
+  //
+  // PriceChart usa d.target en el tooltip. Sin este campo, el tooltip
+  // nunca mostraba el target aunque la ReferenceLine sí lo dibujara.
   useEffect(() => {
     if (!price) return;
     setPriceHistory(h => {
       const ts = new Date().toLocaleTimeString("es-ES", {
         hour: "2-digit", minute: "2-digit", second: "2-digit",
       });
-      return [...h, { ts, price }].slice(-60);
+      // Capturar target en el mismo closure donde price está actualizado
+      return [...h, { ts, price, target }].slice(-60);
     });
-  }, [price]);
+  }, [price, target]);
 
   // ─────────────────────────────────────────────────────────────────────
   // RENDER
@@ -355,7 +365,7 @@ export default function Dashboard() {
                 {price >= prev ? "▲" : "▼"} ${Math.abs(price - prev).toFixed(2)}
               </div>
             )}
-            {/* TARGET value — FIX v4.1: color visible */}
+            {/* TARGET value */}
             {target && (
               <div style={{ fontSize: 11, color: "#888", marginTop: 6 }}>
                 TARGET{" "}
@@ -383,51 +393,43 @@ export default function Dashboard() {
             <div style={{ fontSize: 9, color: "#444", letterSpacing: "0.15em", marginBottom: 6 }}>SEÑAL VISUAL</div>
             {activeWindow && decision ? (
               <>
-                <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 10 }}>
-                  <span style={{ color: activeWindow.color, fontSize: 12, fontWeight: 700 }}>
-                    [{activeWindow.key}]
-                  </span>
-                  <span style={{
-                    fontSize: 28, fontWeight: 700,
-                    color: decision.dir === "UP"   ? "var(--green)"
-                         : decision.dir === "DOWN" ? "var(--red)"
-                         : "var(--dim)",
-                  }}>
-                    {decision.dir === "UP" ? "▲ UP" : decision.dir === "DOWN" ? "▼ DOWN" : "— WAIT"}
-                  </span>
+                <div style={{
+                  fontSize: 28, fontWeight: 700,
+                  color: decision.direction === "UP" ? "var(--green)" : decision.direction === "DOWN" ? "var(--red)" : "#555",
+                }}>
+                  {decision.direction === "UP" ? "▲ UP" : decision.direction === "DOWN" ? "▼ DOWN" : "— WAIT"}
                 </div>
-                {/* FIX v4.1: colores visibles + target value */}
-                <div style={{ fontSize: 11, color: "#888", lineHeight: 2 }}>
-                  <div>
-                    Target:{" "}
-                    <span style={{ color: "var(--yellow)", fontWeight: 700 }}>
-                      {target != null
-                        ? `$${target.toLocaleString("en-US", { maximumFractionDigits: 0 })}`
-                        : "—"}
-                    </span>
+                {decision.direction !== "WAIT" && (
+                  <div style={{ fontSize: 10, color: "#666", marginTop: 6 }}>
+                    ventana {activeWindow}
                   </div>
-                  <div>
-                    Umbral:{" "}
-                    <span style={{ color: "#aaa", fontWeight: 700 }}>
-                      ${decision.threshold?.toFixed(0) ?? "—"}
-                    </span>
+                )}
+                {target && (
+                  <div style={{ marginTop: 10, fontSize: 11 }}>
+                    <div style={{ color: "#444", marginBottom: 4 }}>
+                      TARGET <span style={{ color: "var(--yellow)", fontWeight: 700 }}>
+                        ${target.toLocaleString("en-US", { maximumFractionDigits: 0 })}
+                      </span>
+                    </div>
+                    {dist != null && (
+                      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                        <span style={{ color: "#333" }}>Δ</span>
+                        <span style={{
+                          color: (dist ?? 0) > (decision.threshold ?? 0)
+                            ? "var(--green)" : "var(--red)",
+                          fontWeight: 700,
+                        }}>
+                          ${Math.abs(dist ?? 0).toFixed(0)}
+                        </span>
+                      </div>
+                    )}
                   </div>
-                  <div>
-                    Distancia:{" "}
-                    <span style={{
-                      color: Math.abs(dist ?? 0) > (decision.threshold ?? 0)
-                        ? "var(--green)" : "var(--red)",
-                      fontWeight: 700,
-                    }}>
-                      ${Math.abs(dist ?? 0).toFixed(0)}
-                    </span>
-                  </div>
-                </div>
+                )}
               </>
             ) : (
               <div style={{ fontSize: 11, color: "#555" }}>
                 {!activeWindow ? "Fuera de ventana de entrada" : "Sin precio/target"}
-                {target && !activeWindow && (
+                {target && (
                   <div style={{ marginTop: 8, color: "#666" }}>
                     Target:{" "}
                     <span style={{ color: "var(--yellow)" }}>
@@ -496,8 +498,13 @@ export default function Dashboard() {
               borderRadius: 3, padding: "8px 10px",
             }}>
               {events.length === 0 ? (
-                <div style={{ fontSize: 10, color: "#1a1a2e" }}>
+                <div style={{ fontSize: 10, color: "#2a2a3a" }}>
                   Sin eventos aún — esperando mensajes del bot
+                  {running && (
+                    <span style={{ color: "#333", marginLeft: 8 }}>
+                      · verifica FRONTEND_URL en Railway
+                    </span>
+                  )}
                 </div>
               ) : (
                 events.map(ev => (
@@ -509,8 +516,9 @@ export default function Dashboard() {
                     borderBottom: "1px solid #0a0a14",
                     paddingBottom: 3,
                   }}>
-                    <span style={{ color: "#2a2a3a", marginRight: 8, userSelect: "none" }}>
-                      {fmtTime(ev.ts_iso)}
+                    {/* FIX v4.2: timestamp visible + acepta ts_iso o ts (ms) */}
+                    <span style={{ color: "#444", marginRight: 8, userSelect: "none" }}>
+                      {fmtTime(ev.ts_iso ?? ev.ts)}
                     </span>
                     <span style={{ whiteSpace: "pre-wrap" }}>{ev.text}</span>
                   </div>
