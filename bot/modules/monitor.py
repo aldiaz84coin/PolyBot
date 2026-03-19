@@ -1,19 +1,21 @@
 """
 monitor.py — Loop principal del bot: ventana horaria, stop loss, resolución
 
+v10.8 — MODO VISIBLE EN CICLO + NOTIFICACIÓN TELEGRAM AL CAMBIAR
+  - _log_cycle(): añadido parámetro simulate, cambiado a logger.info,
+    prefijo [SIM]/[REAL] en cada línea de ciclo.
+  - _read_simulate_mode_from_db(): acepta cfg para llamar notify_mode_change()
+    cuando detecta cambio de modo en BD.
+  - report_state(): incluye simulate_mode=simulate para que el dashboard
+    muestre el modo activo real del bot.
+  - Import notify_mode_change desde .notifier.
+
 v10.7 — DASHBOARD STATE REPORTING
   - Importa report_state / report_offline desde state_reporter.py.
-  - Llama report_state() en cada ciclo tras _log_cycle() para que el
-    dashboard reciba market, target, price, direction y ops_today en
-    tiempo real vía /api/bot-state (sin depender de Gamma API).
-  - Llama report_offline() al detener el bot (KeyboardInterrupt / Exception).
+  - Llama report_state() en cada ciclo tras _log_cycle().
+  - Llama report_offline() al detener el bot.
 
 v10.6 — FIX notify_new_hour: target y config de estrategia
-  - Pre-fetch de get_open_1h_binance() ANTES de llamar notify_new_hour.
-    Antes se pasaba target=None (recién reseteado) → mostraba "—" en Telegram.
-  - notify_new_hour recibe ahora stop_pct, stake y umbrales T20/T15/T10/T5.
-  - La carga normal del target más abajo en el ciclo sigue activa como siempre.
-
 v10.5 — notify_stop_loss enriquecida con desglose completo de la operación
 v10.4 — FIX KeyError 'name' + corrección de API evaluate / execute_order / notify
 v10.3 — FIX: tokens es lista, no dict (_tokens_to_dict helper)
@@ -30,6 +32,8 @@ v3.0  — Pre-producción fixes
 v2.9  — BUG FIX: señal WAIT ya no dispara execute_order
 v2.8  — FIX: _fetch_exit_token_price usa CLOB live
 v2.7  — Retornos reales desde Polymarket
+
+Destino: bot/modules/monitor.py
 """
 import csv
 import logging
@@ -53,10 +57,11 @@ from .notifier        import (
     notify_error,
     notify_startup_summary,
     notify_order_failed,
+    notify_mode_change,        # v10.8
 )
 from .command_handler  import process_pending_commands
 from .state_reporter   import report_state, report_offline   # v10.7
-from . import db
+from .                 import db
 
 logger = logging.getLogger(__name__)
 
@@ -84,13 +89,15 @@ def _mins_to_close() -> float:
     return 60 - now.minute - now.second / 60
 
 
-def _log_cycle(price, target, mins_left, ops_hoy, max_ops):
+def _log_cycle(price, target, mins_left, ops_hoy, max_ops, simulate: bool = True):
+    """v10.8: muestra modo [SIM]/[REAL] en cada ciclo. Nivel INFO (siempre visible)."""
     dist_str = "—"
     if price and target:
         dist     = price - target
         dist_str = f"{dist:+,.0f}"
-    logger.debug(
-        f"[MONITOR] Ciclo — "
+    modo = "SIM" if simulate else "REAL"
+    logger.info(
+        f"[MONITOR] [{modo}] Ciclo — "
         f"BTC=${price:,.2f}  "
         f"Target={f'${target:,.2f}' if target else '—'}  "
         f"Dist={dist_str}  "
@@ -206,15 +213,15 @@ def _load_historical_stats(csv_path: str) -> dict:
             s = db.fetch_historical_stats()
             if s and s.get("total_ops", 0) > 0:
                 return {
-                    "total_ops":    s.get("total_ops", 0),
-                    "wins":         s.get("wins", 0),
-                    "losses":       s.get("losses", 0),
-                    "stops":        s.get("stops", 0),
-                    "total":        s.get("total_ops", 0),
-                    "win_rate":     round(s["wins"] / (s["wins"] + s["losses"]) * 100, 1)
-                                    if (s["wins"] + s["losses"]) > 0 else 0,
-                    "total_pnl":    s.get("total_pnl", 0.0),
-                    "invested":     s.get("total_invested", 0.0),
+                    "total_ops": s.get("total_ops", 0),
+                    "wins":      s.get("wins", 0),
+                    "losses":    s.get("losses", 0),
+                    "stops":     s.get("stops", 0),
+                    "total":     s.get("total_ops", 0),
+                    "win_rate":  round(s["wins"] / (s["wins"] + s["losses"]) * 100, 1)
+                                 if (s["wins"] + s["losses"]) > 0 else 0,
+                    "total_pnl": s.get("total_pnl", 0.0),
+                    "invested":  s.get("total_invested", 0.0),
                 }
         except Exception as e:
             logger.debug(f"[MONITOR] _load_historical_stats BD: {e}")
@@ -298,42 +305,6 @@ def _log_hour_table(hour_ops: list):
     sign = "+" if total_pnl >= 0 else ""
     logger.info(f"[MONITOR] P&L hora: {sign}${total_pnl:,.2f} USDC")
     logger.info(_SEPARATOR)
-    _log_accumulated_stats({}, label="ACUMULADO")
-    logger.info(_SEPARATOR)
-
-
-def _log_hour_ops(hour_utc: int, hour_ops: list, hist_stats: dict):
-    if not hour_ops:
-        return
-    logger.info(_SEPARATOR)
-    logger.info(f"[MONITOR] 📋 RESUMEN HORA {hour_utc:02d}:00 UTC — {len(hour_ops)} operación(es)")
-    logger.info(_SEPARATOR2)
-    total_pnl = 0.0
-    for i, op in enumerate(hour_ops, 1):
-        direction  = op.get("direction", "—")
-        window     = op.get("window", "—")
-        entry_btc  = op.get("entry_btc", 0)
-        entry_odds = op.get("entry_odds", 0)
-        tokens     = op.get("tokens", 0)
-        exit_odds  = op.get("exit_odds", 0)
-        exit_btc   = op.get("exit_btc", 0)
-        result     = op.get("result", "—")
-        pnl        = op.get("pnl_usd", 0)
-        sim        = " [SIM]" if op.get("simulated") else ""
-        total_pnl += pnl
-        pnl_str = f"{'+' if pnl >= 0 else ''}{pnl:,.2f}"
-        logger.info(
-            f"[MONITOR] {i:>2}. {direction:<5} [{window}]{sim}  "
-            f"entry=${entry_btc:,.0f}  tokens={tokens:.4f}  "
-            f"E-odds={entry_odds:.4f}  X-odds={exit_odds:.4f}  "
-            f"exit=${exit_btc:,.0f}  {result}  P&L=${pnl_str}"
-        )
-    logger.info(_SEPARATOR2)
-    sign = "+" if total_pnl >= 0 else ""
-    logger.info(f"[MONITOR] P&L hora: {sign}${total_pnl:,.2f} USDC")
-    logger.info(_SEPARATOR)
-    _log_accumulated_stats(hist_stats, label="ACUMULADO")
-    logger.info(_SEPARATOR)
 
 
 # ── Sincronización de sesión horaria ─────────────────────────────────────────
@@ -375,11 +346,11 @@ def _sync_session_to_db(
 
 # ── Polling de modo desde BD ──────────────────────────────────────────────────
 
-def _read_simulate_mode_from_db(current_simulate: bool) -> bool:
+def _read_simulate_mode_from_db(current_simulate: bool, cfg: dict) -> bool:
     """
     Lee el modo de operación desde Supabase (bot_config key='trading_mode').
     Si DB no disponible, devuelve el valor actual sin cambios.
-    Loguea si el modo cambia.
+    v10.8: acepta cfg para llamar notify_mode_change() al detectar cambio.
     """
     try:
         db_mode = db.get_config("trading_mode", None)
@@ -395,6 +366,7 @@ def _read_simulate_mode_from_db(current_simulate: bool) -> bool:
             )
             db.set_config("bot_simulate_active", str(new_simulate).lower())
             db.set_config("bot_mode_ack_at", datetime.now(timezone.utc).isoformat())
+            notify_mode_change(cfg, label_old, label_new)   # v10.8 — Telegram
         return new_simulate
     except Exception as e:
         logger.debug(f"[MONITOR] _read_simulate_mode_from_db: {e}")
@@ -424,12 +396,11 @@ def run(cfg: dict):
 
     # v10.0: leer modo desde BD (sobreescribe env var si BD disponible)
     if db_ok:
-        simulate = _read_simulate_mode_from_db(simulate)
+        simulate = _read_simulate_mode_from_db(simulate, cfg)   # v10.8: pasa cfg
         db.set_config("bot_simulate_active", str(simulate).lower())
         db.set_config("bot_started_at", datetime.now(timezone.utc).isoformat())
-        # v10.2: publicar stake para que el dashboard lo lea
-        db.set_config("stake_usdc", str(stake))
-        db.set_config("funder_address", cfg.get("polymarket", {}).get("funder", ""))  # v10.8 — para check_balance inline
+        db.set_config("stake_usdc", str(stake))                 # v10.2
+        db.set_config("funder_address", cfg.get("polymarket", {}).get("funder", ""))
 
     last_config_check = time.time()
 
@@ -480,7 +451,7 @@ def run(cfg: dict):
 
             # ── Modo: polling desde BD cada _CONFIG_POLL_INTERVAL segundos ─
             if db_ok and (time.time() - last_config_check) >= _CONFIG_POLL_INTERVAL:
-                simulate          = _read_simulate_mode_from_db(simulate)
+                simulate          = _read_simulate_mode_from_db(simulate, cfg)   # v10.8
                 last_config_check = time.time()
                 process_pending_commands(cfg)
 
@@ -604,16 +575,17 @@ def run(cfg: dict):
                 notify_target_change(cfg, target, new_target, mins_left)
                 target = new_target
 
-            _log_cycle(price, target, mins_left, ops_hoy, max_ops)
+            _log_cycle(price, target, mins_left, ops_hoy, max_ops, simulate)   # v10.8
 
-            # ── v10.7: Reportar estado al dashboard ───────────────────────
+            # ── v10.8: Reportar estado al dashboard (con simulate_mode) ───
             report_state(
-                market     = market,
-                target     = target,
-                price      = price,
-                direction  = active_bet.get("direction") if active_bet else None,
-                ops_today  = ops_hoy,
-                bet_active = bool(active_bet),
+                market        = market,
+                target        = target,
+                price         = price,
+                direction     = active_bet.get("direction") if active_bet else None,
+                ops_today     = ops_hoy,
+                bet_active    = bool(active_bet),
+                simulate_mode = simulate,   # v10.8
             )
 
             # ── Stop loss (posición abierta) ───────────────────────────────
@@ -632,7 +604,7 @@ def run(cfg: dict):
                     else tokens_mkt.get("no", {}).get("token_id")
                 )
 
-                exit_token_price = _fetch_exit_token_price(real_exit_token_id) if real_exit_token_id else 0.0
+                exit_token_price   = _fetch_exit_token_price(real_exit_token_id) if real_exit_token_id else 0.0
                 real_exit_odds_val = exit_token_price if exit_token_price > 0 else None
 
                 # P&L estimado a precio actual del token
@@ -645,8 +617,8 @@ def run(cfg: dict):
                     pnl_pct = -100.0
 
                 if pnl_pct <= -stop_pct:
-                    ts_now  = datetime.now(timezone.utc).isoformat()
-                    result  = "STOP"
+                    ts_now       = datetime.now(timezone.utc).isoformat()
+                    result       = "STOP"
                     retorno_real = round(tokens_held * exit_token_price, 4) if exit_token_price > 0 else 0.0
 
                     row = _build_trade_row(
@@ -726,7 +698,7 @@ def run(cfg: dict):
                     else tokens_mkt.get("no", {}).get("token_id")
                 )
 
-                exit_token_price  = _fetch_exit_token_price(real_exit_token_id) if real_exit_token_id else 0.0
+                exit_token_price   = _fetch_exit_token_price(real_exit_token_id) if real_exit_token_id else 0.0
                 real_exit_odds_val = exit_token_price if exit_token_price > 0 else None
 
                 # Determinar resultado por precio de cierre del token
@@ -734,11 +706,12 @@ def run(cfg: dict):
                     won       = exit_token_price >= 0.95
                     exit_odds = exit_token_price
                 else:
-                    # Fallback: precio Gamma si no hay CLOB
-                    won       = dir_ == "UP" and price > (active_bet.get("target") or price)
+                    # Fallback si no hay CLOB: decidir por precio BTC vs target
+                    won       = (dir_ == "UP" and price > (active_bet.get("target") or price)) or \
+                                (dir_ == "DOWN" and price < (active_bet.get("target") or price))
                     exit_odds = 0.98 if won else 0.02
 
-                result      = "WIN" if won else "LOSS"
+                result       = "WIN" if won else "LOSS"
                 retorno_real = round(tokens_held * exit_odds, 4)
                 pnl_usd      = retorno_real - stake_
                 pnl_pct      = (pnl_usd / stake_) * 100 if stake_ > 0 else 0

@@ -1,13 +1,13 @@
 """
 notifier.py — Notificaciones Telegram + Dashboard del bot PolyBot
 
+v5.4 — notify_mode_change()
+  - Nueva función: notifica por Telegram cuando el bot detecta un cambio
+    de modo (SIMULADO ↔ REAL) vía polling de BD en _read_simulate_mode_from_db().
+
 v5.3 — FIX: notify_signal_eval restaurada a firma de 8 argumentos
   - notify_signal_eval(cfg, price, target, dist, umbral, window, direction, mins_left)
-    El último commit la había revertido a la firma corta de 4 args (bot/notifier.py),
-    rompiendo la llamada en monitor.py que pasa los 8 parámetros expandidos.
-  - notify_win: añadido parámetro pnl_usd (kwarg opcional) para coincidir con
-    la llamada notify_win(cfg, active_bet, price, pnl_usd=pnl_usd, simulated=sim_)
-    que hace monitor.py al resolver una operación.
+  - notify_win: añadido parámetro pnl_usd (kwarg opcional).
 
 v5.2 — _post_event(): replica cada mensaje al dashboard (/api/events)
 v5.1 — notify_new_hour muestra config completa de estrategia
@@ -68,7 +68,7 @@ def _send(cfg: dict, text: str):
     """
     Envía a Telegram Y replica al dashboard (/api/events).
     """
-    # ── Telegram ─────────────────────────────────────────────────────────────
+    # ── Telegram ──────────────────────────────────────────────────────────
     token   = cfg.get("telegram", {}).get("bot_token", "")
     chat_id = cfg.get("telegram", {}).get("chat_id", "")
 
@@ -125,9 +125,31 @@ def notify_startup_summary(cfg: dict, hist_stats: dict):
     ))
 
 
+# ── Cambio de modo ────────────────────────────────────────────────────────────
+
+def notify_mode_change(cfg: dict, old_mode: str, new_mode: str):
+    """
+    v5.4: Notifica por Telegram cuando el bot detecta un cambio de modo
+    (SIMULADO ↔ REAL) vía polling de BD en _read_simulate_mode_from_db().
+
+    old_mode / new_mode: "SIMULADO" o "REAL"
+    """
+    icon_new = "🔵" if new_mode == "SIMULADO" else "🔴"
+    icon_old = "🔴" if old_mode == "REAL"     else "🔵"
+    _send(cfg, (
+        f"{icon_new} <b>Modo de trading cambiado</b>\n"
+        f"Anterior : {icon_old} <code>{old_mode}</code>\n"
+        f"Nuevo    : {icon_new} <code>{new_mode}</code>\n"
+        f"Efecto   : inmediato en el próximo ciclo"
+    ))
+
+
 # ── Mercado ──────────────────────────────────────────────────────────────────
 
 def notify_market_found(cfg: dict, market: dict, mins_left: float):
+    """
+    v5.0: muestra YES/NO precios + conditionId además del slug.
+    """
     slug    = market.get("slug", "—")
     cond_id = market.get("condition_id", "—")
     tokens  = market.get("tokens", {})
@@ -188,7 +210,6 @@ def notify_signal_eval(cfg: dict, price: float, target: float,
                        direction: str, mins_left: float):
     """
     v5.3 FIX: restaurada firma de 8 argumentos.
-    El último commit la había revertido a la versión corta de 4 args.
     """
     arrow  = "▲" if dist > 0 else "▼"
     action = (
@@ -258,7 +279,6 @@ def notify_win(cfg: dict, bet: dict, price: float,
     odds_v  = bet.get("odds", 0.5)
     stake   = bet.get("stake", 0)
     tokens  = round(stake / max(odds_v, 0.001), 4)
-    # Preferir pnl_usd real si viene de monitor, si no calcular estimado
     pnl     = pnl_usd if pnl_usd is not None else round(tokens - stake, 2)
     _send(cfg, (
         f"✅ <b>WIN — {bet['direction']}</b>{sim_tag}\n"
@@ -316,7 +336,7 @@ def notify_error(cfg: dict, msg: str):
     _send(cfg, f"🚨 <b>Error crítico</b>\n<code>{msg[:500]}</code>")
 
 
-# ── Nueva hora ───────────────────────────────────────────────────────────────
+# ── Nueva hora ────────────────────────────────────────────────────────────────
 
 def notify_new_hour(cfg: dict, hour_utc, slug: str = None, target: float = None,
                     stop_pct=None, stake=None, umbrales: dict = None):

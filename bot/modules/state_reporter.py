@@ -1,14 +1,16 @@
 """
 state_reporter.py — Reporta el estado del bot al endpoint /api/bot-state del frontend.
 
-Permite al dashboard ver el mercado activo, target, precio y dirección
-tal como los ve el bot, sin depender de cálculos independientes del frontend.
+v1.1 — SIMULATE_MODE en payload
+  - report_state() acepta simulate_mode: bool | None y lo incluye en el payload.
+    El GET de /api/bot-state hace { ...stored } → el campo llega al dashboard
+    sin cambios adicionales en la ruta.
 
 Uso:
     from .state_reporter import report_state, report_offline
 
     # En cada ciclo del monitor:
-    report_state(market=market, target=target, price=price)
+    report_state(market=market, target=target, price=price, simulate_mode=simulate)
 
 Variables de entorno requeridas:
     FRONTEND_URL   → URL del dashboard Vercel, ej: https://tu-app.vercel.app
@@ -53,29 +55,35 @@ def _post(payload: dict) -> None:
 
 def report_state(
     *,
-    market:     dict | None = None,
-    target:     float | None = None,
-    price:      float | None = None,
-    direction:  str | None = None,
-    window:     str | None = None,
-    ops_today:  int | None = None,
-    bet_active: bool | None = None,
-    status:     str = "running",
+    market:        dict | None  = None,
+    target:        float | None = None,
+    price:         float | None = None,
+    direction:     str | None   = None,
+    window:        str | None   = None,
+    ops_today:     int | None   = None,
+    bet_active:    bool | None  = None,
+    simulate_mode: bool | None  = None,   # v1.1 — modo activo en runtime
+    status:        str = "running",
 ) -> None:
     """
     Reporta el estado actual del bot al dashboard.
     La llamada es no-bloqueante (thread daemon).
+
+    simulate_mode: True  → bot en modo simulado
+                   False → bot en modo real
+                   None  → desconocido (no se transmite al dashboard)
     """
     payload = {
-        "status":     status,
-        "market":     market,
-        "target":     target,
-        "price":      price,
-        "slug":       market.get("slug") if market else None,
-        "direction":  direction,
-        "window":     window,
-        "ops_today":  ops_today,
-        "bet_active": bet_active,
+        "status":        status,
+        "market":        market,
+        "target":        target,
+        "price":         price,
+        "slug":          market.get("slug") if market else None,
+        "direction":     direction,
+        "window":        window,
+        "ops_today":     ops_today,
+        "bet_active":    bet_active,
+        "simulate_mode": simulate_mode,   # v1.1
     }
     t = threading.Thread(target=_post, args=(payload,), daemon=True)
     t.start()
