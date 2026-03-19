@@ -1,12 +1,15 @@
 """
 notifier.py — Notificaciones Telegram + Dashboard del bot PolyBot
 
-v5.2 — _post_event(): replica cada mensaje al dashboard (/api/events)
-  - Cada función que llama a _send() también llama a _post_event().
-  - El dashboard lee GET /api/events y muestra los mismos mensajes que Telegram.
-  - FRONTEND_URL y BOT_SECRET se leen de variables de entorno (igual que state_reporter).
-  - La llamada al dashboard es no-bloqueante (thread daemon) y nunca bloquea el bot.
+v5.3 — FIX: notify_signal_eval restaurada a firma de 8 argumentos
+  - notify_signal_eval(cfg, price, target, dist, umbral, window, direction, mins_left)
+    El último commit la había revertido a la firma corta de 4 args (bot/notifier.py),
+    rompiendo la llamada en monitor.py que pasa los 8 parámetros expandidos.
+  - notify_win: añadido parámetro pnl_usd (kwarg opcional) para coincidir con
+    la llamada notify_win(cfg, active_bet, price, pnl_usd=pnl_usd, simulated=sim_)
+    que hace monitor.py al resolver una operación.
 
+v5.2 — _post_event(): replica cada mensaje al dashboard (/api/events)
 v5.1 — notify_new_hour muestra config completa de estrategia
 v5.0 — Resumen al final de cada hora con desglose de operaciones.
 v4.0 — notify_startup_summary, notify_order_failed.
@@ -125,90 +128,108 @@ def notify_startup_summary(cfg: dict, hist_stats: dict):
 # ── Mercado ──────────────────────────────────────────────────────────────────
 
 def notify_market_found(cfg: dict, market: dict, mins_left: float):
-    slug     = market.get("slug", "—")
-    cond_id  = market.get("condition_id", "—")
-    yes_p    = market.get("yes_price")
-    no_p     = market.get("no_price")
-    yes_str  = f"{yes_p:.4f}" if yes_p is not None else "—"
-    no_str   = f"{no_p:.4f}"  if no_p  is not None else "—"
-    mins_str = f"{mins_left:.1f}" if mins_left is not None else "—"
+    slug    = market.get("slug", "—")
+    cond_id = market.get("condition_id", "—")
+    tokens  = market.get("tokens", {})
+
+    if isinstance(tokens, dict):
+        yes_p = tokens.get("yes", {}).get("price")
+        no_p  = tokens.get("no",  {}).get("price")
+    elif isinstance(tokens, list):
+        yes_p = next((t.get("price") for t in tokens if t.get("outcome") == "Yes"), None)
+        no_p  = next((t.get("price") for t in tokens if t.get("outcome") == "No"),  None)
+    else:
+        yes_p = no_p = None
+
+    yes_str = f"{yes_p:.4f}" if yes_p is not None else "—"
+    no_str  = f"{no_p:.4f}"  if no_p  is not None else "—"
+
     _send(cfg, (
-        f"🔍 <b>Mercado encontrado</b>\n"
+        f"🎯 <b>Nuevo mercado detectado</b>\n"
         f"Slug     : <code>{slug}</code>\n"
-        f"CondID   : <code>{cond_id[:20]}...</code>\n"
-        f"YES/NO   : <code>{yes_str} / {no_str}</code>\n"
-        f"Cierre en: <code>{mins_str} min</code>"
+        f"Cierre   : <code>{mins_left:.1f} min</code>\n"
+        f"YES      : <code>{yes_str}</code>   "
+        f"NO: <code>{no_str}</code>\n"
+        f"CondID   : <code>{cond_id[:16]}…</code>"
     ))
 
 
-def notify_market_lost(cfg: dict, slug: str):
-    _send(cfg, f"⚠️ <b>Mercado cerrado/perdido</b>\n<code>{slug}</code>")
+def notify_market_lost(cfg: dict):
+    _send(cfg, "⚠️ <b>Mercado perdido</b> — esperando próximo mercado")
 
 
 # ── Target ───────────────────────────────────────────────────────────────────
 
-def notify_target_change(cfg: dict, old_target: float, new_target: float, slug: str):
+def notify_target_change(cfg: dict, old_target: float, new_target: float, mins_left: float = 0):
+    delta = new_target - old_target
+    sign  = "+" if delta >= 0 else ""
+    mm    = int(mins_left)
     _send(cfg, (
-        f"🎯 <b>Nuevo target</b>\n"
-        f"Mercado : <code>{slug}</code>\n"
-        f"Anterior: <code>${old_target:,.2f}</code>\n"
-        f"Nuevo   : <code>${new_target:,.2f}</code>"
+        f"🔄 <b>Target cambiado</b>\n"
+        f"Anterior : <code>${old_target:,.2f}</code>\n"
+        f"Nuevo    : <code>${new_target:,.2f}</code>\n"
+        f"Δ        : <code>{sign}${delta:,.2f}</code>\n"
+        f"⏱ Quedan : <code>{mm} min</code>"
     ))
 
 
-def notify_target_failed(cfg: dict, attempts: int):
-    _send(cfg, (
-        f"⚠️ <b>Sin target tras {attempts} intentos</b>\n"
-        f"Binance no disponible — sin señal hasta próximo ciclo."
-    ))
+def notify_target_failed(cfg: dict, hour_utc):
+    try:
+        hour_utc = int(hour_utc)
+    except (TypeError, ValueError):
+        hour_utc = "?"
+    _send(cfg, f"🚨 <b>Target no disponible</b> — hora {hour_utc:02d}:00 UTC")
 
 
 # ── Señal ────────────────────────────────────────────────────────────────────
 
-def notify_signal_eval(cfg: dict, signal, price: float, target: float):
-    """Solo para señales accionables (UP o DOWN)."""
-    direction = getattr(signal, "direction", "—")
-    window    = getattr(signal, "window", "—")
-    distance  = price - target
-    icon      = "🟢" if direction == "UP" else "🔴"
+def notify_signal_eval(cfg: dict, price: float, target: float,
+                       dist: float, umbral: float, window: str,
+                       direction: str, mins_left: float):
+    """
+    v5.3 FIX: restaurada firma de 8 argumentos.
+    El último commit la había revertido a la versión corta de 4 args.
+    """
+    arrow  = "▲" if dist > 0 else "▼"
+    action = (
+        f"✅ <b>{direction}</b> — señal accionable"
+        if direction in ("UP", "DOWN")
+        else "⏳ WAIT — dist insuficiente"
+    )
+    mm, ss = int(mins_left), int((mins_left % 1) * 60)
     _send(cfg, (
-        f"{icon} <b>Señal {direction} detectada [{window}]</b>\n"
+        f"📊 <b>Evaluación [{window}]</b>\n"
         f"BTC    : <code>${price:,.2f}</code>\n"
         f"Target : <code>${target:,.2f}</code>\n"
-        f"Dist   : <code>${distance:+,.0f}</code>"
+        f"Dist   : <code>{arrow}${abs(dist):,.0f}</code>  Umbral: <code>${umbral}</code>\n"
+        f"Resta  : <code>{mm:02d}:{ss:02d}</code>\n"
+        f"{action}"
     ))
 
 
 # ── Apuesta ──────────────────────────────────────────────────────────────────
 
-def notify_bet(cfg: dict, bet: dict, signal=None):
-    direction = bet.get("direction", "—")
-    window    = bet.get("window", "—")
-    entry     = bet.get("entry", 0)
-    target    = bet.get("target", 0)
-    distance  = bet.get("distance", 0)
-    stake     = bet.get("stake", 0)
-    odds      = bet.get("odds", 0.5)
-    tokens    = bet.get("tokens", 0)
-    simulated = bet.get("simulated", False)
-
-    arrow   = "🟢" if direction == "UP" else "🔴"
-    sim_tag = " <i>[SIMULADO]</i>" if simulated else ""
-    retorno = round(stake / max(odds, 0.001), 2)
-    pnl_est = round(retorno - stake, 2)
-
+def notify_bet(cfg: dict, bet: dict, signal, simulated: bool = False):
+    sim     = simulated or bet.get("simulated", False)
+    sim_tag = "  <i>[SIMULADO]</i>" if sim else ""
+    odds_v  = bet.get("odds", 0.5)
+    stake   = bet.get("stake", 0)
+    tokens  = round(stake / max(odds_v, 0.001), 4)
+    pnl_est = round(tokens - stake, 2)
+    ret_est = round(tokens, 2)
     _send(cfg, (
-        f"{arrow} <b>Apuesta {direction}</b>{sim_tag}\n"
-        f"Ventana  : <code>{window}</code>\n"
-        f"BTC entry: <code>${entry:,.2f}</code>   "
-        f"Target: <code>${target:,.2f}</code>\n"
-        f"Distancia: <code>${distance:+,.0f}</code>\n"
-        f"Stake    : <code>${stake:.2f} USDC</code>\n"
-        f"Odds     : <code>{odds:.4f}  ({odds*100:.1f}%)</code>\n"
-        f"Tokens   : <code>{tokens:.4f}</code>\n"
-        f"Ret. est.: <code>${retorno:.2f}  (P&L est: +${pnl_est:.2f})</code>"
+        f"{'🟢' if bet['direction'] == 'UP' else '🔴'} "
+        f"<b>Apuesta {bet['direction']} [{bet.get('window','—')}]</b>{sim_tag}\n"
+        f"BTC entry  : <code>${bet.get('entry', 0):,.2f}</code>\n"
+        f"Odds       : <code>{odds_v:.4f}</code>\n"
+        f"Stake      : <code>${stake:.2f} USDC</code>\n"
+        f"Tokens     : <code>{tokens:.4f}</code>\n"
+        f"Ret. est.  : <code>${ret_est:.2f} USDC</code>  "
+        f"(+${pnl_est:.2f} / +{round((pnl_est/stake*100) if stake else 0, 1):.1f}%)"
     ))
 
+
+# ── Orden fallida ─────────────────────────────────────────────────────────────
 
 def notify_order_failed(cfg: dict, signal):
     """
@@ -226,13 +247,19 @@ def notify_order_failed(cfg: dict, signal):
 
 # ── Resultados ────────────────────────────────────────────────────────────────
 
-def notify_win(cfg: dict, bet: dict, price: float, simulated: bool = False):
+def notify_win(cfg: dict, bet: dict, price: float,
+               pnl_usd: float = None, simulated: bool = False):
+    """
+    v5.3: añadido parámetro pnl_usd para coincidir con la llamada de monitor.py:
+      notify_win(cfg, active_bet, price, pnl_usd=pnl_usd, simulated=sim_)
+    """
     sim     = simulated or bet.get("simulated", False)
     sim_tag = "  <i>[SIMULADO]</i>" if sim else ""
     odds_v  = bet.get("odds", 0.5)
     stake   = bet.get("stake", 0)
     tokens  = round(stake / max(odds_v, 0.001), 4)
-    pnl     = round(tokens - stake, 2)
+    # Preferir pnl_usd real si viene de monitor, si no calcular estimado
+    pnl     = pnl_usd if pnl_usd is not None else round(tokens - stake, 2)
     _send(cfg, (
         f"✅ <b>WIN — {bet['direction']}</b>{sim_tag}\n"
         f"BTC cierre : <code>${price:,.2f}</code>\n"
@@ -260,12 +287,11 @@ def notify_loss(cfg: dict, bet: dict, price: float, simulated: bool = False):
 def notify_stop_loss(cfg: dict, bet: dict, price: float, pnl_usd: float,
                      pnl_pct: float = None, exit_token_price: float = None,
                      stop_pct: float = None, simulated: bool = False):
-    sim     = simulated or bet.get("simulated", False)
-    sim_tag = "  <i>[SIMULADO]</i>" if sim else ""
+    sim       = simulated or bet.get("simulated", False)
+    sim_tag   = "  <i>[SIMULADO]</i>" if sim else ""
     direction = bet.get("direction", "—")
     entry_btc = bet.get("entry", 0)
     odds_in   = bet.get("odds", 0)
-    stake     = bet.get("stake", 0)
     pnl_str   = f"${pnl_usd:+,.2f}" if pnl_usd is not None else "—"
     pct_str   = f" ({pnl_pct:+.1f}%)" if pnl_pct is not None else ""
 
@@ -376,26 +402,29 @@ def notify_hour_summary(cfg: dict, hour_utc, hour_wins: int, hour_losses: int,
             arrow   = "🟢" if direction == "UP" else "🔴"
             res_ico = {"WIN": "✅", "LOSS": "❌", "STOP": "🛑"}.get(result, "❓")
             pnl_s   = f"+${pnl:,.2f}" if pnl >= 0 else f"-${abs(pnl):,.2f}"
-            sim_tag = " [SIM]" if simulated else ""
+            sim_tag = " <i>[SIM]</i>" if simulated else ""
 
             lines.append(
                 f"{i}. {arrow} {direction} [{window}]{sim_tag}\n"
-                f"   Odds E/S: <code>{entry_odds:.4f} → {exit_odds:.4f}</code>   "
+                f"   Compra: <code>{entry_odds:.4f}</code>  "
+                f"Venta: <code>{exit_odds:.4f}</code>  "
                 f"Tokens: <code>{tokens:.4f}</code>\n"
-                f"   {res_ico} <b>{result}</b>   P&L: <code>{pnl_s} USDC</code>"
+                f"   {res_ico} {result}  P&L: <code>{pnl_s}</code>"
             )
 
     if hist_stats:
-        wins_t   = hist_stats.get("wins", 0)
-        losses_t = hist_stats.get("losses", 0) + hist_stats.get("stops", 0)
-        total_t  = hist_stats.get("total_ops", 0)
-        pnl_t    = hist_stats.get("total_pnl", 0.0)
-        wr_t     = round(wins_t / (wins_t + losses_t) * 100) if (wins_t + losses_t) > 0 else 0
-        sign_t   = "+" if pnl_t >= 0 else ""
+        h_wins  = hist_stats.get("wins", 0)
+        h_loss  = hist_stats.get("losses", 0) + hist_stats.get("stops", 0)
+        h_total = hist_stats.get("total_ops", 0)
+        h_pnl   = hist_stats.get("total_pnl", 0.0)
+        h_wr    = int(h_wins / (h_wins + h_loss) * 100) if (h_wins + h_loss) > 0 else 0
+        h_sign  = "+" if h_pnl >= 0 else ""
         lines.append("")
         lines.append(
-            f"📊 Global: {total_t} ops  {wins_t}W/{losses_t}L  "
-            f"WR={wr_t}%  P&L={sign_t}${pnl_t:,.2f}"
+            f"📈 <b>Acumulado total</b>\n"
+            f"Ops: <code>{h_total}</code>  "
+            f"W/L: <code>{h_wins}W/{h_loss}L  WR={h_wr}%</code>\n"
+            f"P&L: <code>{h_sign}${h_pnl:,.2f} USDC</code>"
         )
 
     _send(cfg, "\n".join(lines))
