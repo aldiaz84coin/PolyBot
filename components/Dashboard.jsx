@@ -1,28 +1,22 @@
 "use client";
 /**
- * Dashboard.jsx — v3.4
+ * Dashboard.jsx — v4.0
  *
- * CAMBIOS v3.4 — FIX MERCADO + LOG DE EVENTOS
- * ─────────────────────────────────────────────────────────────
- *  FIX 1: Mercado activo siempre mostraba "Buscando..."
- *    - useMarket() ya devolvía error y apiResponse, pero Dashboard no
- *      los pasaba a <MarketInfo>. Añadidos error={marketError} y
- *      apiResponse={marketApiResponse} al render de MarketInfo.
+ * CAMBIOS v4.0
+ * ────────────────────────────────────────────────────────────
+ *  1. MERCADO ACTIVO: MarketInfo simplificado — muestra solo SLUG + link.
+ *     La fuente sigue siendo bot-state (prioridad) o /api/market (fallback).
  *
- *  FIX 2: Log de eventos siempre vacío
- *    - useLog() es in-memory: se llena solo mientras el dashboard
- *      está abierto. Ahora se alimenta de dos fuentes:
- *      a) Cambios de botState en tiempo real (via useRef + useEffect).
- *      b) Historial reciente de Supabase al montar (GET /api/events).
+ *  2. LOG DE EVENTOS: ahora muestra los mismos mensajes que Telegram.
+ *     El bot (notifier.py) postea a /api/events; el dashboard los lee
+ *     cada 5s. Polling simple, sin lógica de Supabase en el log.
  *
- * CAMBIOS v3.3 — ARQUITECTURA: Dashboard = solo lector, Bot = único escritor
- * ─────────────────────────────────────────────────────────────────────────
- *  - Eliminados auto-bet y auto-resolve.
- *  - El bot (Railway) es la ÚNICA fuente de escritura en Supabase.
- *  - Dashboard solo lee /api/bets (Supabase) cada 10s.
- *  - activeBet se deriva de bets: la primera operación con result=PENDING.
- *  - stake_usdc se lee de /api/config?key=stake_usdc.
- *  - running se lee de /api/bot-state.
+ *  3. ANÁLISIS IA: sección eliminada.
+ *     - Quitados: aiText, aiLoading state, fetch a /api/analysis, y el
+ *       bloque JSX "ANÁLISIS IA" de la columna derecha.
+ *     - La columna derecha ahora muestra solo el gráfico BTC.
+ *
+ * (sin otros cambios respecto a v3.4)
  */
 
 import { useState, useEffect, useRef, useCallback } from "react";
@@ -40,9 +34,10 @@ import ConfigPanel  from "./ConfigPanel";
 import StatsPanel   from "./StatsPanel";
 import ModeSelector from "./ModeSelector";
 
-const LS_KEY           = "polymarket_bets_v2";
-const BETS_POLL_MS     = 10_000;
-const BOTSTATE_POLL_MS = 5_000;
+const LS_KEY            = "polymarket_bets_v2";
+const BETS_POLL_MS      = 10_000;
+const BOTSTATE_POLL_MS  = 5_000;
+const EVENTS_POLL_MS    = 5_000;
 
 function Tag({ children, color = "#555" }) {
   return (
@@ -65,25 +60,76 @@ function StatBox({ label, value, color = "#c8c8d8", sub }) {
   );
 }
 
+/** Devuelve HH:MM:SS desde un ISO string o timestamp ms */
+function fmtTime(tsIso) {
+  try {
+    const d = new Date(tsIso);
+    return d.toLocaleTimeString("es-ES", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  } catch {
+    return "";
+  }
+}
+
+/** Colorea el evento por su primer emoji */
+function eventColor(text) {
+  if (!text) return "#555";
+  if (text.startsWith("✅") || text.startsWith("🟢") || text.startsWith("🤖")) return "var(--green)";
+  if (text.startsWith("❌") || text.startsWith("🛑") || text.startsWith("⛔") || text.startsWith("🚨")) return "var(--red)";
+  if (text.startsWith("⚠")) return "var(--yellow)";
+  return "#777";
+}
+
 export default function Dashboard() {
-  // ── Config local (umbrales y stake — stake se sobreescribe desde bot_config)
   const [config, setConfig]       = useState(DEFAULT_CONFIG);
   const [tab, setTab]             = useState("dashboard");
   const [bets, setBets]           = useState([]);
-  const [aiText, setAiText]       = useState("El bot debe estar activo para generar análisis IA.");
-  const [aiLoading, setAiLoading] = useState(false);
   const [priceHistory, setPriceHistory] = useState([]);
 
-  // ── Estado del bot leído desde /api/bot-state ─────────────────────────
+  // ── Estado del bot ────────────────────────────────────────────────────
   const [botState, setBotState] = useState(null);
   const running  = botState?.status === "running" && !botState?.stale;
   const botStale = botState?.stale ?? true;
 
-  // ── v3.4: destructurar error y apiResponse de useMarket ──────────────
+  // ── Log de eventos (mensajes Telegram) ───────────────────────────────
+  const [events, setEvents]       = useState([]);
+  const lastEventIdRef            = useRef(null);
+
+  // ── Hooks de precio y mercado ─────────────────────────────────────────
   const { price, prev, source, error: priceError, loading: priceLoading } = useBTCPrice(true);
   const { market, endMs, active: marketActive, error: marketError, apiResponse: marketApiResponse } = useMarket();
   const now = useClock();
-  const { log, add: addLog } = useLog();
+
+  // ── Derived values ────────────────────────────────────────────────────
+  const minsLeft    = getMinsLeft(endMs, now);
+  const activeWindow = getActiveWindow(minsLeft);
+
+  // Target desde bot-state
+  const target = botState?.target ?? null;
+  const dist   = price != null && target != null ? price - target : null;
+
+  // Señal visual
+  const decision    = config && price && target ? getDecision(price, target, config) : null;
+
+  // Stats desde bets
+  const closedBets  = bets.filter(b => b.result && b.result !== "PENDING");
+  const wins        = closedBets.filter(b => b.result === "WIN").length;
+  const losses      = closedBets.filter(b => b.result === "LOSS" || b.result === "STOP").length;
+  const total       = closedBets.length;
+  const winrate     = total > 0 ? (wins / total) * 100 : null;
+  const pnlTotal    = closedBets.reduce((acc, b) => acc + (b.pnl_usd ?? 0), 0);
+  const activeBet   = bets.find(b => b.result === "PENDING") ?? null;
+
+  // Target tag
+  const targetTag = target
+    ? dist > 0
+      ? { label: `▲ +$${Math.abs(dist).toFixed(0)}`, color: "#2a3a5a" }
+      : dist < 0
+      ? { label: `▼ -$${Math.abs(dist).toFixed(0)}`, color: "#3a2a1a" }
+      : null
+    : null;
+
+  // Slug corto para header
+  const marketSlugShort = market?.slug?.split("-").slice(-3).join("-") ?? null;
 
   // ── 1. Cargar bets desde Supabase ─────────────────────────────────────
   const loadBets = useCallback(async () => {
@@ -109,7 +155,6 @@ export default function Dashboard() {
         if (Array.isArray(parsed) && parsed.length > 0) setBets(parsed);
       }
     } catch {}
-
     loadBets();
     const id = setInterval(loadBets, BETS_POLL_MS);
     return () => clearInterval(id);
@@ -133,87 +178,23 @@ export default function Dashboard() {
     return () => clearInterval(id);
   }, []);
 
-  // ── 3. Log automático desde cambios de botState (v3.4) ───────────────
-  const prevBotRef = useRef(null);
+  // ── 3. Log de eventos: mensajes del bot (= mismos que Telegram) ───────
+  const loadEvents = useCallback(async () => {
+    try {
+      const res = await fetch("/api/events");
+      if (!res.ok) return;
+      const data = await res.json();
+      setEvents(data.events ?? []);
+    } catch {}
+  }, []);
+
   useEffect(() => {
-    if (!botState) return;
-    const prev = prevBotRef.current;
+    loadEvents();
+    const id = setInterval(loadEvents, EVENTS_POLL_MS);
+    return () => clearInterval(id);
+  }, [loadEvents]);
 
-    if (!prev && botState.status === "running") {
-      addLog("🟢 Bot conectado al dashboard", "success");
-    }
-    if (botState.status === "offline" && prev?.status === "running") {
-      addLog("🔴 Bot desconectado", "error");
-    }
-    if (botState.window && botState.window !== prev?.window) {
-      addLog(`📊 Ventana activa: ${botState.window}`, "info");
-    }
-    if (
-      botState.direction &&
-      botState.direction !== "WAIT" &&
-      botState.direction !== prev?.direction
-    ) {
-      const icon   = botState.direction === "UP" ? "🟢" : "🔴";
-      const btcStr = botState.price
-        ? ` | BTC $${Number(botState.price).toLocaleString("en-US")}`
-        : "";
-      addLog(`${icon} Señal ${botState.direction} | ${botState.window ?? ""}${btcStr}`, "info");
-    }
-    if (botState.bet_active && !prev?.bet_active) {
-      addLog("💰 Apuesta abierta", "success");
-    }
-    if (botState.bet_active === false && prev?.bet_active === true) {
-      addLog("🏁 Posición cerrada", "info");
-    }
-
-    prevBotRef.current = botState;
-  }, [botState, addLog]);
-
-  // ── 4. Carga histórica del log desde Supabase al montar (v3.4) ───────
-  useEffect(() => {
-    async function loadRecentEvents() {
-      try {
-        const res = await fetch("/api/events?limit=30");
-        if (!res.ok) return;
-        const data = await res.json();
-        const entries = data.events ?? [];
-
-        // Añadir en orden cronológico inverso (más reciente primero)
-        entries.forEach(ev => {
-          const icon =
-            ev.type === "signal"
-              ? ev.direccion === "UP"   ? "🟢"
-              : ev.direccion === "DOWN" ? "🔴"
-              : "📊"
-              : ev.resultado === "WIN"  ? "✅"
-              : ev.resultado === "LOSS" ? "❌"
-              : ev.resultado === "STOP" ? "🛑"
-              : "🔄";
-
-          const sim = ev.simulado ? " [SIM]" : "";
-
-          const msg =
-            ev.type === "signal"
-              ? `${icon} Señal ${ev.direccion} [${ev.ventana}]${sim} | Dist $${Math.abs(ev.distancia ?? 0).toFixed(0)}`
-              : `${icon} Op ${ev.resultado ?? "PENDING"} ${ev.direccion ?? ""}${sim} | P&L ${
-                  ev.pnl_usd != null
-                    ? (ev.pnl_usd >= 0 ? "+" : "") + "$" + Math.abs(ev.pnl_usd).toFixed(2)
-                    : "—"
-                }`;
-
-          const type =
-            ev.resultado === "WIN"  ? "success"
-          : ev.resultado === "LOSS" || ev.resultado === "STOP" ? "error"
-          : "info";
-
-          addLog(msg, type);
-        });
-      } catch {}
-    }
-    loadRecentEvents();
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
-
-  // ── 5. Leer stake_usdc del bot desde bot_config en Supabase ──────────
+  // ── 4. Leer stake_usdc del bot desde bot_config en Supabase ──────────
   useEffect(() => {
     async function fetchStake() {
       try {
@@ -229,7 +210,7 @@ export default function Dashboard() {
     fetchStake();
   }, []);
 
-  // ── Precio history ─────────────────────────────────────────────────────
+  // ── 5. Precio history ─────────────────────────────────────────────────
   useEffect(() => {
     if (!price) return;
     setPriceHistory(h => {
@@ -240,96 +221,25 @@ export default function Dashboard() {
     });
   }, [price]);
 
-  // ── Target (Price to Beat) ─────────────────────────────────────────────
-  const [target, setTarget]               = useState(null);
-  const [targetError, setTargetError]     = useState(null);
-  const [targetHourUtc, setTargetHourUtc] = useState(null);
-  const [targetSource, setTargetSource]   = useState(null);
-  const [targetIsStale, setTargetIsStale] = useState(false);
-  const targetRef = useRef(null);
+  // ── 6. Target stale watchdog ──────────────────────────────────────────
+  // (target viene directo de bot-state, no necesitamos fetch separado)
 
-  useEffect(() => {
-    let cancelled = false;
-    async function fetchTarget() {
-      try {
-        const res = await fetch("/api/target");
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const data = await res.json();
-        if (cancelled) return;
-        if (data.target) {
-          setTarget(data.target);
-          setTargetError(null);
-          setTargetHourUtc(data.hour_utc ?? null);
-          setTargetSource(data.source ?? null);
-          setTargetIsStale(false);
-          targetRef.current = Date.now();
-        } else {
-          setTargetError(data.error ?? "Sin target");
-        }
-      } catch (e) {
-        if (!cancelled) setTargetError(e.message);
-      }
-    }
-    fetchTarget();
-    const iv = setInterval(fetchTarget, 30_000);
-    return () => { cancelled = true; clearInterval(iv); };
-  }, []);
+  // ─────────────────────────────────────────────────────────────────────
+  // RENDER
+  // ─────────────────────────────────────────────────────────────────────
 
-  useEffect(() => {
-    const iv = setInterval(() => {
-      if (targetRef.current && Date.now() - targetRef.current > 75 * 60_000) {
-        setTargetIsStale(true);
-      }
-    }, 30_000);
-    return () => clearInterval(iv);
-  }, []);
-
-  // ── Timing ─────────────────────────────────────────────────────────────
-  const minsLeft     = getMinsLeft(endMs, now);
-  const activeWindow = getActiveWindow(minsLeft);
-
-  // ── Señal visual ───────────────────────────────────────────────────────
-  const umbral   = activeWindow ? config[activeWindow.configKey] : 0;
-  const decision = (price && target && activeWindow)
-    ? getDecision(price, target, umbral, activeWindow)
-    : null;
-
-  // ── activeBet: primera operación PENDING en Supabase ──────────────────
-  const activeBet = bets.find(b => b.result === "PENDING") ?? null;
-
-  // ── Stats derivadas de bets ────────────────────────────────────────────
-  const wins     = bets.filter(b => b.result === "WIN").length;
-  const losses   = bets.filter(b => b.result === "LOSS" || b.result === "STOP").length;
-  const total    = wins + losses;
-  const winrate  = total > 0 ? (wins / total) * 100 : null;
-  const pnlTotal = bets.reduce((acc, b) => acc + (b.pnl_usd ?? 0), 0);
-
-  const today  = new Date().toISOString().slice(0, 10);
-  const pnlDay = bets
-    .filter(b => b.ts?.startsWith(today) && b.result && b.result !== "PENDING")
-    .reduce((acc, b) => acc + (b.pnl_usd ?? 0), 0);
-
-  const dist = (price && target) ? price - target : null;
-
-  const marketSlugShort = market?.slug
-    ? market.slug.replace("bitcoin-up-or-down-", "")
-    : null;
-
-  const targetTag = targetIsStale
-    ? { color: "var(--red)",    label: "TARGET STALE" }
-    : targetError
-    ? { color: "var(--yellow)", label: "TARGET ERR"   }
-    : null;
-
-  // ── Render ─────────────────────────────────────────────────────────────
   return (
-    <div style={{ minHeight: "100vh", background: "var(--bg)", color: "var(--text)", fontFamily: "var(--font-mono)" }}>
+    <div style={{
+      minHeight: "100vh", background: "var(--bg)",
+      fontFamily: "'JetBrains Mono', monospace",
+      color: "var(--text)", fontSize: 12,
+    }}>
 
       {/* ── HEADER ───────────────────────────────────────────────────────── */}
       <header style={{
         display: "flex", justifyContent: "space-between", alignItems: "center",
         padding: "10px 20px", borderBottom: "1px solid var(--border)",
-        background: "#02020a", position: "sticky", top: 0, zIndex: 100,
+        background: "#02020a",
       }}>
         <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
           <div style={{
@@ -341,7 +251,7 @@ export default function Dashboard() {
           <span style={{ color: "var(--green)", fontWeight: 700, letterSpacing: "0.12em", fontSize: 14 }}>
             POLYMARKET BTC BOT
           </span>
-          <Tag color="#2a4a3a">v3.4</Tag>
+          <Tag color="#2a4a3a">v4.0</Tag>
           {running
             ? <Tag color="#1a3a2a">BOT ACTIVO</Tag>
             : botStale
@@ -353,7 +263,7 @@ export default function Dashboard() {
             : <Tag color="#3a1a1a">SIN MERCADO</Tag>
           }
           {targetTag && <Tag color={targetTag.color}>{targetTag.label}</Tag>}
-          {target && !targetIsStale && (
+          {target && (
             <Tag color="#1a2a3a">TARGET ${fmt(target, 0)}</Tag>
           )}
           {activeBet && (
@@ -388,6 +298,31 @@ export default function Dashboard() {
           </div>
         </div>
       </header>
+
+      {/* ── STATS BAR ────────────────────────────────────────────────────── */}
+      {tab === "dashboard" && total > 0 && (
+        <div style={{
+          display: "flex", gap: 32, padding: "10px 24px",
+          borderBottom: "1px solid var(--border)", background: "#020208",
+          alignItems: "center",
+        }}>
+          <StatBox
+            label="P&L TOTAL"
+            value={fmtUSD(pnlTotal)}
+            color={pnlTotal >= 0 ? "var(--green)" : "var(--red)"}
+          />
+          <StatBox
+            label="WINRATE"
+            value={winrate != null ? `${winrate.toFixed(0)}%` : "—"}
+            color="var(--yellow)"
+            sub={`${wins}W / ${losses}L`}
+          />
+          <StatBox label="OPS" value={total} color="var(--dim)" />
+          <div style={{ marginLeft: "auto", fontSize: 9, color: "#333", alignSelf: "center" }}>
+            ↻ sync cada 10s · fuente: Supabase
+          </div>
+        </div>
+      )}
 
       {/* ── PANEL PRINCIPAL ──────────────────────────────────────────────── */}
       {tab === "dashboard" && (
@@ -444,117 +379,23 @@ export default function Dashboard() {
                     {decision.dir === "UP" ? "▲ UP" : decision.dir === "DOWN" ? "▼ DOWN" : "— WAIT"}
                   </span>
                 </div>
-                <div style={{ fontSize: 11, color: decision.signal ? "var(--green)" : "#555" }}>
-                  {decision.signal
-                    ? `DIST $${Math.abs(decision.dist).toFixed(0)} > $${umbral} ✓`
-                    : `DIST $${Math.abs(decision.dist).toFixed(0)} < $${umbral}`}
+                <div style={{ fontSize: 10, color: "#444", lineHeight: 1.8 }}>
+                  <div>Umbral: <span style={{ color: "#666" }}>${decision.threshold?.toFixed(0)}</span></div>
+                  <div>Distancia: <span style={{
+                    color: Math.abs(dist ?? 0) > (decision.threshold ?? 0) ? "var(--green)" : "var(--red)",
+                    fontWeight: 700,
+                  }}>${Math.abs(dist ?? 0).toFixed(0)}</span></div>
                 </div>
               </>
             ) : (
-              <div style={{ fontSize: 16, color: "var(--dim)", marginTop: 8 }}>
-                {targetIsStale ? "⚠ TARGET STALE"
-                  : !target    ? "⚠ SIN TARGET"
-                  :              "— FUERA DE VENTANA —"}
-              </div>
-            )}
-
-            {activeBet && (
-              <div style={{
-                marginTop: 12, padding: "8px 10px",
-                background: "rgba(255,204,0,0.06)", border: "1px solid rgba(255,204,0,0.25)",
-                borderRadius: 3, fontSize: 10, color: "var(--yellow)",
-                display: "flex", flexDirection: "column", gap: 4,
-              }}>
-                <div style={{ fontWeight: 700 }}>
-                  ● POSICIÓN ACTIVA — {activeBet.dir ?? activeBet.direction}
-                  {(activeBet.simulated || activeBet.simulado) && (
-                    <span style={{ color: "#888", fontWeight: 400, marginLeft: 6 }}>[SIMULADO]</span>
-                  )}
-                </div>
-                <div style={{ color: "#888", display: "grid", gridTemplateColumns: "1fr 1fr", gap: "2px 12px" }}>
-                  <span>Entry: {fmtUSD(activeBet.entry)}</span>
-                  <span>Stake: {fmtUSD(activeBet.stake)}</span>
-                  <span>Odds: {(activeBet.odds ?? 0.5).toFixed(3)}</span>
-                  <span>Ret. est.: {fmtUSD(activeBet.retorno_est)}</span>
-                </div>
+              <div style={{ fontSize: 11, color: "#333" }}>
+                {!activeWindow ? "Fuera de ventana de entrada" : "Sin precio/target"}
               </div>
             )}
           </div>
 
-          {/* TARGET */}
-          <div style={{ background: "var(--bg)", padding: "20px 24px" }}>
-            <div style={{ fontSize: 9, color: "#444", letterSpacing: "0.15em", marginBottom: 6 }}>PRICE TO BEAT</div>
-            <div style={{
-              fontSize: 32, fontWeight: 700, lineHeight: 1,
-              color: targetIsStale ? "var(--red)" : targetError ? "var(--yellow)" : "var(--text)",
-            }}>
-              {target ? `$${fmt(target, 2)}` : (targetError ? "ERROR" : "—")}
-            </div>
-            {targetHourUtc != null && (
-              <div style={{ fontSize: 11, color: "#444", marginTop: 4 }}>
-                Vela {targetHourUtc}:00 UTC
-                {targetSource && <span style={{ marginLeft: 6, color: "#333" }}>{targetSource}</span>}
-              </div>
-            )}
-            {targetError && (
-              <div style={{ fontSize: 10, color: "var(--yellow)", marginTop: 4 }}>{targetError}</div>
-            )}
-            {botState && (
-              <div style={{ fontSize: 9, color: "#333", marginTop: 8 }}>
-                Bot last seen: {botState.last_seen
-                  ? new Date(botState.last_seen).toLocaleTimeString("es-ES", { hour12: false })
-                  : "—"}
-                {botState.ops_today != null && (
-                  <span style={{ marginLeft: 8 }}>Ops hoy: {botState.ops_today}</span>
-                )}
-              </div>
-            )}
-          </div>
-        </div>
-      )}
-
-      {/* ── STATS BAR ────────────────────────────────────────────────────── */}
-      {tab === "dashboard" && (
-        <div style={{
-          display: "flex", gap: 32, padding: "14px 24px",
-          borderBottom: "1px solid var(--border)", background: "#02020a",
-          flexWrap: "wrap", alignItems: "flex-end",
-        }}>
-          <StatBox
-            label="STAKE/OP"
-            value={fmtUSD(config.stake_usdc)}
-            color="var(--yellow)"
-            sub="configurado en bot"
-          />
-          <StatBox
-            label="P&L HOY"
-            value={fmtUSD(pnlDay)}
-            color={pnlDay >= 0 ? "var(--green)" : "var(--red)"}
-          />
-          <StatBox
-            label="P&L TOTAL"
-            value={fmtUSD(pnlTotal)}
-            color={pnlTotal >= 0 ? "var(--green)" : "var(--red)"}
-          />
-          <StatBox
-            label="WINRATE"
-            value={winrate != null ? `${winrate.toFixed(0)}%` : "—"}
-            color="var(--yellow)"
-            sub={`${wins}W / ${losses}L`}
-          />
-          <StatBox label="OPS" value={total} color="var(--dim)" />
-          <div style={{ marginLeft: "auto", fontSize: 9, color: "#333", alignSelf: "center" }}>
-            ↻ sync cada 10s · fuente: Supabase
-          </div>
-        </div>
-      )}
-
-      {/* ── MERCADO + CHART + LOG ─────────────────────────────────────────── */}
-      {tab === "dashboard" && (
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", borderBottom: "1px solid var(--border)" }}>
-          <div style={{ borderRight: "1px solid var(--border)" }}>
-            {/* v3.4 FIX: pasar error y apiResponse para que MarketInfo muestre
-                el panel de error en vez de quedarse en "Buscando..." */}
+          {/* MERCADO ACTIVO — simplificado v4.0 */}
+          <div style={{ background: "var(--bg)" }}>
             <MarketInfo
               market={market}
               minsLeft={minsLeft}
@@ -563,44 +404,58 @@ export default function Dashboard() {
               apiResponse={marketApiResponse}
             />
           </div>
-          <div>
-            <div style={{ padding: "12px 20px", borderBottom: "1px solid var(--border)" }}>
-              <div style={{ fontSize: 9, color: "#444", letterSpacing: "0.15em", marginBottom: 8 }}>PRECIO BTC — ÚLTIMOS 60s</div>
-              <PriceChart data={priceHistory} target={target} />
+        </div>
+      )}
+
+      {/* ── MERCADO + CHART ───────────────────────────────────────────────── */}
+      {tab === "dashboard" && (
+        <div style={{ borderBottom: "1px solid var(--border)" }}>
+          <div style={{ padding: "12px 20px" }}>
+            <div style={{ fontSize: 9, color: "#444", letterSpacing: "0.15em", marginBottom: 8 }}>
+              PRECIO BTC — ÚLTIMOS 60s
             </div>
-            <div style={{ padding: "12px 20px" }}>
-              <div style={{ fontSize: 9, color: "#444", letterSpacing: "0.15em", marginBottom: 6 }}>ANÁLISIS IA</div>
-              <div style={{ fontSize: 11, color: aiLoading ? "var(--dim)" : "var(--text)", lineHeight: 1.6 }}>
-                {aiLoading ? "⏳ Analizando señal..." : aiText}
-              </div>
-            </div>
+            <PriceChart data={priceHistory} target={target} />
           </div>
         </div>
       )}
 
-      {/* ── LOG DE EVENTOS ────────────────────────────────────────────────── */}
+      {/* ── LOG DE EVENTOS (mensajes Telegram del bot) ────────────────────── */}
       {tab === "dashboard" && (
         <div style={{ padding: "12px 20px" }}>
-          <div style={{ fontSize: 9, color: "#444", letterSpacing: "0.15em", marginBottom: 8 }}>LOG DE EVENTOS</div>
           <div style={{
-            maxHeight: 180, overflowY: "auto",
+            display: "flex", justifyContent: "space-between", alignItems: "center",
+            marginBottom: 8,
+          }}>
+            <div style={{ fontSize: 9, color: "#444", letterSpacing: "0.15em" }}>
+              LOG DE EVENTOS
+            </div>
+            <div style={{ fontSize: 9, color: "#222" }}>
+              ↻ sync cada 5s · fuente: bot
+            </div>
+          </div>
+          <div style={{
+            maxHeight: 220, overflowY: "auto",
             background: "#010108", border: "1px solid var(--border)",
             borderRadius: 3, padding: "8px 10px",
           }}>
-            {log.length === 0 && (
-              <div style={{ fontSize: 10, color: "#222" }}>Sin eventos aún...</div>
+            {events.length === 0 && (
+              <div style={{ fontSize: 10, color: "#222" }}>
+                Sin eventos aún — el bot no ha enviado mensajes
+              </div>
             )}
-            {log.map(entry => (
-              <div key={entry.id} style={{
+            {events.map(ev => (
+              <div key={ev.id} style={{
                 fontSize: 10,
-                color: entry.type === "success" ? "var(--green)"
-                     : entry.type === "error"   ? "var(--red)"
-                     : entry.type === "warning" ? "var(--yellow)"
-                     : "#555",
-                marginBottom: 2,
+                color: eventColor(ev.text),
+                marginBottom: 3,
+                lineHeight: 1.55,
+                borderBottom: "1px solid #0a0a14",
+                paddingBottom: 3,
               }}>
-                <span style={{ color: "#2a2a3a", marginRight: 8 }}>{entry.ts}</span>
-                {entry.msg}
+                <span style={{ color: "#2a2a3a", marginRight: 8, userSelect: "none" }}>
+                  {fmtTime(ev.ts_iso)}
+                </span>
+                <span style={{ whiteSpace: "pre-wrap" }}>{ev.text}</span>
               </div>
             ))}
           </div>
