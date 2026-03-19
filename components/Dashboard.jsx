@@ -1,22 +1,20 @@
 "use client";
 /**
- * Dashboard.jsx — v4.0
+ * Dashboard.jsx — v4.1
  *
- * CAMBIOS v4.0
- * ────────────────────────────────────────────────────────────
- *  1. MERCADO ACTIVO: MarketInfo simplificado — muestra solo SLUG + link.
- *     La fuente sigue siendo bot-state (prioridad) o /api/market (fallback).
+ * FIXES v4.1
+ * ─────────────────────────────────────────────────────────────
+ * 1. EVENTOS PERSISTENTES (Bug 3):
+ *    setEvents() ya NO sobreescribe con el array vacío del servidor.
+ *    Si el servidor devuelve [] (instancia fría de Vercel), el cliente
+ *    conserva su caché local. Solo se añaden eventos nuevos (merge por id).
  *
- *  2. LOG DE EVENTOS: ahora muestra los mismos mensajes que Telegram.
- *     El bot (notifier.py) postea a /api/events; el dashboard los lee
- *     cada 5s. Polling simple, sin lógica de Supabase en el log.
+ * 2. TARGET VISIBLE EN DASHBOARD (Bug 1 — lado UI):
+ *    Panel SEÑAL ahora muestra el valor del target en $XXXXX con color
+ *    amarillo visible. Antes los colores eran #444/#666 (casi invisibles).
+ *    El panel BTC también muestra "TARGET $XXXXX" sobre el windowbar.
  *
- *  3. ANÁLISIS IA: sección eliminada.
- *     - Quitados: aiText, aiLoading state, fetch a /api/analysis, y el
- *       bloque JSX "ANÁLISIS IA" de la columna derecha.
- *     - La columna derecha ahora muestra solo el gráfico BTC.
- *
- * (sin otros cambios respecto a v3.4)
+ * (v4.0 — simplificación MarketInfo, log de eventos desde /api/events)
  */
 
 import { useState, useEffect, useRef, useCallback } from "react";
@@ -60,39 +58,35 @@ function StatBox({ label, value, color = "#c8c8d8", sub }) {
   );
 }
 
-/** Devuelve HH:MM:SS desde un ISO string o timestamp ms */
 function fmtTime(tsIso) {
   try {
     const d = new Date(tsIso);
     return d.toLocaleTimeString("es-ES", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
-  } catch {
-    return "";
-  }
+  } catch { return ""; }
 }
 
-/** Colorea el evento por su primer emoji */
 function eventColor(text) {
-  if (!text) return "#555";
+  if (!text) return "#666";
   if (text.startsWith("✅") || text.startsWith("🟢") || text.startsWith("🤖")) return "var(--green)";
   if (text.startsWith("❌") || text.startsWith("🛑") || text.startsWith("⛔") || text.startsWith("🚨")) return "var(--red)";
-  if (text.startsWith("⚠")) return "var(--yellow)";
-  return "#777";
+  if (text.startsWith("⚠")  || text.startsWith("🟡")) return "var(--yellow)";
+  if (text.startsWith("📊") || text.startsWith("📈") || text.startsWith("📉")) return "#4488ff";
+  return "#888";
 }
 
 export default function Dashboard() {
-  const [config, setConfig]       = useState(DEFAULT_CONFIG);
-  const [tab, setTab]             = useState("dashboard");
-  const [bets, setBets]           = useState([]);
+  const [config, setConfig]             = useState(DEFAULT_CONFIG);
+  const [tab, setTab]                   = useState("dashboard");
+  const [bets, setBets]                 = useState([]);
   const [priceHistory, setPriceHistory] = useState([]);
 
   // ── Estado del bot ────────────────────────────────────────────────────
   const [botState, setBotState] = useState(null);
   const running  = botState?.status === "running" && !botState?.stale;
-  const botStale = botState?.stale ?? true;
+  const botStale = botState?.stale ?? false;
 
   // ── Log de eventos (mensajes Telegram) ───────────────────────────────
-  const [events, setEvents]       = useState([]);
-  const lastEventIdRef            = useRef(null);
+  const [events, setEvents] = useState([]);
 
   // ── Hooks de precio y mercado ─────────────────────────────────────────
   const { price, prev, source, error: priceError, loading: priceLoading } = useBTCPrice(true);
@@ -100,41 +94,36 @@ export default function Dashboard() {
   const now = useClock();
 
   // ── Derived values ────────────────────────────────────────────────────
-  const minsLeft    = getMinsLeft(endMs, now);
+  const minsLeft     = getMinsLeft(endMs, now);
   const activeWindow = getActiveWindow(minsLeft);
 
-  // Target desde bot-state
+  // Target desde bot-state (autoritativo)
   const target = botState?.target ?? null;
   const dist   = price != null && target != null ? price - target : null;
 
   // Señal visual
-  const decision    = config && price && target ? getDecision(price, target, config) : null;
+  const decision = config && price && target ? getDecision(price, target, config) : null;
 
   // Stats desde bets
-  const closedBets  = bets.filter(b => b.result && b.result !== "PENDING");
-  const wins        = closedBets.filter(b => b.result === "WIN").length;
-  const losses      = closedBets.filter(b => b.result === "LOSS" || b.result === "STOP").length;
-  const total       = closedBets.length;
-  const winrate     = total > 0 ? (wins / total) * 100 : null;
-  const pnlTotal    = closedBets.reduce((acc, b) => acc + (b.pnl_usd ?? 0), 0);
-  const activeBet   = bets.find(b => b.result === "PENDING") ?? null;
-
-  // Target tag
-  const targetTag = target
-    ? dist > 0
-      ? { label: `▲ +$${Math.abs(dist).toFixed(0)}`, color: "#2a3a5a" }
-      : dist < 0
-      ? { label: `▼ -$${Math.abs(dist).toFixed(0)}`, color: "#3a2a1a" }
-      : null
-    : null;
+  const closedBets = bets.filter(b => b.result && b.result !== "PENDING");
+  const wins       = closedBets.filter(b => b.result === "WIN").length;
+  const losses     = closedBets.filter(b => b.result === "LOSS" || b.result === "STOP").length;
+  const total      = closedBets.length;
+  const winrate    = total > 0 ? (wins / total) * 100 : null;
+  const pnlTotal   = closedBets.reduce((acc, b) => acc + (b.pnl_usd ?? 0), 0);
+  const activeBet  = bets.find(b => b.result === "PENDING") ?? null;
 
   // Slug corto para header
   const marketSlugShort = market?.slug?.split("-").slice(-3).join("-") ?? null;
 
+  // ─────────────────────────────────────────────────────────────────────
+  // EFFECTS
+  // ─────────────────────────────────────────────────────────────────────
+
   // ── 1. Cargar bets desde Supabase ─────────────────────────────────────
   const loadBets = useCallback(async () => {
     try {
-      const res = await fetch("/api/bets?limit=500");
+      const res  = await fetch("/api/bets?limit=500");
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       const rows = data.bets ?? [];
@@ -149,7 +138,7 @@ export default function Dashboard() {
 
   useEffect(() => {
     try {
-      const saved = localStorage.getItem(LS_KEY);
+      const saved  = localStorage.getItem(LS_KEY);
       if (saved) {
         const parsed = JSON.parse(saved);
         if (Array.isArray(parsed) && parsed.length > 0) setBets(parsed);
@@ -164,7 +153,7 @@ export default function Dashboard() {
   useEffect(() => {
     async function fetchBotState() {
       try {
-        const res = await fetch("/api/bot-state");
+        const res  = await fetch("/api/bot-state");
         if (!res.ok) return;
         const data = await res.json();
         setBotState(data);
@@ -178,13 +167,30 @@ export default function Dashboard() {
     return () => clearInterval(id);
   }, []);
 
-  // ── 3. Log de eventos: mensajes del bot (= mismos que Telegram) ───────
+  // ── 3. Log de eventos — FIX v4.1: acumulativo, no reemplaza ──────────
+  //
+  // PROBLEMA ORIGINAL: setEvents(data.events ?? []) reemplazaba todo.
+  // Cuando Vercel levanta una instancia fría, globalThis._botEvents = []
+  // → el cliente veía "Sin eventos" aunque ya tuviera un historial local.
+  //
+  // FIX: si el servidor devuelve vacío, conservar el estado local.
+  // Si devuelve eventos, hacer merge por id (solo añadir los nuevos).
   const loadEvents = useCallback(async () => {
     try {
-      const res = await fetch("/api/events");
+      const res  = await fetch("/api/events");
       if (!res.ok) return;
-      const data = await res.json();
-      setEvents(data.events ?? []);
+      const data    = await res.json();
+      const incoming = data.events ?? [];
+
+      // Si el servidor devuelve vacío (instancia fría), NO sobreescribir
+      if (incoming.length === 0) return;
+
+      setEvents(prev => {
+        const prevIds = new Set(prev.map(e => e.id));
+        const newOnes = incoming.filter(e => !prevIds.has(e.id));
+        if (newOnes.length === 0) return prev;            // nada nuevo
+        return [...newOnes, ...prev].slice(0, 100);       // cap 100
+      });
     } catch {}
   }, []);
 
@@ -198,7 +204,7 @@ export default function Dashboard() {
   useEffect(() => {
     async function fetchStake() {
       try {
-        const res = await fetch("/api/config?key=stake_usdc");
+        const res  = await fetch("/api/config?key=stake_usdc");
         if (!res.ok) return;
         const data = await res.json();
         if (data.value) {
@@ -220,9 +226,6 @@ export default function Dashboard() {
       return [...h, { ts, price }].slice(-60);
     });
   }, [price]);
-
-  // ── 6. Target stale watchdog ──────────────────────────────────────────
-  // (target viene directo de bot-state, no necesitamos fetch separado)
 
   // ─────────────────────────────────────────────────────────────────────
   // RENDER
@@ -246,69 +249,72 @@ export default function Dashboard() {
             width: 8, height: 8, borderRadius: "50%",
             background: running ? "var(--green)" : "var(--red)",
             boxShadow: running ? "0 0 12px var(--green)" : "0 0 8px var(--red)",
-            animation: running ? "pulse 1.5s infinite" : "none",
+            animation: running ? "pulse 2s infinite" : "none",
           }} />
-          <span style={{ color: "var(--green)", fontWeight: 700, letterSpacing: "0.12em", fontSize: 14 }}>
-            POLYMARKET BTC BOT
+          <span style={{ fontSize: 12, fontWeight: 700, letterSpacing: "0.1em" }}>
+            POLYBOT
           </span>
-          <Tag color="#2a4a3a">v4.0</Tag>
-          {running
-            ? <Tag color="#1a3a2a">BOT ACTIVO</Tag>
-            : botStale
-            ? <Tag color="#3a1a1a">BOT OFFLINE</Tag>
-            : <Tag color="#2a2a1a">BOT DETENIDO</Tag>
-          }
-          {marketActive
-            ? <Tag color="#1a3a2a">MERCADO {marketSlugShort ? `· ${marketSlugShort}` : ""}</Tag>
-            : <Tag color="#3a1a1a">SIN MERCADO</Tag>
-          }
-          {targetTag && <Tag color={targetTag.color}>{targetTag.label}</Tag>}
-          {target && (
-            <Tag color="#1a2a3a">TARGET ${fmt(target, 0)}</Tag>
+          {botStale && <Tag color="var(--yellow)">BOT STALE</Tag>}
+          {marketSlugShort && (
+            <Tag color="#4488ff">{marketSlugShort}</Tag>
           )}
           {activeBet && (
-            <Tag color="#3a2a1a">● {activeBet.dir ?? activeBet.direction} PENDING</Tag>
+            <Tag color={activeBet.direction === "UP" ? "var(--green)" : "var(--red)"}>
+              {activeBet.direction === "UP" ? "▲" : "▼"} APUESTA ACTIVA
+            </Tag>
           )}
         </div>
-        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-          {["dashboard", "historial", "análisis", "config"].map(t => (
-            <button
-              key={t}
-              onClick={() => setTab(t)}
-              style={{
-                background: tab === t ? "var(--border)" : "transparent",
-                border: "1px solid",
-                borderColor: tab === t ? "var(--border)" : "transparent",
-                color: tab === t ? "var(--text)" : "var(--dim)",
-                padding: "4px 12px", borderRadius: 3, fontSize: 10,
-                letterSpacing: "0.12em", cursor: "pointer",
-                textTransform: "uppercase",
-              }}>
-              {t}
-            </button>
-          ))}
-          <div style={{
-            background: running ? "rgba(0,255,136,0.08)" : "rgba(255,68,102,0.08)",
-            border: `1px solid ${running ? "rgba(0,255,136,0.25)" : "rgba(255,68,102,0.2)"}`,
-            color: running ? "var(--green)" : "var(--red)",
-            padding: "5px 16px", borderRadius: 3,
-            fontSize: 10, letterSpacing: "0.14em", fontWeight: 700,
-          }}>
-            {running ? "● CORRIENDO" : "○ INACTIVO"}
-          </div>
+        <div style={{ display: "flex", gap: 16, alignItems: "center" }}>
+          {target && (
+            <span style={{ fontSize: 10, color: "var(--yellow)", letterSpacing: "0.08em" }}>
+              TARGET <span style={{ fontWeight: 700 }}>
+                ${target.toLocaleString("en-US", { maximumFractionDigits: 0 })}
+              </span>
+            </span>
+          )}
+          <span style={{ fontSize: 10, color: "#444" }}>
+            {now.toLocaleTimeString("es-ES", { hour12: false })}
+          </span>
         </div>
       </header>
 
-      {/* ── STATS BAR ────────────────────────────────────────────────────── */}
-      {tab === "dashboard" && total > 0 && (
+      {/* ── TABS ─────────────────────────────────────────────────────────── */}
+      <nav style={{
+        display: "flex", borderBottom: "1px solid var(--border)",
+        background: "#020208",
+      }}>
+        {[
+          { key: "dashboard", label: "DASHBOARD" },
+          { key: "historial", label: "HISTORIAL" },
+          { key: "stats",     label: "ESTADÍSTICAS" },
+          { key: "config",    label: "CONFIG" },
+        ].map(({ key, label }) => (
+          <button
+            key={key}
+            onClick={() => setTab(key)}
+            style={{
+              background: "none", border: "none", cursor: "pointer",
+              padding: "10px 20px", fontSize: 9, letterSpacing: "0.15em",
+              color: tab === key ? "var(--text)" : "#444",
+              borderBottom: tab === key ? "2px solid var(--green)" : "2px solid transparent",
+              fontFamily: "inherit",
+            }}
+          >
+            {label}
+          </button>
+        ))}
+      </nav>
+
+      {/* ── STATS BAR (solo dashboard) ────────────────────────────────────── */}
+      {tab === "dashboard" && (
         <div style={{
-          display: "flex", gap: 32, padding: "10px 24px",
-          borderBottom: "1px solid var(--border)", background: "#020208",
-          alignItems: "center",
+          display: "flex", gap: 32, padding: "12px 20px",
+          borderBottom: "1px solid var(--border)", background: "#010108",
+          overflowX: "auto",
         }}>
           <StatBox
             label="P&L TOTAL"
-            value={fmtUSD(pnlTotal)}
+            value={total > 0 ? `${pnlTotal >= 0 ? "+" : ""}${fmtUSD(pnlTotal)}` : "—"}
             color={pnlTotal >= 0 ? "var(--green)" : "var(--red)"}
           />
           <StatBox
@@ -324,7 +330,7 @@ export default function Dashboard() {
         </div>
       )}
 
-      {/* ── PANEL PRINCIPAL ──────────────────────────────────────────────── */}
+      {/* ── PANEL PRINCIPAL 3-columnas ────────────────────────────────────── */}
       {tab === "dashboard" && (
         <div style={{
           display: "grid",
@@ -336,7 +342,7 @@ export default function Dashboard() {
           <div style={{ background: "var(--bg)", padding: "20px 24px", borderRight: "1px solid var(--border)" }}>
             <div style={{ fontSize: 9, color: "#444", letterSpacing: "0.15em", marginBottom: 6 }}>
               BTC / USDT
-              {source && <span style={{ color: "#222", marginLeft: 6 }}>{source.toUpperCase()}</span>}
+              {source && <span style={{ color: "#333", marginLeft: 6 }}>{source.toUpperCase()}</span>}
             </div>
             <div style={{
               fontSize: 38, fontWeight: 700, lineHeight: 1,
@@ -349,11 +355,22 @@ export default function Dashboard() {
                 {price >= prev ? "▲" : "▼"} ${Math.abs(price - prev).toFixed(2)}
               </div>
             )}
-            {dist != null && target && (
-              <div style={{ fontSize: 11, color: "#444", marginTop: 4 }}>
-                Dist target: <span style={{ color: dist > 0 ? "#4488ff" : "#ff8800", fontWeight: 700 }}>
-                  {dist > 0 ? "+" : ""}{fmtUSD(dist)}
+            {/* TARGET value — FIX v4.1: color visible */}
+            {target && (
+              <div style={{ fontSize: 11, color: "#888", marginTop: 6 }}>
+                TARGET{" "}
+                <span style={{ color: "var(--yellow)", fontWeight: 700 }}>
+                  ${target.toLocaleString("en-US", { maximumFractionDigits: 0 })}
                 </span>
+                {dist != null && (
+                  <span style={{
+                    marginLeft: 8,
+                    color: dist > 0 ? "#4488ff" : "#ff8800",
+                    fontWeight: 700,
+                  }}>
+                    ({dist > 0 ? "+" : ""}{fmtUSD(dist)})
+                  </span>
+                )}
               </div>
             )}
             <div style={{ marginTop: 16 }}>
@@ -366,7 +383,7 @@ export default function Dashboard() {
             <div style={{ fontSize: 9, color: "#444", letterSpacing: "0.15em", marginBottom: 6 }}>SEÑAL VISUAL</div>
             {activeWindow && decision ? (
               <>
-                <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 8 }}>
+                <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 10 }}>
                   <span style={{ color: activeWindow.color, fontSize: 12, fontWeight: 700 }}>
                     [{activeWindow.key}]
                   </span>
@@ -379,22 +396,50 @@ export default function Dashboard() {
                     {decision.dir === "UP" ? "▲ UP" : decision.dir === "DOWN" ? "▼ DOWN" : "— WAIT"}
                   </span>
                 </div>
-                <div style={{ fontSize: 10, color: "#444", lineHeight: 1.8 }}>
-                  <div>Umbral: <span style={{ color: "#666" }}>${decision.threshold?.toFixed(0)}</span></div>
-                  <div>Distancia: <span style={{
-                    color: Math.abs(dist ?? 0) > (decision.threshold ?? 0) ? "var(--green)" : "var(--red)",
-                    fontWeight: 700,
-                  }}>${Math.abs(dist ?? 0).toFixed(0)}</span></div>
+                {/* FIX v4.1: colores visibles + target value */}
+                <div style={{ fontSize: 11, color: "#888", lineHeight: 2 }}>
+                  <div>
+                    Target:{" "}
+                    <span style={{ color: "var(--yellow)", fontWeight: 700 }}>
+                      {target != null
+                        ? `$${target.toLocaleString("en-US", { maximumFractionDigits: 0 })}`
+                        : "—"}
+                    </span>
+                  </div>
+                  <div>
+                    Umbral:{" "}
+                    <span style={{ color: "#aaa", fontWeight: 700 }}>
+                      ${decision.threshold?.toFixed(0) ?? "—"}
+                    </span>
+                  </div>
+                  <div>
+                    Distancia:{" "}
+                    <span style={{
+                      color: Math.abs(dist ?? 0) > (decision.threshold ?? 0)
+                        ? "var(--green)" : "var(--red)",
+                      fontWeight: 700,
+                    }}>
+                      ${Math.abs(dist ?? 0).toFixed(0)}
+                    </span>
+                  </div>
                 </div>
               </>
             ) : (
-              <div style={{ fontSize: 11, color: "#333" }}>
+              <div style={{ fontSize: 11, color: "#555" }}>
                 {!activeWindow ? "Fuera de ventana de entrada" : "Sin precio/target"}
+                {target && !activeWindow && (
+                  <div style={{ marginTop: 8, color: "#666" }}>
+                    Target:{" "}
+                    <span style={{ color: "var(--yellow)" }}>
+                      ${target.toLocaleString("en-US", { maximumFractionDigits: 0 })}
+                    </span>
+                  </div>
+                )}
               </div>
             )}
           </div>
 
-          {/* MERCADO ACTIVO — simplificado v4.0 */}
+          {/* MERCADO ACTIVO */}
           <div style={{ background: "var(--bg)" }}>
             <MarketInfo
               market={market}
@@ -407,57 +452,71 @@ export default function Dashboard() {
         </div>
       )}
 
-      {/* ── MERCADO + CHART ───────────────────────────────────────────────── */}
+      {/* ── GRÁFICA BTC ──────────────────────────────────────────────────── */}
       {tab === "dashboard" && (
         <div style={{ borderBottom: "1px solid var(--border)" }}>
           <div style={{ padding: "12px 20px" }}>
-            <div style={{ fontSize: 9, color: "#444", letterSpacing: "0.15em", marginBottom: 8 }}>
-              PRECIO BTC — ÚLTIMOS 60s
-            </div>
             <PriceChart data={priceHistory} target={target} />
           </div>
         </div>
       )}
 
-      {/* ── LOG DE EVENTOS (mensajes Telegram del bot) ────────────────────── */}
+      {/* ── LOG DE EVENTOS ────────────────────────────────────────────────── */}
       {tab === "dashboard" && (
-        <div style={{ padding: "12px 20px" }}>
-          <div style={{
-            display: "flex", justifyContent: "space-between", alignItems: "center",
-            marginBottom: 8,
-          }}>
-            <div style={{ fontSize: 9, color: "#444", letterSpacing: "0.15em" }}>
-              LOG DE EVENTOS
-            </div>
-            <div style={{ fontSize: 9, color: "#222" }}>
-              ↻ sync cada 5s · fuente: bot
-            </div>
-          </div>
-          <div style={{
-            maxHeight: 220, overflowY: "auto",
-            background: "#010108", border: "1px solid var(--border)",
-            borderRadius: 3, padding: "8px 10px",
-          }}>
-            {events.length === 0 && (
-              <div style={{ fontSize: 10, color: "#222" }}>
-                Sin eventos aún — el bot no ha enviado mensajes
+        <div style={{ borderBottom: "1px solid var(--border)" }}>
+          <div style={{ padding: "12px 20px" }}>
+            <div style={{
+              display: "flex", justifyContent: "space-between", alignItems: "center",
+              marginBottom: 8,
+            }}>
+              <div style={{ fontSize: 9, color: "#444", letterSpacing: "0.15em" }}>
+                LOG DE EVENTOS
               </div>
-            )}
-            {events.map(ev => (
-              <div key={ev.id} style={{
-                fontSize: 10,
-                color: eventColor(ev.text),
-                marginBottom: 3,
-                lineHeight: 1.55,
-                borderBottom: "1px solid #0a0a14",
-                paddingBottom: 3,
-              }}>
-                <span style={{ color: "#2a2a3a", marginRight: 8, userSelect: "none" }}>
-                  {fmtTime(ev.ts_iso)}
-                </span>
-                <span style={{ whiteSpace: "pre-wrap" }}>{ev.text}</span>
+              <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
+                <div style={{ fontSize: 9, color: "#222" }}>
+                  ↻ sync cada 5s · fuente: bot ({events.length})
+                </div>
+                {events.length > 0 && (
+                  <button
+                    onClick={() => setEvents([])}
+                    style={{
+                      background: "none", border: "1px solid #1a1a2e", color: "#333",
+                      fontSize: 8, padding: "2px 6px", borderRadius: 2, cursor: "pointer",
+                      fontFamily: "inherit", letterSpacing: "0.1em",
+                    }}
+                  >
+                    LIMPIAR
+                  </button>
+                )}
               </div>
-            ))}
+            </div>
+            <div style={{
+              maxHeight: 220, overflowY: "auto",
+              background: "#010108", border: "1px solid var(--border)",
+              borderRadius: 3, padding: "8px 10px",
+            }}>
+              {events.length === 0 ? (
+                <div style={{ fontSize: 10, color: "#1a1a2e" }}>
+                  Sin eventos aún — esperando mensajes del bot
+                </div>
+              ) : (
+                events.map(ev => (
+                  <div key={ev.id} style={{
+                    fontSize: 10,
+                    color: eventColor(ev.text),
+                    marginBottom: 3,
+                    lineHeight: 1.55,
+                    borderBottom: "1px solid #0a0a14",
+                    paddingBottom: 3,
+                  }}>
+                    <span style={{ color: "#2a2a3a", marginRight: 8, userSelect: "none" }}>
+                      {fmtTime(ev.ts_iso)}
+                    </span>
+                    <span style={{ whiteSpace: "pre-wrap" }}>{ev.text}</span>
+                  </div>
+                ))
+              )}
+            </div>
           </div>
         </div>
       )}
@@ -471,24 +530,23 @@ export default function Dashboard() {
             background: "#02020a",
           }}>
             <span style={{ fontSize: 10, color: "#444", letterSpacing: "0.12em" }}>
-              {bets.length} OPERACIONES · FUENTE: SUPABASE (bot) · CLIC EN FILA PARA DETALLES
+              {bets.length} OPERACIONES · FUENTE: SUPABASE · CLIC EN FILA PARA DETALLES
             </span>
             {bets.length > 0 && (
               <button
                 onClick={() => {
-                  if (window.confirm("¿Limpiar caché local? (Supabase no se modifica)")) {
+                  if (window.confirm("¿Limpiar caché local?")) {
+                    localStorage.removeItem(LS_KEY);
                     setBets([]);
-                    try { localStorage.removeItem(LS_KEY); } catch {}
                   }
                 }}
                 style={{
-                  background: "rgba(255,68,102,0.1)",
-                  border: "1px solid rgba(255,68,102,0.3)",
-                  color: "var(--red)", fontSize: 9,
-                  padding: "4px 10px", borderRadius: 3,
-                  cursor: "pointer", letterSpacing: "0.12em",
-                }}>
-                LIMPIAR CACHÉ LOCAL
+                  background: "none", border: "1px solid #1a1a2e",
+                  color: "#333", fontSize: 9, padding: "3px 8px",
+                  cursor: "pointer", fontFamily: "inherit",
+                }}
+              >
+                LIMPIAR CACHÉ
               </button>
             )}
           </div>
@@ -496,27 +554,13 @@ export default function Dashboard() {
         </div>
       )}
 
-      {/* ── ANÁLISIS ─────────────────────────────────────────────────────── */}
-      {tab === "análisis" && <StatsPanel />}
+      {/* ── ESTADÍSTICAS ─────────────────────────────────────────────────── */}
+      {tab === "stats" && <StatsPanel />}
 
       {/* ── CONFIG ───────────────────────────────────────────────────────── */}
       {tab === "config" && (
-        <div style={{ padding: "24px" }}>
-          <div style={{ marginBottom: 32 }}>
-            <ModeSelector />
-          </div>
-          <div style={{
-            marginBottom: 16, padding: "10px 14px",
-            background: "rgba(255,204,0,0.04)", border: "1px solid rgba(255,204,0,0.15)",
-            borderRadius: 3, fontSize: 10, color: "#666",
-          }}>
-            ⚠ Los umbrales y stake que usa el bot están definidos en Railway (variables de entorno).
-            Los valores aquí son solo para la <span style={{ color: "var(--yellow)" }}>visualización de señal</span> en el dashboard.
-          </div>
-          <ConfigPanel config={config} onChange={setConfig} />
-        </div>
+        <ConfigPanel config={config} onChange={setConfig} />
       )}
-
     </div>
   );
 }
