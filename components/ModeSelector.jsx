@@ -1,19 +1,17 @@
 "use client";
 /**
- * components/ModeSelector.jsx — v2.2
+ * components/ModeSelector.jsx — v2.3
  *
- * CAMBIOS v2.2 — Timeout en poller + aviso bot inactivo:
- *   - useCommandPoller ahora acepta timeoutMs (default 35s).
- *     Si el bot no responde en ese tiempo, resuelve con error explicativo
- *     en lugar de esperar indefinidamente.
- *   - runBalanceCheck muestra aviso previo si el bot está inactivo (stale)
- *     antes de intentar el comando.
- *   - Paso 2 incluye indicador visual de estado del bot (ACTIVO / INACTIVO).
+ * CAMBIOS v2.3 — check_balance INLINE (sin bot, sin Railway):
+ *   - runBalanceCheck detecta respuesta directa (data.direct === true) y aplica
+ *     el resultado inmediatamente sin iniciar polling.
+ *   - Eliminado el aviso "Bot inactivo" del paso 2 — ya no es necesario porque
+ *     check_balance ahora ejecuta inline desde Vercel via Polygon JSON-RPC.
+ *   - El texto descriptivo del paso 2 actualizado: ya no dice "requiere bot".
+ *   - El botón ya no muestra el countdown de timeout (no hay espera).
  *
- * CAMBIOS v2.1 — check_clob DIRECTO:
- *   runClobCheck detecta respuesta directa (data.direct === true) y aplica
- *   el resultado inmediatamente sin iniciar polling.
- *
+ * CAMBIOS v2.2 — Timeout en poller + aviso bot inactivo.
+ * CAMBIOS v2.1 — check_clob DIRECTO.
  * CAMBIOS v2.0 — Preflight screen para cambio a modo real.
  * CAMBIOS v1.1 — safeJson con guard res.ok.
  */
@@ -57,7 +55,7 @@ const S = {
   col: { display: "flex", flexDirection: "column", gap: 12 },
 };
 
-// Timeout para el poller (ms). Si el bot no responde en este tiempo → error.
+// Timeout para el poller (ms) — solo aplica a test_order.
 const POLL_TIMEOUT_MS = 35_000;
 
 // ── Helpers ───────────────────────────────────────────────────────────────
@@ -116,7 +114,7 @@ function BotStatusBadge({ botRunning, botChecked }) {
 }
 
 // ── useCommandPoller ──────────────────────────────────────────────────────
-// Usado para check_balance y test_order (pasan por el bot).
+// Solo usado para test_order (pasa por el bot).
 // Incluye timeout: si el bot no responde en POLL_TIMEOUT_MS, resuelve con error.
 
 function useCommandPoller() {
@@ -157,7 +155,6 @@ function useCommandPoller() {
           cancel();
           onDone(data);
         }
-        // Si status es "pending" o "running", continuar esperando
       } catch (e) {
         cancel();
         onDone({
@@ -174,7 +171,6 @@ function useCommandPoller() {
 }
 
 // ── useBotStatus ──────────────────────────────────────────────────────────
-// Consulta /api/bot-state para saber si el bot está activo.
 
 function useBotStatus() {
   const [running,  setRunning]  = useState(false);
@@ -252,7 +248,7 @@ function PreflightScreen({ onCancel, onConfirm }) {
 
   const canConfirm = clobStatus === "ok" && confirmText === "REAL";
 
-  // ── Check CLOB — v2.2: ejecución directa desde Vercel, sin bot ───────────
+  // ── Check CLOB — inline desde Vercel, sin bot ─────────────────────────────
   const runClobCheck = async () => {
     setClobStatus("loading"); setClobResult(null);
     try {
@@ -264,20 +260,18 @@ function PreflightScreen({ onCancel, onConfirm }) {
       const data = await safeJson(res);
       if (!data.ok) throw new Error(data.error || "Error enviando comando");
 
-      // Respuesta directa — la API route ejecutó check_clob inline, sin bot.
       if (data.direct) {
         const ok = data.status === "done" && data.result?.success;
         setClobStatus(ok ? "ok" : "error");
         setClobResult(data.result);
         return;
       }
-
-      // Fallback (no debería llegar aquí en v1.3+, pero por seguridad):
+      // Fallback legacy
       if (data.id) {
         poll(data.id, (pollData) => {
           const ok = pollData.status === "done" && pollData.result?.success;
           setClobStatus(ok ? "ok" : "error");
-          setClobResult(pollData.result ?? pollData.result);
+          setClobResult(pollData.result);
         });
       }
     } catch (e) {
@@ -286,9 +280,9 @@ function PreflightScreen({ onCancel, onConfirm }) {
     }
   };
 
-  // ── Check Balance — pasa por el bot (necesita wallet) ────────────────────
+  // ── Check Balance — v2.3: inline desde Vercel via Polygon JSON-RPC ────────
+  // Ya no pasa por el bot. Respuesta directa en < 2s.
   const runBalanceCheck = async () => {
-    // Aviso preventivo si el bot está inactivo (pero permitir intentar)
     setBalanceStatus("loading"); setBalanceResult(null);
     try {
       const res = await fetch("/api/commands", {
@@ -296,13 +290,24 @@ function PreflightScreen({ onCancel, onConfirm }) {
         headers: { "Content-Type": "application/json" },
         body:    JSON.stringify({ command: "check_balance" }),
       });
-      const { ok, id, error } = await safeJson(res);
-      if (!ok) throw new Error(error || "Error enviando comando");
-      poll(id, (data) => {
+      const data = await safeJson(res);
+      if (!data.ok) throw new Error(data.error || "Error enviando comando");
+
+      // Respuesta directa — route.js v1.5 ejecuta inline sin bot
+      if (data.direct) {
         const ok2 = data.status === "done" && data.result?.success;
         setBalanceStatus(ok2 ? "ok" : "error");
         setBalanceResult(data.result);
-      });
+        return;
+      }
+      // Fallback legacy polling (no debería llegar aquí con route.js v1.5+)
+      if (data.id) {
+        poll(data.id, (pollData) => {
+          const ok2 = pollData.status === "done" && pollData.result?.success;
+          setBalanceStatus(ok2 ? "ok" : "error");
+          setBalanceResult(pollData.result);
+        });
+      }
     } catch (e) {
       setBalanceStatus("error");
       setBalanceResult({ error: e.message });
@@ -337,55 +342,53 @@ function PreflightScreen({ onCancel, onConfirm }) {
     }
   };
 
+  // ── Render ────────────────────────────────────────────────────────────────
   return (
     <div style={{
-      position: "fixed", inset: 0, zIndex: 1000,
-      background: "rgba(0,0,0,0.85)",
+      position: "fixed", inset: 0,
+      background: "rgba(0,0,0,0.85)", backdropFilter: "blur(4px)",
+      zIndex: 1000,
       display: "flex", alignItems: "center", justifyContent: "center",
-      padding: 24,
-      ...S.font,
+      padding: 20,
     }}>
       <div style={{
-        background: "#02020a", border: "1px solid #1a1a2a",
-        borderRadius: 6, padding: 28,
-        width: "100%", maxWidth: 560,
+        background: "#02020a",
+        border: "1px solid #2a2a3a",
+        borderRadius: 8, padding: "28px 32px",
+        maxWidth: 560, width: "100%",
         maxHeight: "90vh", overflowY: "auto",
-        boxShadow: "0 0 60px rgba(255,68,102,0.08)",
       }}>
-
         {/* Header */}
-        <div style={{ marginBottom: 20 }}>
-          <div style={{ ...S.row, justifyContent: "space-between", marginBottom: 8 }}>
-            <div style={{ fontSize: 13, color: "#ff4466", fontWeight: 700, letterSpacing: "0.12em" }}>
-              ⚠ CAMBIO A MODO REAL
-            </div>
-            <button onClick={() => { cancel(); onCancel(); }} style={S.btn("default")}>
-              ✕ CANCELAR
-            </button>
-          </div>
-          <p style={{ fontSize: 10, color: "#555", lineHeight: 1.7, margin: 0 }}>
-            Antes de activar el modo real, verifica que el bot tiene conectividad
-            con Polymarket y que las credenciales son correctas. Las órdenes reales
-            usan fondos USDC reales de tu cartera.
-          </p>
+        <div style={{ ...S.row, justifyContent: "space-between", marginBottom: 20 }}>
+          <span style={{ fontSize: 13, color: "#ff4466", fontWeight: 700, letterSpacing: "0.1em" }}>
+            ⚠ ACTIVAR MODO REAL
+          </span>
+          <button onClick={onCancel} style={{ ...S.btn("default"), padding: "4px 10px", fontSize: 10 }}>
+            ✕ CANCELAR
+          </button>
         </div>
+
+        <p style={{ fontSize: 9, color: "#555", marginBottom: 20, lineHeight: 1.8 }}>
+          Completa los checks antes de activar el modo real. El bot empezará a
+          ejecutar órdenes con fondos USDC reales de tu cartera.
+        </p>
 
         <div style={S.col}>
 
-          {/* PASO 1: CLOB — ejecución directa desde Vercel */}
+          {/* PASO 1: Conectividad CLOB */}
           <PreflightStep
             num={1}
-            title="Conexión CLOB"
-            description="Verifica que el mercado BTC está activo en Polymarket y los precios CLOB están disponibles. Ejecutado directamente desde Vercel — sin depender del bot."
+            title="Conectividad CLOB"
+            description="Verifica que Polymarket CLOB responde y hay un mercado BTC activo."
             chipStatus={clobStatus}
           >
             <div style={S.row}>
               <button
                 onClick={runClobCheck}
                 disabled={clobStatus === "loading"}
-                style={S.btn("blue", clobStatus === "loading")}
+                style={S.btn("primary", clobStatus === "loading")}
               >
-                {clobStatus === "loading" ? "VERIFICANDO…" : "VERIFICAR CONEXIÓN"}
+                {clobStatus === "loading" ? "COMPROBANDO…" : "VERIFICAR CLOB"}
               </button>
             </div>
             {clobResult && (
@@ -408,32 +411,20 @@ function PreflightScreen({ onCancel, onConfirm }) {
             )}
           </PreflightStep>
 
-          {/* PASO 2: Balance — requiere bot activo */}
+          {/* PASO 2: Balance — v2.3: inline desde Vercel, sin bot */}
           <PreflightStep
             num={2}
             title="Balance de cartera"
-            description="Consulta el saldo USDC y POL en tu cartera de Polygon. Requiere que el bot esté activo en Railway."
+            description="Consulta el saldo USDC y POL en tu cartera de Polygon directamente on-chain."
             chipStatus={balanceStatus}
           >
-            {/* Indicador estado del bot */}
-            <div style={{ ...S.row, marginBottom: 8 }}>
-              <BotStatusBadge botRunning={botRunning} botChecked={botChecked} />
-              {botChecked && !botRunning && balanceStatus === "idle" && (
-                <span style={{ fontSize: 9, color: "#ff8800" }}>
-                  ⚠ Bot inactivo — el comando esperará hasta que Railway responda (35s timeout)
-                </span>
-              )}
-            </div>
-
             <div style={S.row}>
               <button
                 onClick={runBalanceCheck}
                 disabled={balanceStatus === "loading"}
                 style={S.btn("blue", balanceStatus === "loading")}
               >
-                {balanceStatus === "loading"
-                  ? `CONSULTANDO… (timeout ${POLL_TIMEOUT_MS / 1000}s)`
-                  : "CONSULTAR BALANCE"}
+                {balanceStatus === "loading" ? "CONSULTANDO…" : "CONSULTAR BALANCE"}
               </button>
             </div>
             {balanceResult && (
@@ -446,11 +437,11 @@ function PreflightScreen({ onCancel, onConfirm }) {
                   <span style={{ color: "#ff4466" }}>✗ {balanceResult.error}</span>
                 ) : (
                   <>
-                    <div>USDC: <span style={{ color: "#00ff88" }}>${parseFloat(balanceResult.usdc || 0).toFixed(2)}</span></div>
-                    <div>POL:  <span style={{ color: "#888" }}>{parseFloat(balanceResult.pol || 0).toFixed(4)}</span></div>
-                    {balanceResult.rpc_attempts && (
-                      <div style={{ color: "#444" }}>RPC: {balanceResult.rpc_attempts}</div>
-                    )}
+                    <div>USDC: <span style={{ color: "#00ff88" }}>${parseFloat(balanceResult.usdc ?? balanceResult.usdc_balance ?? 0).toFixed(2)}</span></div>
+                    <div>POL:  <span style={{ color: "#888" }}>{parseFloat(balanceResult.pol ?? balanceResult.pol_balance ?? 0).toFixed(4)}</span></div>
+                    <div style={{ color: "#333" }}>
+                      Via: {balanceResult.rpc_used ?? "—"} · {balanceResult.latency_ms}ms
+                    </div>
                   </>
                 )}
               </div>
@@ -461,9 +452,19 @@ function PreflightScreen({ onCancel, onConfirm }) {
           <PreflightStep
             num={3}
             title="Orden de prueba (opcional)"
-            description="Ejecuta una orden real mínima para verificar L2 auth y conectividad completa con el CLOB. Usa fondos reales."
+            description="Ejecuta una orden real mínima para verificar L2 auth y conectividad completa con el CLOB. Usa fondos reales. Requiere bot activo en Railway."
             chipStatus={testStatus}
           >
+            {/* Indicador estado del bot — relevante solo aquí */}
+            <div style={{ ...S.row, marginBottom: 8 }}>
+              <BotStatusBadge botRunning={botRunning} botChecked={botChecked} />
+              {botChecked && !botRunning && testStatus === "idle" && (
+                <span style={{ fontSize: 9, color: "#ff8800" }}>
+                  ⚠ Bot inactivo — la orden no podrá ejecutarse
+                </span>
+              )}
+            </div>
+
             <div style={S.row}>
               <select
                 value={testDir}
@@ -495,7 +496,9 @@ function PreflightScreen({ onCancel, onConfirm }) {
                 disabled={testStatus === "loading"}
                 style={S.btn("danger", testStatus === "loading")}
               >
-                {testStatus === "loading" ? "EJECUTANDO…" : "TEST ORDER"}
+                {testStatus === "loading"
+                  ? `EJECUTANDO… (${POLL_TIMEOUT_MS / 1000}s)`
+                  : "TEST ORDER"}
               </button>
             </div>
             {testResult && (
