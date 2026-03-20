@@ -1,6 +1,13 @@
 """
 monitor.py — Loop principal del bot: ventana horaria, stop loss, resolución
 
+v13.0 — FIX CRÍTICO: SELL real en CLOB al activar Stop Loss
+  - Al dispararse el SL en modo real (not sim_), se llama a sell_position()
+    de strategy.py para cerrar la posición en el CLOB antes de contabilizarla.
+  - Precio de venta: midpoint live - 0.005, mínimo 0.90 (igual que sell_fallback_clob).
+  - Si sell_position() devuelve None se logea el error pero la contabilidad continúa.
+  - En modo simulado el SELL se omite (no hay tokens reales).
+
 v12.0 — ESTRATEGIA ARB EN PARALELO
   - _launch_arb_thread(): lanza arb_monitor.run() como hilo daemon al arrancar.
   - Activación: arb_strategy.enabled: true en config.yaml
@@ -232,25 +239,23 @@ def _load_historical_stats(csv_path: str) -> dict:
 
 
 def _log_accumulated_stats(stats: dict, label: str = "HISTORIAL"):
-    wins   = stats.get("wins", 0)
-    losses = stats.get("losses", 0)
-    stops  = stats.get("stops", 0)
-    total  = stats.get("total_ops", wins + losses + stops)
-    wl     = wins + losses + stops
-    wr     = round(wins / wl * 100, 1) if wl > 0 else 0
-    pnl    = stats.get("total_pnl", 0.0)
-    inv    = stats.get("total_invested", 0.0)
-    sign   = "+" if pnl >= 0 else ""
+    wins   = stats["wins"]
+    losses = stats["losses"] + stats["stops"]
+    wr     = round(wins / (wins + losses) * 100) if (wins + losses) > 0 else 0
+    sign   = "+" if stats["total_pnl"] >= 0 else ""
     logger.info(
         f"[MONITOR] 📊 {label}: "
-        f"{total} ops  {wins}W/{losses}L/{stops}S  WR={wr}%  "
-        f"P&L={sign}${pnl:,.2f}  Invertido=${inv:,.2f}"
+        f"{stats['total_ops']} ops  "
+        f"{wins}W/{losses}L  WR={wr}%  "
+        f"P&L={sign}${stats['total_pnl']:,.2f}  "
+        f"Invertido=${stats['total_invested']:,.2f}"
     )
 
 
 def _log_hour_ops(hour_utc: int, hour_ops: list, hist_stats: dict):
     if not hour_ops:
         return
+
     logger.info(_SEPARATOR)
     logger.info(f"[MONITOR] 📋 RESUMEN HORA {hour_utc:02d}:00 UTC — {len(hour_ops)} operación(es)")
     logger.info(
@@ -259,6 +264,7 @@ def _log_hour_ops(hour_utc: int, hour_ops: list, hist_stats: dict):
         f"{'Odds S':>6}  {'BTC cierre':>10}  {'Resultado':<6}  {'P&L':>10}"
     )
     logger.info(_SEPARATOR2)
+
     total_pnl = 0.0
     for i, op in enumerate(hour_ops, 1):
         direction  = op.get("direction", "—")
@@ -272,7 +278,8 @@ def _log_hour_ops(hour_utc: int, hour_ops: list, hist_stats: dict):
         pnl        = op.get("pnl_usd", 0)
         sim        = " [SIM]" if op.get("simulated") else ""
         total_pnl += pnl
-        pnl_str    = f"{'+' if pnl >= 0 else ''}{pnl:,.2f}"
+
+        pnl_str = f"{'+' if pnl >= 0 else ''}{pnl:,.2f}"
         logger.info(
             f"[MONITOR] {i:>2}.  "
             f"{direction:<5} {window:<6}  "
@@ -413,7 +420,7 @@ def run(cfg: dict):
         db.set_config("bot_simulate_active", str(simulate).lower())
         db.set_config("bot_started_at", datetime.now(timezone.utc).isoformat())
 
-        # v11.1: leer stake desde Supabase — el dashboard puede haberlo cambiado
+        # v11.1: leer stake desde BD — el dashboard puede haberlo cambiado
         _db_stake = db.get_config("stake_usdc", None)
         if _db_stake is not None:
             try:
@@ -586,7 +593,7 @@ def run(cfg: dict):
                 simulate_mode = simulate,
             )
 
-            # ── Snapshot de precio ────────────────────────────────────────
+            # ── Snapshot de precio (~cada N ciclos) ───────────────────────
             if cycle_n % _SNAPSHOT_EVERY_N_CYCLES == 0 and db_ok:
                 try:
                     db.log_price_snapshot(
@@ -599,7 +606,7 @@ def run(cfg: dict):
                 except Exception:
                     pass
 
-            # ── Stop loss (posición abierta, ventana T-5) ─────────────────
+            # ── Stop loss (posición abierta) ──────────────────────────────
             if active_bet:
                 stake_      = active_bet.get("stake", 0)
                 sim_        = active_bet.get("simulated", False)
@@ -632,6 +639,37 @@ def run(cfg: dict):
                     retorno_real = round(tokens_held * exit_token_price, 4) if exit_token_price > 0 else 0.0
                     pnl_usd      = round(retorno_real - stake_, 4)
                     pnl_pct      = round(pnl_pct_sl, 2)
+
+                    # ── v13.0 FIX: ejecutar SELL real en CLOB al activar SL ──
+                    if not sim_ and real_exit_token_id and exit_token_price > 0:
+                        from .strategy import sell_position
+                        sl_sell_price = max(0.90, round(exit_token_price - 0.005, 3))
+                        logger.info(
+                            f"[MONITOR] 🛑 Stop Loss — ejecutando SELL en CLOB\n"
+                            f"          Token    : {real_exit_token_id[:16]}...\n"
+                            f"          Tokens   : {tokens_held:.4f}\n"
+                            f"          Sell @   : {sl_sell_price:.4f}  (mid={exit_token_price:.4f})"
+                        )
+                        sl_sell_resp = sell_position(
+                            real_exit_token_id, tokens_held, sl_sell_price, cfg, mkt_
+                        )
+                        if sl_sell_resp is None:
+                            logger.error(
+                                "[MONITOR] ❌ SELL de stop loss devolvió None — "
+                                "posición NO cerrada en CLOB, revisar manualmente"
+                            )
+                        else:
+                            logger.info("[MONITOR] ✅ SELL de stop loss ejecutado en CLOB")
+                    elif sim_:
+                        logger.info(
+                            "[MONITOR] 🔵 [SIMULADO] Stop Loss — SELL omitido (modo simulación)"
+                        )
+                    else:
+                        logger.warning(
+                            "[MONITOR] ⚠ Stop Loss — SELL omitido: "
+                            "sin token_id o precio CLOB no disponible"
+                        )
+                    # ── FIN v13.0 FIX ────────────────────────────────────
 
                     row = _build_trade_row(
                         active_bet, result, ts_now, pnl_usd, pnl_pct, real_exit_odds_val
@@ -813,17 +851,22 @@ def run(cfg: dict):
             # ── Cambio de hora (sin posición abierta) ─────────────────────
             if hour_utc != last_hour:
                 hist_stats = _load_historical_stats(csv_path)
-                _log_hour_ops(last_hour, hour_ops, hist_stats)
-                notify_hour_summary(cfg, hour_ops, simulate)
 
                 _sync_session_to_db(
-                    now_utc, slug or "",
-                    hour_wins, hour_losses, hour_stops,
-                    hour_pnl, hour_invested, simulate,
+                    now           = now_utc,
+                    market_slug   = slug,
+                    hour_wins     = hour_wins,
+                    hour_losses   = hour_losses,
+                    hour_stops    = hour_stops,
+                    hour_pnl      = hour_pnl,
+                    hour_invested = hour_invested,
+                    simulado      = simulate,
                 )
-                notify_new_hour(cfg, hour_utc, simulate)
 
-                # Reset contadores horarios
+                notify_hour_summary(cfg, hour_utc, hour_wins, hour_losses, ops_hoy, target, hour_ops)
+                _log_hour_ops(last_hour, hour_ops, hist_stats)
+
+                # Reset de hora
                 hour_wins     = 0
                 hour_losses   = 0
                 hour_stops    = 0
@@ -934,56 +977,54 @@ def run(cfg: dict):
                             f"           Odds      : {entry_odds:.4f}  ({entry_odds*100:.1f}%)\n"
                             f"           Tokens    : {tokens_bought:.4f}\n"
                             f"           Ret. est. : ${retorno_est:.2f}  "
-                            f"P&L est: {'+'if pnl_est>=0 else ''}${pnl_est:.2f} ({pct_est:+.1f}%)"
+                            f"({'+' if pnl_est >= 0 else ''}{pct_est:.1f}%)"
                         )
 
-                        notify_bet(cfg, active_bet, signal)
+                        notify_bet(cfg, active_bet)
 
-                        try:
-                            db.upsert_operation({
-                                "id":                   active_bet["id"],
-                                "ts_entrada":           active_bet["ts_entrada"],
-                                "direccion":            active_bet["direction"],
-                                "ventana":              active_bet["window"],
-                                "entry_price":          price,
-                                "target_price":         target,
-                                "distancia":            round(signal.distance, 2),
-                                "umbral":               signal.umbral,
-                                "odds_entrada":         entry_odds,
-                                "stake_usd":            stake,
-                                "tokens_comprados":     tokens_bought,
-                                "retorno_estimado_usd": retorno_est,
-                                "resultado":            "PENDING",
-                                "market_slug":          slug or "",
-                                "simulado":             active_bet["simulated"],
-                            })
-                        except Exception as e:
-                            logger.warning(f"[MONITOR] ⚠ upsert_operation: {e}")
+                        if db_ok:
+                            try:
+                                db.upsert_operation(
+                                    op_id       = active_bet["id"],
+                                    direccion   = active_bet["direction"],
+                                    ventana     = active_bet["window"],
+                                    btc_entry   = price,
+                                    btc_target  = target,
+                                    distancia   = round(signal.distance, 2),
+                                    umbral      = signal.umbral,
+                                    odds        = entry_odds,
+                                    stake_usd   = stake,
+                                    tokens      = tokens_bought,
+                                    retorno_est = retorno_est,
+                                    market_slug = slug or "",
+                                    hour_utc    = hour_utc,
+                                    simulado    = active_bet["simulated"],
+                                    ts_entrada  = active_bet["ts_entrada"],
+                                )
+                            except Exception as e:
+                                logger.warning(f"[MONITOR] ⚠ upsert_operation: {e}")
                 else:
-                    logger.info(
-                        f"[MONITOR] ⛔ Señal {signal.direction.value} en {signal.window} — "
-                        f"límite diario alcanzado ({ops_hoy}/{max_ops})"
-                    )
+                    logger.info(f"[MONITOR] 🚫 Límite diario alcanzado ({max_ops} ops)")
 
             # ── Intervalo adaptativo ───────────────────────────────────────
-            in_t5 = _in_any_window(mins_left) and mins_left < 7
-            if in_t5 and active_bet:
+            _in_t5 = _in_any_window(mins_left)
+            if active_bet and _in_t5:
                 if not _t5_hf_active:
-                    logger.info("[MONITOR] ⚡ T-5 con posición abierta → intervalo 1s")
+                    logger.info(f"[MONITOR] ⚡ Alta frecuencia activada (T-5, {t5_sl_interval}s)")
                     _t5_hf_active = True
                 time.sleep(t5_sl_interval)
             else:
                 if _t5_hf_active:
-                    logger.info(f"[MONITOR] ↩ Saliendo de T-5 HF → intervalo {interval}s")
+                    logger.info("[MONITOR] 🐢 Volviendo a intervalo normal")
                     _t5_hf_active = False
                 time.sleep(interval)
 
     except KeyboardInterrupt:
-        logger.info("[MONITOR] 🛑 Detenido por el usuario")
+        logger.info("[MONITOR] ⛔ KeyboardInterrupt — deteniendo bot")
+        report_offline()
         notify_stop(cfg)
-        report_offline()
     except Exception as e:
-        logger.error(f"[MONITOR] ❌ Error fatal: {e}", exc_info=True)
-        notify_error(cfg, str(e))
+        logger.error(f"[MONITOR] ❌ Error fatal en loop: {e}", exc_info=True)
         report_offline()
+        notify_error(cfg, str(e))
         raise
