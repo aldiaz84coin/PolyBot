@@ -1,15 +1,9 @@
 /**
- * Comparativa.jsx — Comparación de rendimiento entre estrategia Direccional y Arbitraje
+ * Comparativa.jsx — v1.1
  *
- * Muestra en paralelo:
- *  - Métricas clave de cada estrategia (PnL, win rate, ROI, ops)
- *  - Gráfico de PnL acumulado en el tiempo para ambas
- *  - Tabla de rendimiento por día (ambas estrategias)
- *
- * Lee de Supabase:
- *   operations     → estrategia direccional
- *   arb_operations → estrategia de arbitraje
- *   v_comparativa_estrategias → vista SQL (si disponible)
+ * v1.1 — MIGRACIÓN: eliminado createClient de @supabase/supabase-js.
+ *         Ahora usa /api/comparativa (GET) para obtener datos agregados.
+ *         Corrige error "supabaseUrl is required" en build de Vercel.
  *
  * v1.0 — Implementación inicial
  */
@@ -17,14 +11,8 @@
 "use client";
 
 import { useState, useEffect, useCallback } from "react";
-import { createClient } from "@supabase/supabase-js";
 
-const supabase = createClient(
-  process.env.NEXT_PUBLIC_SUPABASE_URL,
-  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY,
-);
-
-// ── Helpers ────────────────────────────────────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 function fmtUSD(v, digits = 2) {
   if (v == null || isNaN(v)) return "—";
@@ -37,17 +25,9 @@ function fmtPct(v) {
   return `${v >= 0 ? "+" : ""}${parseFloat(v).toFixed(1)}%`;
 }
 
-function fmtDate(iso) {
-  if (!iso) return "—";
-  return new Date(iso).toLocaleDateString("es-ES", { day: "2-digit", month: "2-digit" });
-}
-
 const C = {
   dir: "#00ff88",
   arb: "#4488ff",
-  neutral: "#555",
-  bg: "#02020a",
-  border: "#0a0a1e",
 };
 
 const S = {
@@ -97,20 +77,12 @@ const S = {
     padding: "3px 8px", cursor: "pointer",
     borderRadius: 2, fontFamily: "inherit",
   }),
-  table: { width: "100%", borderCollapse: "collapse", fontSize: 10 },
-  th: {
-    fontSize: 8, color: "#333", letterSpacing: "0.12em",
-    padding: "6px 10px", borderBottom: "1px solid #0a0a1e",
-    textAlign: "left", background: "#02020a",
-  },
-  td: { padding: "6px 10px", borderBottom: "1px solid #050510", color: "#666" },
-  chart: { height: 120, position: "relative", marginTop: 8 },
   empty: { fontSize: 10, color: "#2a2a3a", padding: "12px 0" },
 };
 
-// ── Mini bar chart ─────────────────────────────────────────────────────────
+// ── Mini bar chart ────────────────────────────────────────────────────────────
 
-function MiniBarChart({ rows, label }) {
+function MiniBarChart({ rows }) {
   if (!rows || rows.length === 0) {
     return <div style={S.empty}>Sin datos suficientes</div>;
   }
@@ -140,7 +112,7 @@ function MiniBarChart({ rows, label }) {
   );
 }
 
-// ── Comparativa de métricas ────────────────────────────────────────────────
+// ── Columna de métricas ───────────────────────────────────────────────────────
 
 function MetricColumn({ title, color, stats, loading }) {
   if (loading) {
@@ -160,7 +132,8 @@ function MetricColumn({ title, color, stats, loading }) {
     );
   }
 
-  const { total_ops, wins, losses, tasa_exito_pct, pnl_total_usd, pnl_medio_usd, invertido_total_usd, roi_pct } = stats;
+  const { total_ops, wins, losses, tasa_exito_pct, pnl_total_usd,
+          pnl_medio_usd, invertido_total_usd, roi_pct } = stats;
   const pnl  = parseFloat(pnl_total_usd  || 0);
   const roi  = parseFloat(roi_pct         || 0);
   const tasa = parseFloat(tasa_exito_pct  || 0);
@@ -212,12 +185,11 @@ function MetricColumn({ title, color, stats, loading }) {
   );
 }
 
-// ── Componente principal ───────────────────────────────────────────────────
+// ── Componente principal ──────────────────────────────────────────────────────
 
 export default function Comparativa() {
   const [filterMode, setFilterMode] = useState("all"); // all | sim | real
   const [loading,    setLoading]    = useState(true);
-
   const [dirStats,   setDirStats]   = useState(null);
   const [arbStats,   setArbStats]   = useState(null);
   const [dailyDir,   setDailyDir]   = useState([]);
@@ -226,75 +198,12 @@ export default function Comparativa() {
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      const simFilter = filterMode === "sim" ? true : filterMode === "real" ? false : null;
-
-      // ── Estrategia Direccional ─────────────────────────────────────────
-      let dirQ = supabase
-        .from("operations")
-        .select("resultado, pnl_usd, stake_usd, ts_entrada")
-        .neq("resultado", "PENDING");
-      if (simFilter !== null) dirQ = dirQ.eq("simulado", simFilter);
-      const { data: dirOps } = await dirQ;
-
-      // ── Estrategia ARB ─────────────────────────────────────────────────
-      let arbQ = supabase
-        .from("arb_operations")
-        .select("resultado, pnl_usd, stake_total_usd, ts_entrada")
-        .neq("resultado", "PENDING");
-      if (simFilter !== null) arbQ = arbQ.eq("simulado", simFilter);
-      const { data: arbOps } = await arbQ;
-
-      // ── Calcular stats Direccional ─────────────────────────────────────
-      const dOps  = dirOps || [];
-      const dWins = dOps.filter(o => o.resultado === "WIN").length;
-      const dLoss = dOps.filter(o => ["LOSS","STOP"].includes(o.resultado)).length;
-      const dPnl  = dOps.reduce((s, o) => s + (parseFloat(o.pnl_usd) || 0), 0);
-      const dInv  = dOps.reduce((s, o) => s + (parseFloat(o.stake_usd) || 0), 0);
-      setDirStats({
-        total_ops:         dOps.length,
-        wins:              dWins,
-        losses:            dLoss,
-        tasa_exito_pct:    dOps.length > 0 ? (dWins / dOps.length * 100) : 0,
-        pnl_total_usd:     dPnl,
-        pnl_medio_usd:     dOps.length > 0 ? dPnl / dOps.length : 0,
-        invertido_total_usd: dInv,
-        roi_pct:           dInv > 0 ? (dPnl / dInv * 100) : 0,
-      });
-
-      // ── Calcular stats ARB ─────────────────────────────────────────────
-      const aOps  = arbOps || [];
-      const aWins = aOps.filter(o => o.resultado === "BALANCED").length;
-      const aLoss = aOps.filter(o => ["PHASE3_EXIT","PARTIAL"].includes(o.resultado)).length;
-      const aPnl  = aOps.reduce((s, o) => s + (parseFloat(o.pnl_usd) || 0), 0);
-      const aInv  = aOps.reduce((s, o) => s + (parseFloat(o.stake_total_usd) || 0), 0);
-      setArbStats({
-        total_ops:         aOps.length,
-        wins:              aWins,
-        losses:            aLoss,
-        tasa_exito_pct:    aOps.length > 0 ? (aWins / aOps.length * 100) : 0,
-        pnl_total_usd:     aPnl,
-        pnl_medio_usd:     aOps.length > 0 ? aPnl / aOps.length : 0,
-        invertido_total_usd: aInv,
-        roi_pct:           aInv > 0 ? (aPnl / aInv * 100) : 0,
-      });
-
-      // ── PnL por día ────────────────────────────────────────────────────
-      const byDay = (ops, pnlKey) => {
-        const map = {};
-        for (const o of ops) {
-          const day = (o.ts_entrada || "").slice(0, 10);
-          if (!day) continue;
-          map[day] = (map[day] || 0) + (parseFloat(o[pnlKey]) || 0);
-        }
-        return Object.entries(map)
-          .sort(([a], [b]) => a.localeCompare(b))
-          .slice(-14)  // últimos 14 días
-          .map(([date, value]) => ({ label: date.slice(5), value }));
-      };
-
-      setDailyDir(byDay(dOps, "pnl_usd"));
-      setDailyArb(byDay(aOps, "pnl_usd"));
-
+      const res  = await fetch(`/api/comparativa?mode=${filterMode}`, { cache: "no-store" });
+      const data = await res.json();
+      setDirStats(data.dirStats ?? null);
+      setArbStats(data.arbStats ?? null);
+      setDailyDir(data.dailyDir ?? []);
+      setDailyArb(data.dailyArb ?? []);
     } catch (e) {
       console.error("[Comparativa]", e);
     } finally {
@@ -316,7 +225,7 @@ export default function Comparativa() {
 
   return (
     <div style={S.container}>
-      {/* ── Filtros ────────────────────────────────────────────────────── */}
+      {/* ── Filtros ──────────────────────────────────────────────────────── */}
       <div style={S.filterRow}>
         <span style={{ fontSize: 9, color: "#444", lineHeight: "24px", letterSpacing: "0.1em" }}>MODO:</span>
         {[["all","TODOS"],["sim","SIMULADO"],["real","REAL"]].map(([v,l]) => (
@@ -329,15 +238,13 @@ export default function Comparativa() {
         </button>
       </div>
 
-      {/* ── Banner ganador ────────────────────────────────────────────── */}
+      {/* ── Banner ganador ───────────────────────────────────────────────── */}
       {winner && !loading && (
         <div style={{
-          marginBottom: 16,
-          padding: "10px 14px",
+          marginBottom: 16, padding: "10px 14px",
           background: winner === "empate" ? "#07070f" : `${winner === "direccional" ? C.dir : C.arb}0a`,
           border: `1px solid ${winner === "empate" ? "#1a1a2e" : winner === "direccional" ? C.dir : C.arb}33`,
-          borderRadius: 4,
-          fontSize: 9, color: "#777", letterSpacing: "0.1em",
+          borderRadius: 4, fontSize: 9, color: "#777", letterSpacing: "0.1em",
         }}>
           {winner === "empate"
             ? "⚖ EMPATE — Ambas estrategias con mismo ROI"
@@ -346,7 +253,7 @@ export default function Comparativa() {
         </div>
       )}
 
-      {/* ── Columnas de métricas ──────────────────────────────────────── */}
+      {/* ── Columnas de métricas ─────────────────────────────────────────── */}
       <div style={S.grid2}>
         <MetricColumn
           title="📈 DIRECCIONAL (UP/DOWN)"
@@ -362,7 +269,7 @@ export default function Comparativa() {
         />
       </div>
 
-      {/* ── PnL diario por estrategia ─────────────────────────────────── */}
+      {/* ── PnL diario por estrategia ────────────────────────────────────── */}
       <div style={{ ...S.section, marginTop: 16 }}>
         <div style={S.sectionTitle}>PnL DIARIO — ÚLTIMOS 14 DÍAS</div>
         <div style={{ ...S.body, ...S.grid2 }}>
@@ -380,78 +287,6 @@ export default function Comparativa() {
           </div>
         </div>
       </div>
-
-      {/* ── Tabla comparativa por estrategia ──────────────────────────── */}
-      {!loading && dirStats && arbStats && (
-        <div style={{ ...S.section, marginTop: 0 }}>
-          <div style={S.sectionTitle}>RESUMEN COMPARATIVO</div>
-          <div style={{ overflowX: "auto" }}>
-            <table style={S.table}>
-              <thead>
-                <tr>
-                  <th style={S.th}>MÉTRICA</th>
-                  <th style={{ ...S.th, color: C.dir }}>DIRECCIONAL</th>
-                  <th style={{ ...S.th, color: C.arb }}>ARBITRAJE</th>
-                  <th style={S.th}>VENTAJA</th>
-                </tr>
-              </thead>
-              <tbody>
-                {[
-                  {
-                    label: "Operaciones",
-                    dir: dirStats.total_ops,
-                    arb: arbStats.total_ops,
-                    fmt: v => v,
-                    higherIsBetter: true,
-                  },
-                  {
-                    label: "Tasa éxito",
-                    dir: parseFloat(dirStats.tasa_exito_pct || 0),
-                    arb: parseFloat(arbStats.tasa_exito_pct || 0),
-                    fmt: v => fmtPct(v),
-                    higherIsBetter: true,
-                  },
-                  {
-                    label: "PnL total",
-                    dir: parseFloat(dirStats.pnl_total_usd || 0),
-                    arb: parseFloat(arbStats.pnl_total_usd || 0),
-                    fmt: v => fmtUSD(v),
-                    higherIsBetter: true,
-                  },
-                  {
-                    label: "PnL / operación",
-                    dir: parseFloat(dirStats.pnl_medio_usd || 0),
-                    arb: parseFloat(arbStats.pnl_medio_usd || 0),
-                    fmt: v => fmtUSD(v),
-                    higherIsBetter: true,
-                  },
-                  {
-                    label: "ROI %",
-                    dir: parseFloat(dirStats.roi_pct || 0),
-                    arb: parseFloat(arbStats.roi_pct || 0),
-                    fmt: v => fmtPct(v),
-                    higherIsBetter: true,
-                  },
-                ].map(({ label, dir, arb, fmt, higherIsBetter }) => {
-                  let ventaja = "—";
-                  if (dir > arb) ventaja = <span style={{ color: C.dir }}>📈 DIR</span>;
-                  else if (arb > dir) ventaja = <span style={{ color: C.arb }}>⚖️ ARB</span>;
-                  else ventaja = <span style={{ color: "#555" }}>= igual</span>;
-
-                  return (
-                    <tr key={label}>
-                      <td style={{ ...S.td, fontSize: 9, color: "#555" }}>{label}</td>
-                      <td style={{ ...S.td, color: C.dir, fontWeight: 600 }}>{fmt(dir)}</td>
-                      <td style={{ ...S.td, color: C.arb, fontWeight: 600 }}>{fmt(arb)}</td>
-                      <td style={S.td}>{ventaja}</td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
-        </div>
-      )}
     </div>
   );
 }

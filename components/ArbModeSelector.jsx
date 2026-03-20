@@ -1,16 +1,9 @@
 /**
- * ArbModeSelector.jsx — Panel de control para la estrategia de arbitraje
+ * ArbModeSelector.jsx — v1.1
  *
- * Permite al usuario:
- *  - Activar/desactivar el bot ARB
- *  - Cambiar entre modo Simulado y Real (independiente del bot principal)
- *  - Configurar stake por pata
- *  - Ver estado actual del bot ARB
- *
- * Lee/escribe en Supabase bot_config:
- *   arb_enabled       "true" | "false"
- *   arb_simulate_mode "simulate" | "real"
- *   arb_stake_usdc    número como string
+ * v1.1 — MIGRACIÓN: eliminado createClient de @supabase/supabase-js.
+ *         Ahora usa /api/config (GET + POST) igual que ModeSelector.
+ *         Corrige error "supabaseUrl is required" en build de Vercel.
  *
  * v1.0 — Implementación inicial
  */
@@ -18,12 +11,6 @@
 "use client";
 
 import { useState, useEffect, useCallback } from "react";
-import { createClient } from "@supabase/supabase-js";
-
-const supabase = createClient(
-  process.env.NEXT_PUBLIC_SUPABASE_URL,
-  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY,
-);
 
 const S = {
   card: {
@@ -103,29 +90,46 @@ const DEFAULT_STATE = {
   arb_stake_usdc:    "5.0",
 };
 
+// ── Helper fetch /api/config ──────────────────────────────────────────────────
+
+async function getConfig(key) {
+  const res  = await fetch(`/api/config?key=${key}`, { cache: "no-store" });
+  const data = await res.json();
+  return data.value ?? null;
+}
+
+async function setConfig(key, value) {
+  await fetch("/api/config", {
+    method:  "POST",
+    headers: { "Content-Type": "application/json" },
+    body:    JSON.stringify({ key, value: String(value) }),
+  });
+}
+
+// ── Componente ────────────────────────────────────────────────────────────────
+
 export default function ArbModeSelector() {
-  const [state,       setState]     = useState(DEFAULT_STATE);
+  const [state,       setState]      = useState(DEFAULT_STATE);
   const [stakeInput,  setStakeInput] = useState("5.0");
-  const [loading,     setLoading]   = useState(true);
-  const [saving,      setSaving]    = useState(false);
+  const [loading,     setLoading]    = useState(true);
+  const [saving,      setSaving]     = useState(false);
   const [lastUpdated, setLastUpdated] = useState(null);
 
-  // ── Cargar config desde Supabase ─────────────────────────────────────────
+  // ── Cargar config ─────────────────────────────────────────────────────────
   const loadConfig = useCallback(async () => {
     try {
-      const { data, error } = await supabase
-        .from("bot_config")
-        .select("key, value")
-        .in("key", ["arb_enabled", "arb_simulate_mode", "arb_stake_usdc"]);
-
-      if (error) throw error;
-
-      const merged = { ...DEFAULT_STATE };
-      for (const row of (data || [])) {
-        merged[row.key] = row.value;
-      }
+      const [enabled, simMode, stake] = await Promise.all([
+        getConfig("arb_enabled"),
+        getConfig("arb_simulate_mode"),
+        getConfig("arb_stake_usdc"),
+      ]);
+      const merged = {
+        arb_enabled:       enabled  ?? DEFAULT_STATE.arb_enabled,
+        arb_simulate_mode: simMode  ?? DEFAULT_STATE.arb_simulate_mode,
+        arb_stake_usdc:    stake    ?? DEFAULT_STATE.arb_stake_usdc,
+      };
       setState(merged);
-      setStakeInput(merged.arb_stake_usdc || "5.0");
+      setStakeInput(merged.arb_stake_usdc);
       setLastUpdated(new Date().toISOString());
     } catch (e) {
       console.error("[ArbModeSelector] loadConfig:", e);
@@ -136,22 +140,15 @@ export default function ArbModeSelector() {
 
   useEffect(() => {
     loadConfig();
-    const interval = setInterval(loadConfig, 15000); // poll cada 15s
+    const interval = setInterval(loadConfig, 15_000);
     return () => clearInterval(interval);
   }, [loadConfig]);
 
-  // ── Escribir en Supabase ─────────────────────────────────────────────────
-  const upsertConfig = async (key, value) => {
-    await supabase
-      .from("bot_config")
-      .upsert({ key, value, updated_at: new Date().toISOString() }, { onConflict: "key" });
-  };
-
-  // ── Handlers ─────────────────────────────────────────────────────────────
+  // ── Handlers ──────────────────────────────────────────────────────────────
   const handleEnable = async (enabled) => {
     setSaving(true);
     try {
-      await upsertConfig("arb_enabled", enabled ? "true" : "false");
+      await setConfig("arb_enabled", enabled ? "true" : "false");
       setState(s => ({ ...s, arb_enabled: enabled ? "true" : "false" }));
     } finally {
       setSaving(false);
@@ -161,7 +158,7 @@ export default function ArbModeSelector() {
   const handleMode = async (mode) => {
     setSaving(true);
     try {
-      await upsertConfig("arb_simulate_mode", mode);
+      await setConfig("arb_simulate_mode", mode);
       setState(s => ({ ...s, arb_simulate_mode: mode }));
     } finally {
       setSaving(false);
@@ -173,7 +170,7 @@ export default function ArbModeSelector() {
     if (isNaN(val) || val <= 0) return;
     setSaving(true);
     try {
-      await upsertConfig("arb_stake_usdc", val.toFixed(2));
+      await setConfig("arb_stake_usdc", val.toFixed(2));
       setState(s => ({ ...s, arb_stake_usdc: val.toFixed(2) }));
     } finally {
       setSaving(false);
@@ -195,7 +192,7 @@ export default function ArbModeSelector() {
 
   return (
     <div style={S.card}>
-      {/* ── Título ──────────────────────────────────────────────────────── */}
+      {/* ── Título ─────────────────────────────────────────────────────────── */}
       <div style={S.title}>
         <span style={S.statusDot(isEnabled)} />
         ⚖️ ESTRATEGIA DE ARBITRAJE
@@ -206,7 +203,7 @@ export default function ArbModeSelector() {
         )}
       </div>
 
-      {/* ── Enable / Disable ─────────────────────────────────────────────── */}
+      {/* ── Enable / Disable ──────────────────────────────────────────────── */}
       <div style={{ marginBottom: 14 }}>
         <div style={{ ...S.label, marginBottom: 7 }}>ESTADO</div>
         <div style={S.row}>
@@ -230,7 +227,7 @@ export default function ArbModeSelector() {
 
       <div style={S.divider} />
 
-      {/* ── Modo Simulado / Real ─────────────────────────────────────────── */}
+      {/* ── Modo Simulado / Real ───────────────────────────────────────────── */}
       <div style={{ marginBottom: 14, opacity: isEnabled ? 1 : 0.4 }}>
         <div style={{ ...S.label, marginBottom: 7 }}>MODO ARB</div>
         <div style={S.row}>
@@ -258,7 +255,7 @@ export default function ArbModeSelector() {
 
       <div style={S.divider} />
 
-      {/* ── Stake por pata ──────────────────────────────────────────────── */}
+      {/* ── Stake por pata ────────────────────────────────────────────────── */}
       <div style={{ marginBottom: 6, opacity: isEnabled ? 1 : 0.4 }}>
         <div style={{ ...S.label, marginBottom: 7 }}>STAKE POR PATA (USDC)</div>
         <div style={S.row}>
@@ -280,7 +277,8 @@ export default function ArbModeSelector() {
           </button>
         </div>
         <div style={{ marginTop: 6, fontSize: 9, color: "#444" }}>
-          Invertido total por par: <b style={{ color: "#888" }}>
+          Invertido total por par:{" "}
+          <b style={{ color: "#888" }}>
             ${(parseFloat(stakeInput || "0") * 2).toFixed(2)} USDC
           </b>
         </div>
