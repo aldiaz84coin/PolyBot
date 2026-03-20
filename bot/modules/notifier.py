@@ -1,24 +1,19 @@
 """
 notifier.py — Notificaciones Telegram + Dashboard del bot PolyBot
 
+v5.6 — DEBUG _post_event
+  - Log WARNING al arrancar mostrando FRONTEND_URL y BOT_SECRET.
+  - _post_event: errores y respuestas no-OK suben a WARNING (antes DEBUG).
+
 v5.5 — NOTIFICACIONES DE CLAIM
-  - notify_claim_ok()       : 💰 Claim confirmado on-chain (TX hash + P&L)
-  - notify_claim_retrying() : 🔄 Reintentando claim (motivo + espera)
-  - notify_claim_failed()   : 🚨 Claim fallido definitivo + aviso manual
-  Llamadas exclusivamente desde claimer.py → claim_with_retry().
+  - notify_claim_ok(), notify_claim_retrying(), notify_claim_failed()
 
 v5.4 — notify_mode_change()
-  - Nueva función: notifica por Telegram cuando el bot detecta un cambio
-    de modo (SIMULADO ↔ REAL) vía polling de BD en _read_simulate_mode_from_db().
-
-v5.3 — FIX: notify_signal_eval restaurada a firma de 8 argumentos
-  - notify_signal_eval(cfg, price, target, dist, umbral, window, direction, mins_left)
-  - notify_win: añadido parámetro pnl_usd (kwarg opcional).
-
-v5.2 — _post_event(): replica cada mensaje al dashboard (/api/events)
-v5.1 — notify_new_hour muestra config completa de estrategia
-v5.0 — Resumen al final de cada hora con desglose de operaciones.
-v4.0 — notify_startup_summary, notify_order_failed.
+v5.3 — FIX notify_signal_eval firma 8 args + notify_win pnl_usd kwarg
+v5.2 — _post_event(): replica mensajes al dashboard (/api/events)
+v5.1 — notify_new_hour config completa
+v5.0 — Resumen horario con desglose de operaciones
+v4.0 — notify_startup_summary, notify_order_failed
 
 Destino: bot/modules/notifier.py
 """
@@ -36,6 +31,12 @@ logger = logging.getLogger(__name__)
 _FRONTEND_URL = os.getenv("FRONTEND_URL", "").rstrip("/")
 _BOT_SECRET   = os.getenv("BOT_SECRET", "")
 _EVENTS_PATH  = "/api/events"
+
+# Visible en Railway al arrancar — confirma que las vars están bien cargadas
+logger.warning(
+    f"[NOTIF] FRONTEND_URL = '{_FRONTEND_URL or '(vacío)'}' | "
+    f"BOT_SECRET = {'SET' if _BOT_SECRET else 'EMPTY'}"
+)
 
 
 # ── Helper: envío al dashboard (no-bloqueante) ────────────────────────────────
@@ -57,9 +58,13 @@ def _post_event(text: str) -> None:
         try:
             r = requests.post(url, json=payload, headers=headers, timeout=4)
             if not r.ok:
-                logger.debug(f"[NOTIF/EVENT] Dashboard respondió {r.status_code}")
+                logger.warning(
+                    f"[NOTIF/EVENT] ⚠ Dashboard respondió {r.status_code}: {r.text[:120]}"
+                )
+            else:
+                logger.debug("[NOTIF/EVENT] ✅ Evento enviado al dashboard")
         except Exception as e:
-            logger.debug(f"[NOTIF/EVENT] No se pudo enviar evento al dashboard: {e}")
+            logger.warning(f"[NOTIF/EVENT] ⚠ No se pudo enviar evento al dashboard: {e}")
 
     t = threading.Thread(target=_do_post, daemon=True)
     t.start()
@@ -71,10 +76,7 @@ _SEND_URL = "https://api.telegram.org/bot{token}/sendMessage"
 
 
 def _send(cfg: dict, text: str):
-    """
-    Envía a Telegram Y replica al dashboard (/api/events).
-    """
-    # ── Telegram ──────────────────────────────────────────────────────────
+    """Envía a Telegram Y replica al dashboard (/api/events)."""
     token   = cfg.get("telegram", {}).get("bot_token", "")
     chat_id = cfg.get("telegram", {}).get("chat_id", "")
 
@@ -102,7 +104,6 @@ def _send(cfg: dict, text: str):
         except Exception as e:
             logger.warning(f"[NOTIF] ⚠ Telegram error: {e}")
 
-    # ── Dashboard (siempre, independiente de Telegram) ────────────────────
     _post_event(text)
 
 
@@ -111,10 +112,8 @@ def _send(cfg: dict, text: str):
 def notify_start(cfg: dict):
     _send(cfg, "🤖 <b>Bot iniciado</b> — Polymarket BTC Hourly")
 
-
 def notify_stop(cfg: dict):
     _send(cfg, "⛔ <b>Bot detenido</b>")
-
 
 def notify_startup_summary(cfg: dict, hist_stats: dict):
     wins   = hist_stats.get("wins", 0)
@@ -134,11 +133,6 @@ def notify_startup_summary(cfg: dict, hist_stats: dict):
 # ── Cambio de modo ────────────────────────────────────────────────────────────
 
 def notify_mode_change(cfg: dict, old_mode: str, new_mode: str):
-    """
-    v5.4: Notifica por Telegram cuando el bot detecta un cambio de modo
-    (SIMULADO ↔ REAL) vía polling de BD en _read_simulate_mode_from_db().
-    old_mode / new_mode: "SIMULADO" o "REAL"
-    """
     icon_new = "🔵" if new_mode == "SIMULADO" else "🔴"
     icon_old = "🔴" if old_mode == "REAL"     else "🔵"
     _send(cfg, (
@@ -152,13 +146,9 @@ def notify_mode_change(cfg: dict, old_mode: str, new_mode: str):
 # ── Mercado ──────────────────────────────────────────────────────────────────
 
 def notify_market_found(cfg: dict, market: dict, mins_left: float):
-    """
-    v5.0: muestra YES/NO precios + conditionId además del slug.
-    """
     slug    = market.get("slug", "—")
     cond_id = market.get("condition_id", "—")
     tokens  = market.get("tokens", {})
-
     if isinstance(tokens, dict):
         yes_p = tokens.get("yes", {}).get("price")
         no_p  = tokens.get("no",  {}).get("price")
@@ -167,19 +157,15 @@ def notify_market_found(cfg: dict, market: dict, mins_left: float):
         no_p  = next((t.get("price") for t in tokens if t.get("outcome") == "No"),  None)
     else:
         yes_p = no_p = None
-
     yes_str = f"{yes_p:.4f}" if yes_p is not None else "—"
     no_str  = f"{no_p:.4f}"  if no_p  is not None else "—"
-
     _send(cfg, (
         f"🎯 <b>Nuevo mercado detectado</b>\n"
         f"Slug     : <code>{slug}</code>\n"
         f"Cierre   : <code>{mins_left:.1f} min</code>\n"
-        f"YES      : <code>{yes_str}</code>   "
-        f"NO: <code>{no_str}</code>\n"
+        f"YES      : <code>{yes_str}</code>   NO: <code>{no_str}</code>\n"
         f"CondID   : <code>{cond_id[:16]}…</code>"
     ))
-
 
 def notify_market_lost(cfg: dict):
     _send(cfg, "⚠️ <b>Mercado perdido</b> — esperando próximo mercado")
@@ -190,15 +176,13 @@ def notify_market_lost(cfg: dict):
 def notify_target_change(cfg: dict, old_target: float, new_target: float, mins_left: float = 0):
     delta = new_target - old_target
     sign  = "+" if delta >= 0 else ""
-    mm    = int(mins_left)
     _send(cfg, (
         f"🔄 <b>Target cambiado</b>\n"
         f"Anterior : <code>${old_target:,.2f}</code>\n"
         f"Nuevo    : <code>${new_target:,.2f}</code>\n"
         f"Δ        : <code>{sign}${delta:,.2f}</code>\n"
-        f"⏱ Quedan : <code>{mm} min</code>"
+        f"⏱ Quedan : <code>{int(mins_left)} min</code>"
     ))
-
 
 def notify_target_failed(cfg: dict, hour_utc):
     try:
@@ -213,9 +197,6 @@ def notify_target_failed(cfg: dict, hour_utc):
 def notify_signal_eval(cfg: dict, price: float, target: float,
                        dist: float, umbral: float, window: str,
                        direction: str, mins_left: float):
-    """
-    v5.3 FIX: restaurada firma de 8 argumentos.
-    """
     arrow  = "▲" if dist > 0 else "▼"
     action = (
         f"✅ <b>{direction}</b> — señal accionable"
@@ -258,10 +239,6 @@ def notify_bet(cfg: dict, bet: dict, signal, simulated: bool = False):
 # ── Orden fallida ─────────────────────────────────────────────────────────────
 
 def notify_order_failed(cfg: dict, signal):
-    """
-    Alerta cuando execute_order() devuelve None.
-    Evita que el bot reintente indefinidamente en la misma ventana.
-    """
     window    = getattr(signal, "window", "—")
     direction = getattr(signal, "direction", "—")
     _send(cfg, (
@@ -275,10 +252,6 @@ def notify_order_failed(cfg: dict, signal):
 
 def notify_win(cfg: dict, bet: dict, price: float,
                pnl_usd: float = None, simulated: bool = False):
-    """
-    v5.3: añadido parámetro pnl_usd para coincidir con la llamada de monitor.py:
-      notify_win(cfg, active_bet, price, pnl_usd=pnl_usd, simulated=sim_)
-    """
     sim     = simulated or bet.get("simulated", False)
     sim_tag = "  <i>[SIMULADO]</i>" if sim else ""
     odds_v  = bet.get("odds", 0.5)
@@ -292,7 +265,6 @@ def notify_win(cfg: dict, bet: dict, price: float,
         f"Venta      : <code>{tokens:.4f} tokens × 1.0000</code>\n"
         f"P&L        : <code>+${pnl:.2f} USDC</code>"
     ))
-
 
 def notify_loss(cfg: dict, bet: dict, price: float,
                 pnl_usd: float = None, simulated: bool = False):
@@ -309,7 +281,6 @@ def notify_loss(cfg: dict, bet: dict, price: float,
         f"P&L        : <code>-${stake:.2f} USDC</code>"
     ))
 
-
 def notify_stop_loss(cfg: dict, bet: dict, price: float, pnl_usd: float,
                      pnl_pct: float = None, exit_token_price: float = None,
                      stop_pct: float = None, simulated: bool = False):
@@ -320,7 +291,6 @@ def notify_stop_loss(cfg: dict, bet: dict, price: float, pnl_usd: float,
     odds_in   = bet.get("odds", 0)
     pnl_str   = f"${pnl_usd:+,.2f}" if pnl_usd is not None else "—"
     pct_str   = f" ({pnl_pct:+.1f}%)" if pnl_pct is not None else ""
-
     lines = [
         f"🛑 <b>STOP LOSS — {direction}</b>{sim_tag}",
         f"BTC entrada: <code>${entry_btc:,.2f}</code>",
@@ -332,16 +302,12 @@ def notify_stop_loss(cfg: dict, bet: dict, price: float, pnl_usd: float,
     if stop_pct is not None:
         lines.append(f"SL umbral  : <code>{stop_pct}%</code>")
     lines.append(f"P&L        : <code>{pnl_str} USDC{pct_str}</code>")
-
     _send(cfg, "\n".join(lines))
 
 
 # ── Claim on-chain ────────────────────────────────────────────────────────────
 
 def notify_claim_ok(cfg: dict, bet: dict, tx_hash: str, attempt: int, usdc_est: float):
-    """
-    v5.5: Claim confirmado on-chain. TX hash + USDC recuperado + intento.
-    """
     direction = bet.get("direction", "—")
     stake     = bet.get("stake", 0.0)
     pnl_est   = round(usdc_est - stake, 2)
@@ -355,21 +321,13 @@ def notify_claim_ok(cfg: dict, bet: dict, tx_hash: str, attempt: int, usdc_est: 
         f"🔗 <a href=\"https://polygonscan.com/tx/{tx_hash}\">Ver en Polygonscan</a>"
     ))
 
-
 def notify_claim_retrying(cfg: dict, bet: dict, attempt: int, max_attempts: int,
                           reason: str, wait_secs: int):
-    """
-    v5.5: Se envía ANTES de dormir, para que el usuario vea el motivo del retraso.
-    """
     direction = bet.get("direction", "—")
     mins      = wait_secs // 60
     secs_rem  = wait_secs % 60
-    if mins > 0 and secs_rem > 0:
-        wait_str = f"{mins}m {secs_rem}s"
-    elif mins > 0:
-        wait_str = f"{mins}m"
-    else:
-        wait_str = f"{wait_secs}s"
+    wait_str  = (f"{mins}m {secs_rem}s" if mins > 0 and secs_rem > 0
+                 else f"{mins}m" if mins > 0 else f"{wait_secs}s")
     short_err = (reason[:150] + "…") if reason and len(reason) > 150 else (reason or "—")
     _send(cfg, (
         f"🔄 <b>Reintentando claim [{attempt}/{max_attempts}]</b>\n"
@@ -378,12 +336,7 @@ def notify_claim_retrying(cfg: dict, bet: dict, attempt: int, max_attempts: int,
         f"Próximo    : en <code>{wait_str}</code>"
     ))
 
-
 def notify_claim_failed(cfg: dict, bet: dict, reason: str, attempts: int):
-    """
-    v5.5: Fallo definitivo tras agotar todos los intentos del RETRY_SCHEDULE.
-    Incluye aviso para reclamar manualmente en polymarket.com.
-    """
     direction = bet.get("direction", "—")
     stake     = bet.get("stake", 0.0)
     tokens    = bet.get("tokens", 0.0)
@@ -408,32 +361,21 @@ def notify_error(cfg: dict, msg: str):
 
 def notify_new_hour(cfg: dict, hour_utc, slug: str = None, target: float = None,
                     stop_pct=None, stake=None, umbrales: dict = None):
-    """
-    v5.1: Mensaje de inicio de nueva hora con config completa.
-    Parámetros nuevos (opcionales pero recomendados):
-      stop_pct  : % de stop loss (ej. 50.0)
-      stake     : USDC por operación
-      umbrales  : dict con claves t20, t15, t10, t5
-    """
     try:
         hour_utc = int(hour_utc)
     except (TypeError, ValueError):
         hour_utc = "?"
-
     target_str = f"${target:,.2f}" if target else "—"
-
     lines = [
         f"🕐 <b>Nueva hora: {hour_utc:02d}:00 UTC</b>",
         f"Mercado  : <code>{slug or '—'}</code>",
         f"Target   : <code>{target_str}</code>",
     ]
-
     if stop_pct is not None or stake is not None:
         sl_str    = f"SL={stop_pct}%" if stop_pct is not None else ""
         stake_str = f"Stake=${stake} USDC" if stake is not None else ""
         sep       = "   " if sl_str and stake_str else ""
         lines.append(f"Estrategia: <code>{sl_str}{sep}{stake_str}</code>")
-
     if umbrales:
         t20 = umbrales.get("t20", "—")
         t15 = umbrales.get("t15", "—")
@@ -442,7 +384,6 @@ def notify_new_hour(cfg: dict, hour_utc, slug: str = None, target: float = None,
         lines.append(
             f"Umbrales  : <code>T20=${t20}  T15=${t15}  T10=${t10}  T5=${t5}</code>"
         )
-
     _send(cfg, "\n".join(lines))
 
 
@@ -452,20 +393,14 @@ def notify_hour_summary(cfg: dict, hour_utc, hour_wins: int, hour_losses: int,
                         ops_hoy: int, target: float,
                         hour_ops: list | None = None,
                         hist_stats: dict | None = None):
-    """
-    v5.0: Resumen al final de cada hora.
-    SIEMPRE se envía (la condición de filtrado está en monitor.py).
-    """
     try:
         hour_utc = int(hour_utc)
     except (TypeError, ValueError):
         hour_utc = "?"
-
     total_hora = hour_wins + hour_losses
     wr_hora    = int(hour_wins / total_hora * 100) if total_hora > 0 else 0
     pnl_hora   = sum(op.get("pnl_usd", 0) for op in (hour_ops or []))
     sign_h     = "+" if pnl_hora >= 0 else ""
-
     lines = [
         f"📋 <b>Resumen hora {hour_utc:02d}:00 UTC</b>",
         f"Ops    : <code>{ops_hoy}</code>   "
@@ -473,7 +408,6 @@ def notify_hour_summary(cfg: dict, hour_utc, hour_wins: int, hour_losses: int,
         f"P&L hora : <code>{sign_h}${pnl_hora:,.2f} USDC</code>",
         f"Target   : <code>${target:,.2f}</code>",
     ]
-
     if hour_ops:
         lines.append("")
         lines.append("━━━ Operaciones ━━━")
@@ -486,12 +420,10 @@ def notify_hour_summary(cfg: dict, hour_utc, hour_wins: int, hour_losses: int,
             result     = op.get("result", "—")
             pnl        = op.get("pnl_usd", 0)
             simulated  = op.get("simulated", False)
-
             arrow   = "🟢" if direction == "UP" else "🔴"
             res_ico = {"WIN": "✅", "LOSS": "❌", "STOP": "🛑"}.get(result, "❓")
             pnl_s   = f"+${pnl:,.2f}" if pnl >= 0 else f"-${abs(pnl):,.2f}"
             sim_tag = " <i>[SIM]</i>" if simulated else ""
-
             lines.append(
                 f"{i}. {arrow} {direction} [{window}]{sim_tag}\n"
                 f"   Compra: <code>{entry_odds:.4f}</code>  "
@@ -499,7 +431,6 @@ def notify_hour_summary(cfg: dict, hour_utc, hour_wins: int, hour_losses: int,
                 f"Tokens: <code>{tokens:.4f}</code>\n"
                 f"   {res_ico} {result}  P&L: <code>{pnl_s}</code>"
             )
-
     if hist_stats:
         h_wins  = hist_stats.get("wins", 0)
         h_loss  = hist_stats.get("losses", 0) + hist_stats.get("stops", 0)
@@ -514,5 +445,4 @@ def notify_hour_summary(cfg: dict, hour_utc, hour_wins: int, hour_losses: int,
             f"W/L: <code>{h_wins}W/{h_loss}L  WR={h_wr}%</code>\n"
             f"P&L: <code>{h_sign}${h_pnl:,.2f} USDC</code>"
         )
-
     _send(cfg, "\n".join(lines))
