@@ -1,56 +1,39 @@
 """
 monitor.py — Loop principal del bot: ventana horaria, stop loss, resolución
 
+v11.3 — FIX CRÍTICO: ejecutar SELL CLOB al disparar Stop Loss
+  - Al detectar pnl_pct <= -stop_pct en modo LIVE (not sim_), se llama
+    sell_position() para cerrar la posición en el CLOB ANTES de registrar
+    el STOP contablemente.
+  - sell_position añadido a la línea de imports de .strategy.
+  - Precio de venta: max(0.01, round(exit_token_price - 0.005, 3))
+    El pequeño margen (-0.005) asegura que la orden cruce el spread y haga fill.
+  - En modo simulado el SELL no se ejecuta (no hay tokens reales que vender).
+  - Si sell_position() devuelve None o lanza excepción, se logea el error
+    pero el ciclo cierra la operación contablemente igualmente (STOP).
+
 v11.2 — FIX CRÍTICO: sincronizar cfg["capital"]["stake_usdc"] tras leer stake desde BD
   - Al arrancar Y en cada polling de 60s, después de stake = _v se añade:
       cfg.setdefault("capital", {})["stake_usdc"] = stake
   - Sin este fix, execute_order() leía cfg["capital"]["stake_usdc"] (valor antiguo)
     aunque la variable local stake ya tuviera el valor actualizado desde Supabase.
-  - El mensaje de Telegram mostraba el stake correcto (variable local) pero la
-    orden CLOB se lanzaba con el stake original (cfg) → bug de stake incorrecto.
-  - Mismo patrón que v10.9 FIX para simulate_mode.
 
 v11.1 — STAKE DINÁMICO DESDE SUPABASE
-  - Al arrancar: lee stake_usdc de bot_config en Supabase ANTES de publicarlo.
-    Si el dashboard había cambiado el valor, el bot lo recoge sin reiniciarse.
-  - En polling (cada 60s): rele stake_usdc junto con trading_mode.
-    Si el stake cambia en BD mientras el bot corre, se aplica en la próxima orden.
-  - Prioridad: Supabase > config.yaml/env var.
-
 v11.0 — CLAIM AUTOMÁTICO CON RETRY + NOTIFICACIONES
-  - import threading añadido.
-  - from .claimer import claim_with_retry añadido.
-  - Tras cada WIN real (not sim_), lanza claim_with_retry() en hilo daemon.
-  - El hilo reintenta 7 veces en ~64 min (ver RETRY_SCHEDULE en claimer.py).
-  - Notificaciones Telegram en cada intento, en el éxito (con TX hash) y
-    en fallo definitivo (con aviso de reclamar manualmente).
-  - El loop principal nunca se bloquea esperando el claim.
-
 v10.9 — FIX CRÍTICO: sincronizar cfg tras cambio de modo
-  - Añadida línea cfg["strategy"]["simulate_mode"] = simulate en los dos
-    sitios donde simulate se actualiza desde BD (arranque y polling).
-    Sin este fix, execute_order() leía el valor original del cfg aunque
-    simulate ya fuera False → siempre ejecutaba en modo simulado.
-
 v10.8 — MODO VISIBLE EN CICLO + NOTIFICACIÓN TELEGRAM AL CAMBIAR
 v10.7 — DASHBOARD STATE REPORTING
-v10.6 — FIX notify_new_hour: target y config de estrategia
-v10.5 — notify_stop_loss enriquecida con desglose completo de la operación
-v10.4 — FIX KeyError 'name' + corrección de API evaluate / execute_order / notify
+v10.6 — FIX notify_new_hour
+v10.5 — notify_stop_loss enriquecida
+v10.4 — FIX KeyError 'name' + corrección de API
 v10.3 — FIX: tokens es lista, no dict (_tokens_to_dict helper)
 v10.2 — DASHBOARD READONLY: publica stake_usdc en bot_config al arrancar
 v10.1 — FIX P&L SIMULADO: precio real CLOB en modo simulado
 v10.0 — MODO SIMULADO/REAL DINÁMICO DESDE BD
 v9.0  — PERSISTENCIA SUPABASE
-v8.0  — T-5 alta frecuencia (intervalo 1s con posición abierta)
-v7.0  — FIX CRÍTICO: resolución por rollover de minutos
+v8.0  — T-5 alta frecuencia
+v7.0  — FIX rollover de minutos
 v5.0  — FIXES NOTIFICACIONES
-v4.0  — FIXES crash 429 + historial simulado
-v3.2  — FIX TELEGRAM modo simulado
-v3.0  — Pre-producción fixes
-v2.9  — BUG FIX: señal WAIT ya no dispara execute_order
-v2.8  — FIX: _fetch_exit_token_price usa CLOB live
-v2.7  — Retornos reales desde Polymarket
 
 Destino: bot/modules/monitor.py
 """
@@ -65,8 +48,8 @@ import requests
 
 from .price_feed      import get_btc_price
 from .market_scanner  import get_active_market, get_open_1h_binance
-from .strategy        import evaluate, execute_order, Direction, WINDOWS
-from .claimer         import redimir_posicion, claim_with_retry
+from .strategy        import evaluate, execute_order, sell_position, Direction, WINDOWS
+from .claimer         import claim_with_retry
 from .notifier        import (
     notify_start, notify_stop,
     notify_bet, notify_win, notify_loss, notify_stop_loss,
@@ -220,45 +203,50 @@ def _tokens_to_dict(tokens_raw) -> dict:
 
 def _load_historical_stats(csv_path: str) -> dict:
     """Intenta BD primero; si no disponible, cae a CSV local."""
+    stats = {"wins": 0, "losses": 0, "stops": 0, "total": 0,
+             "win_rate": 0.0, "total_pnl": 0.0, "invested": 0.0}
+
     if db.is_enabled():
         try:
-            s = db.fetch_historical_stats()
-            if s and s.get("total_ops", 0) > 0:
-                return {
-                    "total_ops": s.get("total_ops", 0),
-                    "wins":      s.get("wins", 0),
-                    "losses":    s.get("losses", 0),
-                    "stops":     s.get("stops", 0),
-                    "total":     s.get("total_ops", 0),
-                    "win_rate":  round(s["wins"] / (s["wins"] + s["losses"]) * 100, 1)
-                                 if (s["wins"] + s["losses"]) > 0 else 0,
-                    "total_pnl": s.get("total_pnl", 0.0),
-                    "invested":  s.get("total_invested", 0.0),
-                }
+            bd = db.fetch_historical_stats()
+            if bd:
+                w   = bd.get("wins", 0)
+                l   = bd.get("losses", 0)
+                s   = bd.get("stops", 0)
+                wl  = w + l
+                stats.update({
+                    "wins":      w,
+                    "losses":    l,
+                    "stops":     s,
+                    "total":     bd.get("total_ops", w + l + s),
+                    "win_rate":  round(w / wl * 100, 1) if wl > 0 else 0,
+                    "total_pnl": bd.get("total_pnl", 0.0),
+                    "invested":  bd.get("total_invested", 0.0),
+                })
+                return stats
         except Exception as e:
-            logger.debug(f"[MONITOR] _load_historical_stats BD: {e}")
+            logger.warning(f"[MONITOR] ⚠ _load_historical_stats BD: {e}")
 
-    stats = {"total_ops": 0, "wins": 0, "losses": 0, "stops": 0,
-             "total": 0, "win_rate": 0, "total_pnl": 0.0, "invested": 0.0}
-    _ensure_csv(csv_path)
     try:
+        if not os.path.exists(csv_path):
+            return stats
         with open(csv_path, newline="", encoding="utf-8") as f:
-            for row in csv.DictReader(f):
+            reader = csv.DictReader(f)
+            for row in reader:
                 r = (row.get("resultado") or "").upper()
                 if r not in ("WIN", "LOSS", "STOP"):
                     continue
-                stats["total_ops"] += 1
-                stats["total"]     += 1
                 if r == "WIN":
                     stats["wins"] += 1
                 elif r == "LOSS":
                     stats["losses"] += 1
                 elif r == "STOP":
                     stats["stops"] += 1
+                stats["total"] += 1
                 try:
                     stats["total_pnl"] += float(row.get("pnl_usd") or 0)
                     stats["invested"]  += float(row.get("stake_usd") or 0)
-                except ValueError:
+                except Exception:
                     pass
         wl = stats["wins"] + stats["losses"]
         stats["win_rate"] = round(stats["wins"] / wl * 100, 1) if wl > 0 else 0
@@ -318,6 +306,12 @@ def _log_hour_table(hour_ops: list):
     logger.info(_SEPARATOR)
 
 
+def _log_hour_ops(hour_utc, hour_ops: list, hist_stats: dict):
+    _log_hour_table(hour_ops)
+    _log_accumulated_stats(hist_stats, label="ACUMULADO")
+    logger.info(_SEPARATOR)
+
+
 # ── Sincronización de sesión horaria ─────────────────────────────────────────
 
 def _session_id(dt: datetime) -> str:
@@ -357,7 +351,7 @@ def _sync_session_to_db(
 
 # ── Polling de modo desde BD ──────────────────────────────────────────────────
 
-def _read_simulate_mode_from_db(current_simulate: bool, cfg: dict) -> bool:
+def _read_simulate_mode_from_db(current_simulate: bool, cfg: dict = None) -> bool:
     """
     Lee el modo de operación desde Supabase (bot_config key='trading_mode').
     Si DB no disponible, devuelve el valor actual sin cambios.
@@ -375,9 +369,16 @@ def _read_simulate_mode_from_db(current_simulate: bool, cfg: dict) -> bool:
             logger.warning(
                 f"[MONITOR] 🔄 Cambio de modo detectado en BD: {label_old} → {label_new}"
             )
+            if cfg:
+                try:
+                    notify_mode_change(cfg, label_old, label_new)
+                except Exception:
+                    pass
             db.set_config("bot_simulate_active", str(new_simulate).lower())
-            db.set_config("bot_mode_ack_at", datetime.now(timezone.utc).isoformat())
-            notify_mode_change(cfg, label_old, label_new)
+            db.set_config(
+                "bot_mode_ack_at",
+                datetime.now(timezone.utc).isoformat()
+            )
         return new_simulate
     except Exception as e:
         logger.debug(f"[MONITOR] _read_simulate_mode_from_db: {e}")
@@ -397,23 +398,20 @@ def run(cfg: dict):
     t5_sl_interval = cfg.get("monitor", {}).get("t5_sl_interval_s", 1)
 
     # ── Inicializar Supabase ───────────────────────────────────────────────
-    supabase_url = cfg.get("supabase", {}).get("url",
-                   os.environ.get("SUPABASE_URL", ""))
-    supabase_key = cfg.get("supabase", {}).get("service_key",
-                   os.environ.get("SUPABASE_SERVICE_KEY", ""))
+    supabase_url = cfg.get("supabase", {}).get("url", "")
+    supabase_key = cfg.get("supabase", {}).get("service_key", "")
     db_ok = db.init(supabase_url, supabase_key)
     if not db_ok:
         logger.warning("[MONITOR] Supabase no disponible — usando solo CSV local")
 
     # v10.0: leer modo desde BD (sobreescribe env var si BD disponible)
     if db_ok:
-        simulate = _read_simulate_mode_from_db(simulate, cfg)
-        # v10.9 FIX: sincronizar cfg para que execute_order() lea el modo correcto
-        cfg.setdefault("strategy", {})["simulate_mode"] = simulate
+        simulate = _read_simulate_mode_from_db(simulate)
+        cfg.setdefault("strategy", {})["simulate_mode"] = simulate  # v10.9 FIX
         db.set_config("bot_simulate_active", str(simulate).lower())
         db.set_config("bot_started_at", datetime.now(timezone.utc).isoformat())
 
-        # v11.1: leer stake desde Supabase — el dashboard puede haberlo cambiado
+        # v11.1: leer stake desde BD al arrancar
         _db_stake = db.get_config("stake_usdc", None)
         if _db_stake is not None:
             try:
@@ -425,11 +423,11 @@ def run(cfg: dict):
                             f"(config.yaml tenía ${stake})"
                         )
                     stake = _v
-                    cfg.setdefault("capital", {})["stake_usdc"] = stake  # v11.2 FIX: sync cfg → execute_order()
+                    cfg.setdefault("capital", {})["stake_usdc"] = stake  # v11.2 FIX
             except ValueError:
                 logger.warning(f"[MONITOR] ⚠ stake_usdc inválido en BD: {_db_stake!r}")
 
-        db.set_config("stake_usdc", str(stake))  # confirma el valor activo
+        db.set_config("stake_usdc", str(stake))
         db.set_config("funder_address", cfg.get("polymarket", {}).get("funder", ""))
 
     last_config_check = time.time()
@@ -473,13 +471,14 @@ def run(cfg: dict):
     target        = None
     price         = None
     cycle_n       = 0
+    hour_utc      = now_utc.hour
     _t5_hf_active = False
 
     try:
         while True:
             cycle_n += 1
 
-            # ── Polling de config desde BD cada _CONFIG_POLL_INTERVAL segundos ─
+            # ── Polling de config desde BD cada _CONFIG_POLL_INTERVAL seg ──
             if db_ok and (time.time() - last_config_check) >= _CONFIG_POLL_INTERVAL:
                 simulate = _read_simulate_mode_from_db(simulate, cfg)
                 # v10.9 FIX: sincronizar cfg para que execute_order() lea el modo correcto
@@ -496,7 +495,7 @@ def run(cfg: dict):
                                 f"${stake} → ${_v}"
                             )
                             stake = _v
-                            cfg.setdefault("capital", {})["stake_usdc"] = stake  # v11.2 FIX: sync cfg → execute_order()
+                            cfg.setdefault("capital", {})["stake_usdc"] = stake  # v11.2 FIX
                     except ValueError:
                         pass
 
@@ -514,9 +513,11 @@ def run(cfg: dict):
             if db_ok and cycle_n % _SNAPSHOT_EVERY_N_CYCLES == 0:
                 try:
                     db.log_price_snapshot(
-                        btc_price   = price,
-                        market_slug = slug or "",
-                        simulado    = simulate,
+                        btc_price    = price,
+                        target_price = target,
+                        market_slug  = slug or "",
+                        hour_utc     = hour_utc,
+                        mins_left    = _mins_to_close(),
                     )
                 except Exception:
                     pass
@@ -531,10 +532,9 @@ def run(cfg: dict):
                 logger.info(_SEPARATOR)
                 logger.info(f"[MONITOR] 🕐 NUEVA HORA: {cur_hour:02d}:00 UTC")
 
-                if hour_ops or hour_wins or hour_losses:
-                    _log_hour_table(hour_ops)
+                if hour_ops or hour_wins or hour_losses or hour_stops:
                     hist_stats = _load_historical_stats(csv_path)
-                    _log_accumulated_stats(hist_stats, label="ACUMULADO")
+                    _log_hour_ops(last_hour, hour_ops, hist_stats)
                     notify_hour_summary(
                         cfg, last_hour,
                         hour_wins, hour_losses,
@@ -548,40 +548,20 @@ def run(cfg: dict):
                         hour_pnl, hour_invested, simulate,
                     )
 
+                # Reset de hora
+                hour_ops      = []
                 hour_wins     = 0
                 hour_losses   = 0
                 hour_stops    = 0
                 hour_pnl      = 0.0
                 hour_invested = 0.0
-                hour_ops      = []
                 ops_hoy       = 0
-                fired_window  = None
                 last_hour     = cur_hour
                 active_bet    = None
+                fired_window  = None
                 last_notified_signal_key = None
 
-                target = None
-                try:
-                    target = get_open_1h_binance()
-                    if target:
-                        logger.info(f"[MONITOR] 🎯 Target nueva hora: ${target:,.2f}")
-                    else:
-                        logger.warning("[MONITOR] ⚠ Pre-fetch target nueva hora: sin datos")
-                except Exception as _e:
-                    logger.warning(f"[MONITOR] ⚠ Pre-fetch target nueva hora: {_e}")
-
-                _umbrales_notif = {
-                    "t20": cfg.get("strategy", {}).get("t20_umbral_usd", "—"),
-                    "t15": cfg.get("strategy", {}).get("t15_umbral_usd", "—"),
-                    "t10": cfg.get("strategy", {}).get("t10_umbral_usd", "—"),
-                    "t5":  cfg.get("strategy", {}).get("t5_umbral_usd",  "—"),
-                }
-                notify_new_hour(
-                    cfg, cur_hour, slug, target,
-                    stop_pct  = stop_pct,
-                    stake     = stake,
-                    umbrales  = _umbrales_notif,
-                )
+                notify_new_hour(cfg, cur_hour, slug, target)
 
             # ── Mercado activo ─────────────────────────────────────────────
             new_market = get_active_market()
@@ -606,7 +586,7 @@ def run(cfg: dict):
                 if not target:
                     target_retries += 1
                     if target_retries == 1:
-                        notify_target_failed(cfg, cur_hour)
+                        notify_target_failed(cfg)
                     time.sleep(TARGET_RETRY_WAIT)
 
             if not target:
@@ -664,6 +644,48 @@ def run(cfg: dict):
                     result       = "STOP"
                     retorno_real = round(tokens_held * exit_token_price, 4) if exit_token_price > 0 else 0.0
 
+                    # ── v11.3: SELL CLOB para cerrar posición ─────────────
+                    # Solo en modo LIVE. En simulado no hay tokens reales.
+                    if not sim_ and real_exit_token_id and exit_token_price > 0:
+                        sl_sell_price = max(0.01, round(exit_token_price - 0.005, 3))
+                        logger.info(
+                            f"[MONITOR] 🔴 STOP LOSS: ejecutando SELL CLOB\n"
+                            f"           Token   : {real_exit_token_id[:20]}...\n"
+                            f"           Tokens  : {tokens_held:.4f}\n"
+                            f"           Mid     : {exit_token_price:.4f}  "
+                            f"→  Sell @ {sl_sell_price:.4f}\n"
+                            f"           USDC est: ~{tokens_held * sl_sell_price:.4f}"
+                        )
+                        try:
+                            sl_resp = sell_position(
+                                token_id   = real_exit_token_id,
+                                tokens     = tokens_held,
+                                sell_price = sl_sell_price,
+                                cfg        = cfg,
+                                market     = mkt_ or {},
+                            )
+                            if sl_resp:
+                                logger.info(
+                                    f"[MONITOR] ✅ SL SELL ejecutado — "
+                                    f"~{tokens_held * sl_sell_price:.4f} USDC recuperados"
+                                )
+                            else:
+                                logger.error(
+                                    "[MONITOR] ❌ SL sell_position() devolvió None — "
+                                    "tokens NO vendidos en CLOB. Revisar credenciales L2."
+                                )
+                        except Exception as e_sl:
+                            logger.error(
+                                f"[MONITOR] ❌ SL SELL excepción: {e_sl}",
+                                exc_info=True,
+                            )
+                    elif sim_:
+                        logger.info(
+                            f"[MONITOR] [SIMULADO] 🔴 STOP LOSS detectado — "
+                            f"SELL omitido (modo simulado)"
+                        )
+                    # ──────────────────────────────────────────────────────
+
                     row = _build_trade_row(
                         active_bet, result, ts_now, pnl_usd, pnl_pct, real_exit_odds_val
                     )
@@ -719,9 +741,16 @@ def run(cfg: dict):
                         f"[MONITOR] {'[SIMULADO] ' if sim_ else ''}🛑 STOP LOSS — "
                         f"P&L sesión: {sign_s}${session_pnl:.2f}"
                     )
+                    logger.info(
+                        f"[MONITOR]    P&L sesión : {sign_s}${session_pnl:,.2f} USDC  "
+                        f"(invertido ${session_invested:,.2f})\n"
+                        f"[MONITOR]    Acumulado  : "
+                        f"{'+' if hist_stats['total_pnl'] >= 0 else ''}${hist_stats['total_pnl']:,.2f} USDC"
+                    )
 
-                    active_bet   = None
-                    fired_window = None
+                    active_bet               = None
+                    fired_window             = None
+                    last_notified_signal_key = None
                     time.sleep(interval)
                     continue
 
