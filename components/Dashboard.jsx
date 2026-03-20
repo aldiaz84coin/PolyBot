@@ -1,3 +1,5 @@
+"use client";
+
 /**
  * Dashboard.jsx — v12.0
  *
@@ -11,6 +13,9 @@
  * (v4.1 — eventos acumulativos)
  * (v4.0 — simplificación MarketInfo, log de eventos)
  */
+
+
+
 
 import { useState, useEffect, useCallback } from "react";
 import {
