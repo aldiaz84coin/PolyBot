@@ -1,6 +1,13 @@
 """
 monitor.py — Loop principal del bot: ventana horaria, stop loss, resolución
 
+v11.1 — STAKE DINÁMICO DESDE SUPABASE
+  - Al arrancar: lee stake_usdc de bot_config en Supabase ANTES de publicarlo.
+    Si el dashboard había cambiado el valor, el bot lo recoge sin reiniciarse.
+  - En polling (cada 60s): rele stake_usdc junto con trading_mode.
+    Si el stake cambia en BD mientras el bot corre, se aplica en la próxima orden.
+  - Prioridad: Supabase > config.yaml/env var.
+
 v11.0 — CLAIM AUTOMÁTICO CON RETRY + NOTIFICACIONES
   - import threading añadido.
   - from .claimer import claim_with_retry añadido.
@@ -63,8 +70,8 @@ from .notifier        import (
     notify_order_failed,
     notify_mode_change,
 )
-from .command_handler  import process_pending_commands
-from .state_reporter   import report_state, report_offline
+from .command_handler import process_pending_commands
+from .state_reporter  import report_state, report_offline
 from . import db
 
 logger = logging.getLogger(__name__)
@@ -76,7 +83,7 @@ MAX_TARGET_RETRIES       = 5
 TARGET_RETRY_WAIT        = 10
 _CLOB_MIDPOINT           = "https://clob.polymarket.com/midpoint"
 _SNAPSHOT_EVERY_N_CYCLES = 10
-_CONFIG_POLL_INTERVAL    = 60
+_CONFIG_POLL_INTERVAL    = 60  # segundos entre lecturas de bot_config
 
 
 # ── Helpers de tiempo ─────────────────────────────────────────────────────────
@@ -396,7 +403,23 @@ def run(cfg: dict):
         cfg.setdefault("strategy", {})["simulate_mode"] = simulate
         db.set_config("bot_simulate_active", str(simulate).lower())
         db.set_config("bot_started_at", datetime.now(timezone.utc).isoformat())
-        db.set_config("stake_usdc", str(stake))
+
+        # v11.1: leer stake desde Supabase — el dashboard puede haberlo cambiado
+        _db_stake = db.get_config("stake_usdc", None)
+        if _db_stake is not None:
+            try:
+                _v = float(_db_stake)
+                if _v > 0:
+                    if _v != stake:
+                        logger.info(
+                            f"[MONITOR] 💰 Stake desde Supabase: ${_v} "
+                            f"(config.yaml tenía ${stake})"
+                        )
+                    stake = _v
+            except ValueError:
+                logger.warning(f"[MONITOR] ⚠ stake_usdc inválido en BD: {_db_stake!r}")
+
+        db.set_config("stake_usdc", str(stake))  # confirma el valor activo
         db.set_config("funder_address", cfg.get("polymarket", {}).get("funder", ""))
 
     last_config_check = time.time()
@@ -446,11 +469,26 @@ def run(cfg: dict):
         while True:
             cycle_n += 1
 
-            # ── Modo: polling desde BD cada _CONFIG_POLL_INTERVAL segundos ─
+            # ── Polling de config desde BD cada _CONFIG_POLL_INTERVAL segundos ─
             if db_ok and (time.time() - last_config_check) >= _CONFIG_POLL_INTERVAL:
                 simulate = _read_simulate_mode_from_db(simulate, cfg)
                 # v10.9 FIX: sincronizar cfg para que execute_order() lea el modo correcto
                 cfg.setdefault("strategy", {})["simulate_mode"] = simulate
+
+                # v11.1: releer stake desde BD por si el dashboard lo cambió
+                _db_stake = db.get_config("stake_usdc", None)
+                if _db_stake is not None:
+                    try:
+                        _v = float(_db_stake)
+                        if _v > 0 and _v != stake:
+                            logger.info(
+                                f"[MONITOR] 💰 Stake actualizado desde BD: "
+                                f"${stake} → ${_v}"
+                            )
+                            stake = _v
+                    except ValueError:
+                        pass
+
                 last_config_check = time.time()
                 process_pending_commands(cfg)
 
@@ -751,15 +789,15 @@ def run(cfg: dict):
 
                 # ── v11.0: WIN → lanzar claim en hilo background ──────────
                 if result == "WIN":
-                    session_wins  += 1
-                    hour_wins     += 1
+                    session_wins += 1
+                    hour_wins    += 1
                     notify_win(cfg, active_bet, price, pnl_usd, simulated=sim_)
                     if not sim_:
                         threading.Thread(
-                            target=claim_with_retry,
-                            args=(active_bet, cfg),
-                            daemon=True,
-                            name=f"claim-{active_bet.get('id', 'x')[:8]}",
+                            target = claim_with_retry,
+                            args   = (active_bet, cfg),
+                            daemon = True,
+                            name   = f"claim-{active_bet.get('id', 'x')[:8]}",
                         ).start()
                         logger.info(
                             "[MONITOR] 🧵 Hilo de claim lanzado en background "
