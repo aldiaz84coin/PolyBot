@@ -1,6 +1,15 @@
 """
 monitor.py — Loop principal del bot: ventana horaria, stop loss, resolución
 
+v11.2 — FIX CRÍTICO: sincronizar cfg["capital"]["stake_usdc"] tras leer stake desde BD
+  - Al arrancar Y en cada polling de 60s, después de stake = _v se añade:
+      cfg.setdefault("capital", {})["stake_usdc"] = stake
+  - Sin este fix, execute_order() leía cfg["capital"]["stake_usdc"] (valor antiguo)
+    aunque la variable local stake ya tuviera el valor actualizado desde Supabase.
+  - El mensaje de Telegram mostraba el stake correcto (variable local) pero la
+    orden CLOB se lanzaba con el stake original (cfg) → bug de stake incorrecto.
+  - Mismo patrón que v10.9 FIX para simulate_mode.
+
 v11.1 — STAKE DINÁMICO DESDE SUPABASE
   - Al arrancar: lee stake_usdc de bot_config en Supabase ANTES de publicarlo.
     Si el dashboard había cambiado el valor, el bot lo recoge sin reiniciarse.
@@ -416,6 +425,7 @@ def run(cfg: dict):
                             f"(config.yaml tenía ${stake})"
                         )
                     stake = _v
+                    cfg.setdefault("capital", {})["stake_usdc"] = stake  # v11.2 FIX: sync cfg → execute_order()
             except ValueError:
                 logger.warning(f"[MONITOR] ⚠ stake_usdc inválido en BD: {_db_stake!r}")
 
@@ -486,6 +496,7 @@ def run(cfg: dict):
                                 f"${stake} → ${_v}"
                             )
                             stake = _v
+                            cfg.setdefault("capital", {})["stake_usdc"] = stake  # v11.2 FIX: sync cfg → execute_order()
                     except ValueError:
                         pass
 
@@ -743,11 +754,37 @@ def run(cfg: dict):
                     )
                     exit_odds = 0.98 if won else 0.02
 
-                result       = "WIN" if won else "LOSS"
                 retorno_real = round(tokens_held * exit_odds, 4)
                 pnl_usd      = retorno_real - stake_
                 pnl_pct      = (pnl_usd / stake_) * 100 if stake_ > 0 else 0
+                result       = "WIN" if won else "LOSS"
                 ts_now       = datetime.now(timezone.utc).isoformat()
+
+                if won:
+                    hour_wins      += 1
+                    session_wins   += 1
+                    notify_win(cfg, active_bet, price, simulated=sim_)
+                    logger.info(
+                        f"[MONITOR] {'[SIMULADO] ' if sim_ else ''}✅ WIN — "
+                        f"Tokens: {tokens_held:.4f} × {exit_odds:.4f} = ${retorno_real:.2f}  "
+                        f"P&L: ${pnl_usd:.2f} ({pnl_pct:.1f}%)"
+                    )
+                    if not sim_:
+                        threading.Thread(
+                            target=claim_with_retry,
+                            args=(active_bet, cfg),
+                            daemon=True,
+                            name=f"claim-{active_bet.get('id', 'x')}",
+                        ).start()
+                else:
+                    hour_losses    += 1
+                    session_losses += 1
+                    notify_loss(cfg, active_bet, price, simulated=sim_)
+                    logger.info(
+                        f"[MONITOR] {'[SIMULADO] ' if sim_ else ''}❌ LOSS — "
+                        f"Tokens: {tokens_held:.4f} × {exit_odds:.4f} = ${retorno_real:.2f}  "
+                        f"P&L: ${pnl_usd:.2f} ({pnl_pct:.1f}%)"
+                    )
 
                 row = _build_trade_row(
                     active_bet, result, ts_now, pnl_usd, pnl_pct, real_exit_odds_val
@@ -766,13 +803,13 @@ def run(cfg: dict):
                         ts_cierre        = ts_now,
                     )
                 except Exception as e:
-                    logger.warning(f"[MONITOR] ⚠ close_operation fin-hora: {e}")
+                    logger.warning(f"[MONITOR] ⚠ close_operation: {e}")
 
                 hour_ops.append({
                     "direction":  active_bet["direction"],
                     "window":     active_bet["window"],
                     "entry_btc":  active_bet["entry"],
-                    "entry_odds": entry_odds,
+                    "entry_odds": active_bet["odds"],
                     "stake":      stake_,
                     "tokens":     tokens_held,
                     "exit_odds":  exit_odds,
@@ -786,27 +823,6 @@ def run(cfg: dict):
                 session_invested += stake_
                 hour_pnl         += pnl_usd
                 hour_invested    += stake_
-
-                # ── v11.0: WIN → lanzar claim en hilo background ──────────
-                if result == "WIN":
-                    session_wins += 1
-                    hour_wins    += 1
-                    notify_win(cfg, active_bet, price, pnl_usd, simulated=sim_)
-                    if not sim_:
-                        threading.Thread(
-                            target = claim_with_retry,
-                            args   = (active_bet, cfg),
-                            daemon = True,
-                            name   = f"claim-{active_bet.get('id', 'x')[:8]}",
-                        ).start()
-                        logger.info(
-                            "[MONITOR] 🧵 Hilo de claim lanzado en background "
-                            "(hasta 7 intentos en ~64 min)"
-                        )
-                else:
-                    session_losses += 1
-                    hour_losses    += 1
-                    notify_loss(cfg, active_bet, price, pnl_usd, simulated=sim_)
 
                 hist_stats = _load_historical_stats(csv_path)
                 _log_accumulated_stats(hist_stats, label=f"TRAS {result}")
@@ -872,15 +888,15 @@ def run(cfg: dict):
 
                     if result_order is None:
                         notify_order_failed(cfg, signal)
-                        fired_window = signal.window
+                        fired_window = signal.window  # evitar retry infinito
                         logger.error(
                             f"[MONITOR] ❌ execute_order devolvió None — "
                             f"ventana {signal.window} marcada como fired"
                         )
                     else:
-                        ops_hoy       += 1
-                        entry_odds     = result_order.get("odds", 0.5)
-                        tokens_bought  = round(stake / max(entry_odds, 0.001), 4)
+                        ops_hoy      += 1
+                        entry_odds    = result_order.get("odds", 0.5)
+                        tokens_bought = round(stake / max(entry_odds, 0.001), 4)
 
                         active_bet = {
                             "id":          result_order.get("id", ""),
