@@ -1,21 +1,37 @@
 "use client";
-
 /**
- * Dashboard.jsx — v12.0
+ * Dashboard.jsx — v5.0
  *
- * v12.0 — ESTRATEGIA ARB EN PARALELO
- *  - Tab "⚖ ARBITRAJE": historial de operaciones arb_operations con filtros y stats.
- *  - Tab "COMPARATIVA": métricas side-by-side + PnL diario de ambas estrategias.
- *  - ArbModeSelector en panel DASHBOARD: controla activación y modo sim/real ARB.
+ * CAMBIOS v5.0 — Corrección integral (todos los bugs reportados)
+ * ─────────────────────────────────────────────────────────────────────
+ * BUG 1 FIX — getDecision recibía `config` (objeto) en lugar del umbral
+ *   numérico de la ventana activa. `dist > {objeto}` es siempre false en JS
+ *   → la señal siempre era WAIT. Ahora: getDecision(price, target, umbral)
+ *   donde umbral = config[activeWindow.configKey] ?? 200.
  *
- * (v5.1 — FIX BUG 1-5)
+ * BUG 2 FIX — getDecision devolvía { dir, ... } pero el render usaba
+ *   decision.direction y decision.threshold (siempre undefined).
+ *   Corregido en constants.js v2.0 (direction, threshold). El render ya
+ *   era correcto, solo fallaba la fuente de datos.
+ *
+ * BUG 3 FIX — activeWindow es un OBJETO { key, label, color, ... } pero el
+ *   render hacía `{activeWindow}` → "[object Object]". Corregido:
+ *   `{activeWindow?.label}`.
+ *
+ * BUG 4 FIX — botState se polleaba en un useEffect ad-hoc. Reemplazado por
+ *   el hook useBotState() de hooks.js v4.0, que también alimenta useMarket()
+ *   sin duplicar la llamada HTTP a /api/bot-state.
+ *
+ * BUG 5 FIX — priceHistory capturaba target desde closure; si target llegaba
+ *   tarde, los primeros puntos del historial tenían target:null y la
+ *   ReferenceLine no aparecía. Ahora: target se pasa directamente como prop
+ *   a <PriceChart> (ya lo era) y se garantiza que el efecto registra target
+ *   también cuando cambia de null a número.
+ *
  * (v4.2 — fmtTime, hints de eventos)
  * (v4.1 — eventos acumulativos)
  * (v4.0 — simplificación MarketInfo, log de eventos)
  */
-
-
-
 
 import { useState, useEffect, useCallback } from "react";
 import {
@@ -24,16 +40,13 @@ import {
   fmt, fmtUSD,
 } from "../lib/constants";
 import { useBotState, useBTCPrice, useMarket, useClock } from "../lib/hooks";
-import PriceChart    from "./PriceChart";
-import WindowBar     from "./WindowBar";
-import MarketInfo    from "./MarketInfo";
-import BetsTable     from "./BetsTable";
-import ConfigPanel   from "./ConfigPanel";
-import StatsPanel    from "./StatsPanel";
-import ModeSelector  from "./ModeSelector";
-import ArbModeSelector from "./ArbModeSelector";   // v12.0
-import ArbHistorial    from "./ArbHistorial";       // v12.0
-import Comparativa     from "./Comparativa";        // v12.0
+import PriceChart  from "./PriceChart";
+import WindowBar   from "./WindowBar";
+import MarketInfo  from "./MarketInfo";
+import BetsTable   from "./BetsTable";
+import ConfigPanel from "./ConfigPanel";
+import StatsPanel  from "./StatsPanel";
+import ModeSelector from "./ModeSelector";
 
 const LS_KEY        = "polymarket_bets_v2";
 const BETS_POLL_MS  = 10_000;
@@ -79,7 +92,6 @@ function eventColor(text) {
   if (text.startsWith("❌") || text.startsWith("🛑") || text.startsWith("⛔") || text.startsWith("🚨")) return "var(--red)";
   if (text.startsWith("⚠")  || text.startsWith("🟡")) return "var(--yellow)";
   if (text.startsWith("📊") || text.startsWith("📈") || text.startsWith("📉")) return "#4488ff";
-  if (text.startsWith("⚖"))  return "#4488ff";
   return "#888";
 }
 
@@ -93,18 +105,26 @@ export default function Dashboard() {
   const [events, setEvents]             = useState([]);
 
   // ── Hooks de datos ────────────────────────────────────────────────────────
+  //
+  // FIX v5.0: useBotState() reemplaza el useEffect ad-hoc.
+  // Se pasa botState.raw a useMarket() para evitar doble fetch a /api/bot-state.
+
   const botState = useBotState();
   const { price, prev, source, loading: priceLoading } = useBTCPrice(true);
   const { market, endMs, error: marketError, apiResponse: marketApiResponse } = useMarket(botState.raw);
   const now = useClock();
 
   // ── Valores derivados ─────────────────────────────────────────────────────
-  const minsLeft     = getMinsLeft(endMs, now);
-  const activeWindow = getActiveWindow(minsLeft);
 
+  const minsLeft     = getMinsLeft(endMs, now);
+  const activeWindow = getActiveWindow(minsLeft);   // objeto { key, label, ... } o null
+
+  // Target: lo que el bot reporta como "precio de apertura de vela"
   const target = botState.target ?? null;
   const dist   = price != null && target != null ? price - target : null;
 
+  // FIX v5.0 BUG 1: pasar el umbral numérico de la ventana activa, no el config completo.
+  // Si no hay ventana activa, se puede usar el t5_umbral como mínimo (o null → señal null).
   const umbral   = activeWindow ? (config[activeWindow.configKey] ?? 200) : null;
   const decision = price != null && target != null && umbral != null
     ? getDecision(price, target, umbral)
@@ -120,37 +140,50 @@ export default function Dashboard() {
   const activeBet  = bets.find(b => b.result === "PENDING") ?? null;
   const marketSlugShort = market?.slug?.split("-").slice(-3).join("-") ?? null;
 
-  // ── Historial de bets ─────────────────────────────────────────────────────
+  // ── Effects ───────────────────────────────────────────────────────────────
+
+  // 1. Bets desde Supabase
   const loadBets = useCallback(async () => {
     try {
       const res  = await fetch("/api/bets?limit=500");
+      if (!res.ok) return;
       const data = await res.json();
-      setBets(data.bets ?? []);
-    } catch { /* silencioso */ }
+      const rows = data.bets ?? [];
+      if (rows.length > 0) {
+        setBets(rows);
+        try { localStorage.setItem(LS_KEY, JSON.stringify(rows.slice(0, 500))); } catch {}
+      }
+    } catch {}
   }, []);
 
   useEffect(() => {
+    try {
+      const saved = localStorage.getItem(LS_KEY);
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed) && parsed.length > 0) setBets(parsed);
+      }
+    } catch {}
     loadBets();
     const id = setInterval(loadBets, BETS_POLL_MS);
     return () => clearInterval(id);
   }, [loadBets]);
 
-  // ── Eventos del bot ───────────────────────────────────────────────────────
+  // 2. Eventos del bot (mensajes Telegram replicados)
   const loadEvents = useCallback(async () => {
     try {
-      const res  = await fetch("/api/events");
-      const data = await res.json();
+      const res      = await fetch("/api/events");
+      if (!res.ok) return;
+      const data     = await res.json();
+      const incoming = data.events ?? [];
+      if (incoming.length === 0) return;
       setEvents(prev => {
-        const incoming = data.events ?? [];
-        if (!incoming.length) return prev;
-        const ids = new Set(prev.map(e => e.id));
-        const merged = [
-          ...incoming.filter(e => !ids.has(e.id)),
-          ...prev,
-        ].slice(0, 60);
-        return merged;
+        const prevIds = new Set(prev.map(e => e.id));
+        const newOnes = incoming.filter(e => !prevIds.has(e.id));
+        if (newOnes.length === 0) return prev;
+        return [...newOnes, ...prev].slice(0, 100);
       });
-    } catch { /* silencioso */ }
+    } catch {}
   }, []);
 
   useEffect(() => {
@@ -159,33 +192,52 @@ export default function Dashboard() {
     return () => clearInterval(id);
   }, [loadEvents]);
 
-  // ── Historial de precio ───────────────────────────────────────────────────
+  // 3. Historial de precio para la gráfica
+  //    FIX v5.0 BUG 5: target incluido en deps para que cada punto de historial
+  //    capture el target correcto en cuanto llega del bot.
   useEffect(() => {
-    if (price == null) return;
-    setPriceHistory(h => {
-      const last = h[h.length - 1];
-      if (last && last.price === price) return h;
-      const next = [...h, { time: Date.now(), price, target }].slice(-120);
-      return next;
+    if (!price) return;
+    const ts = new Date().toLocaleTimeString("es-ES", {
+      hour: "2-digit", minute: "2-digit", second: "2-digit",
     });
+    setPriceHistory(h => [...h, { ts, price, target }].slice(-60));
   }, [price, target]);
 
+  // 4. Stake USDC desde config API (si disponible)
+  useEffect(() => {
+    async function fetchStake() {
+      try {
+        const res  = await fetch("/api/config?key=stake_usdc");
+        if (!res.ok) return;
+        const data = await res.json();
+        if (data.value) {
+          const v = parseFloat(data.value);
+          if (!isNaN(v) && v > 0) setConfig(c => ({ ...c, stake_usdc: v }));
+        }
+      } catch {}
+    }
+    fetchStake();
+  }, []);
+
   // ── Render ────────────────────────────────────────────────────────────────
+
   return (
     <div style={{
-      background: "var(--bg)", minHeight: "100vh",
-      fontFamily: "var(--font-mono)", color: "var(--text)",
+      minHeight: "100vh", background: "var(--bg)",
+      fontFamily: "'JetBrains Mono', monospace",
+      color: "var(--text)", fontSize: 12,
     }}>
-      {/* ── HEADER ──────────────────────────────────────────────────────── */}
+
+      {/* ── HEADER ─────────────────────────────────────────────────────── */}
       <header style={{
         display: "flex", justifyContent: "space-between", alignItems: "center",
-        padding: "0 20px", height: 44,
-        borderBottom: "1px solid var(--border)", background: "#010108",
+        padding: "10px 20px", borderBottom: "1px solid var(--border)",
+        background: "#02020a",
       }}>
-        <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
+        <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
           <div style={{
             width: 8, height: 8, borderRadius: "50%",
-            background: botState.running ? "var(--green)" : "#333",
+            background: botState.running ? "var(--green)" : "var(--red)",
             boxShadow: botState.running ? "0 0 12px var(--green)" : "0 0 8px var(--red)",
             animation: botState.running ? "pulse 2s infinite" : "none",
           }} />
@@ -199,6 +251,7 @@ export default function Dashboard() {
           )}
         </div>
         <div style={{ display: "flex", gap: 16, alignItems: "center" }}>
+          {/* FIX v5.0: target viene de botState.target, no de mercado */}
           {target != null && (
             <span style={{ fontSize: 10, color: "var(--yellow)", letterSpacing: "0.08em" }}>
               TARGET{" "}
@@ -216,12 +269,10 @@ export default function Dashboard() {
       {/* ── TABS ────────────────────────────────────────────────────────── */}
       <nav style={{ display: "flex", borderBottom: "1px solid var(--border)", background: "#020208" }}>
         {[
-          { key: "dashboard",   label: "DASHBOARD"    },
-          { key: "historial",   label: "HISTORIAL"    },
-          { key: "arbitraje",   label: "⚖ ARBITRAJE"  },
-          { key: "comparativa", label: "COMPARATIVA"  },
-          { key: "stats",       label: "ESTADÍSTICAS" },
-          { key: "config",      label: "CONFIG"       },
+          { key: "dashboard",  label: "DASHBOARD"     },
+          { key: "historial",  label: "HISTORIAL"     },
+          { key: "stats",      label: "ESTADÍSTICAS"  },
+          { key: "config",     label: "CONFIG"        },
         ].map(({ key, label }) => (
           <button key={key} onClick={() => setTab(key)} style={{
             background: "none", border: "none", cursor: "pointer",
@@ -250,97 +301,206 @@ export default function Dashboard() {
           <StatBox
             label="WINRATE"
             value={winrate != null ? `${winrate.toFixed(0)}%` : "—"}
-            color={winrate != null && winrate >= 50 ? "var(--green)" : "var(--red)"}
-            sub={total > 0 ? `${wins}W / ${losses}L` : undefined}
+            color="var(--yellow)"
+            sub={`${wins}W / ${losses}L`}
           />
-          <StatBox
-            label="OPS HOY"
-            value={botState.ops_today ?? 0}
-            color="#c8c8d8"
-          />
-          {price != null && (
-            <StatBox
-              label="BTC PRECIO"
-              value={`$${price.toLocaleString("en-US", { maximumFractionDigits: 0 })}`}
-              color={prev != null && price > prev ? "var(--green)" : prev != null && price < prev ? "var(--red)" : "#c8c8d8"}
-            />
-          )}
-          {dist != null && (
-            <StatBox
-              label="DISTANCIA"
-              value={`${dist >= 0 ? "+" : ""}${dist.toFixed(0)}`}
-              color={Math.abs(dist) > (umbral ?? 200) ? "var(--green)" : "var(--yellow)"}
-              sub="vs Target"
-            />
-          )}
-          {decision && (
-            <StatBox
-              label="SEÑAL"
-              value={decision}
-              color={decision === "UP" ? "var(--green)" : decision === "DOWN" ? "var(--red)" : "var(--yellow)"}
-            />
-          )}
-        </div>
-      )}
-
-      {/* ── CHART + MERCADO ─────────────────────────────────────────────── */}
-      {tab === "dashboard" && (
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 300px", borderBottom: "1px solid var(--border)" }}>
-          <div style={{ borderRight: "1px solid var(--border)", padding: "16px 20px" }}>
-            <PriceChart
-              data={priceHistory}
-              target={target}
-              activeWindow={activeWindow}
-              minsLeft={minsLeft}
-            />
-          </div>
-          <div style={{ padding: "16px 20px" }}>
-            <WindowBar minsLeft={minsLeft} activeWindow={activeWindow} />
-            <MarketInfo
-              market={market}
-              endMs={endMs}
-              minsLeft={minsLeft}
-              botState={botState}
-              activeBet={activeBet}
-            />
+          <StatBox label="OPS" value={total || "—"} color="var(--dim)" />
+          <div style={{ marginLeft: "auto", fontSize: 9, color: "#333", alignSelf: "center" }}>
+            ↻ sync cada 10s · fuente: Supabase
           </div>
         </div>
       )}
 
-      {/* ── EVENTOS DEL BOT ─────────────────────────────────────────────── */}
+      {/* ── PANEL PRINCIPAL 3-columnas ──────────────────────────────────── */}
       {tab === "dashboard" && (
-        <div style={{ padding: "16px 20px", borderBottom: "1px solid var(--border)" }}>
-          <div style={{ fontSize: 9, color: "#333", letterSpacing: "0.14em", marginBottom: 10 }}>
-            EVENTOS DEL BOT
-          </div>
-          <div style={{
-            maxHeight: 180, overflowY: "auto",
-            background: "#01010a", border: "1px solid #0a0a18",
-            borderRadius: 3, padding: "8px 10px",
-          }}>
-            {events.length === 0 ? (
-              <div style={{ fontSize: 10, color: "#2a2a3a" }}>
-                Sin eventos — esperando mensajes del bot
-                {botState.running && (
-                  <span style={{ color: "#333", marginLeft: 8 }}>
-                    · verifica FRONTEND_URL en Railway
+        <div style={{
+          display: "grid",
+          gridTemplateColumns: "1fr 1fr 1fr",
+          borderBottom: "1px solid var(--border)",
+        }}>
+
+          {/* COLUMNA 1 — BTC PRECIO + TARGET + WINDOWBAR */}
+          <div style={{ padding: "20px 24px", borderRight: "1px solid var(--border)" }}>
+            <div style={{ fontSize: 9, color: "#444", letterSpacing: "0.15em", marginBottom: 6 }}>
+              BTC / USDT
+              {source && <span style={{ color: "#333", marginLeft: 6 }}>{source.toUpperCase()}</span>}
+            </div>
+            <div style={{
+              fontSize: 38, fontWeight: 700, lineHeight: 1,
+              color: price && prev ? (price >= prev ? "var(--green)" : "var(--red)") : "var(--text)",
+            }}>
+              {price ? `$${fmt(price, 2)}` : (priceLoading ? "…" : "—")}
+            </div>
+            {prev && price && (
+              <div style={{ fontSize: 11, color: price >= prev ? "var(--green)" : "var(--red)", marginTop: 4 }}>
+                {price >= prev ? "▲" : "▼"} ${Math.abs(price - prev).toFixed(2)}
+              </div>
+            )}
+
+            {/* TARGET con distancia */}
+            {target != null ? (
+              <div style={{ fontSize: 11, color: "#888", marginTop: 8 }}>
+                TARGET{" "}
+                <span style={{ color: "var(--yellow)", fontWeight: 700 }}>
+                  ${target.toLocaleString("en-US", { maximumFractionDigits: 0 })}
+                </span>
+                {dist != null && (
+                  <span style={{ marginLeft: 8, color: dist > 0 ? "#4488ff" : "#ff8800", fontWeight: 700 }}>
+                    ({dist > 0 ? "+" : ""}{fmtUSD(dist)})
                   </span>
                 )}
               </div>
             ) : (
-              events.map(ev => (
-                <div key={ev.id} style={{
-                  fontSize: 10, color: eventColor(ev.text),
-                  marginBottom: 3, lineHeight: 1.55,
-                  borderBottom: "1px solid #0a0a14", paddingBottom: 3,
-                }}>
-                  <span style={{ color: "#444", marginRight: 8, userSelect: "none" }}>
-                    {fmtTime(ev.ts_iso ?? ev.ts)}
-                  </span>
-                  <span style={{ whiteSpace: "pre-wrap" }}>{ev.text}</span>
-                </div>
-              ))
+              <div style={{ fontSize: 10, color: "#333", marginTop: 8 }}>
+                TARGET — (bot offline o sin vela)
+              </div>
             )}
+
+            {/* WindowBar — FIX v5.0: minsLeft siempre válido */}
+            <div style={{ marginTop: 16 }}>
+              <WindowBar minsLeft={minsLeft} activeWindow={activeWindow} />
+            </div>
+          </div>
+
+          {/* COLUMNA 2 — SEÑAL VISUAL */}
+          <div style={{ padding: "20px 24px", borderRight: "1px solid var(--border)" }}>
+            <div style={{ fontSize: 9, color: "#444", letterSpacing: "0.15em", marginBottom: 6 }}>SEÑAL VISUAL</div>
+
+            {activeWindow && decision ? (
+              <>
+                {/* FIX v5.0 BUG 2: decision.direction (no decision.dir) */}
+                <div style={{
+                  fontSize: 28, fontWeight: 700,
+                  color: decision.direction === "UP"   ? "var(--green)"
+                       : decision.direction === "DOWN" ? "var(--red)"
+                       : "#555",
+                }}>
+                  {decision.direction === "UP"   ? "▲ UP"
+                   : decision.direction === "DOWN" ? "▼ DOWN"
+                   : "— WAIT"}
+                </div>
+
+                {/* FIX v5.0 BUG 3: activeWindow?.label no {activeWindow} */}
+                <div style={{ fontSize: 10, color: activeWindow.color, marginTop: 6 }}>
+                  ventana {activeWindow.label}
+                </div>
+
+                {target != null && (
+                  <div style={{ marginTop: 10, fontSize: 11 }}>
+                    <div style={{ color: "#444", marginBottom: 4 }}>
+                      TARGET{" "}
+                      <span style={{ color: "var(--yellow)", fontWeight: 700 }}>
+                        ${target.toLocaleString("en-US", { maximumFractionDigits: 0 })}
+                      </span>
+                    </div>
+                    {dist != null && umbral != null && (
+                      <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                        <span style={{ color: "#333" }}>Δ</span>
+                        <span style={{
+                          color: Math.abs(dist) > umbral ? "var(--green)" : "var(--red)",
+                          fontWeight: 700,
+                        }}>
+                          ${Math.abs(dist).toFixed(0)}
+                        </span>
+                        <span style={{ color: "#333" }}>/ umbral ${umbral}</span>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </>
+            ) : (
+              <div style={{ fontSize: 11, color: "#555" }}>
+                {!activeWindow ? "Fuera de ventana" : target == null ? "Sin target del bot" : "Sin precio"}
+                {target != null && (
+                  <div style={{ marginTop: 8, color: "#555" }}>
+                    Target:{" "}
+                    <span style={{ color: "var(--yellow)" }}>
+                      ${target.toLocaleString("en-US", { maximumFractionDigits: 0 })}
+                    </span>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* COLUMNA 3 — MERCADO ACTIVO + TOKENS */}
+          <div>
+            <MarketInfo
+              market={market}
+              minsLeft={minsLeft}
+              activeWindow={activeWindow}
+              error={marketError}
+              apiResponse={marketApiResponse}
+            />
+          </div>
+        </div>
+      )}
+
+      {/* ── GRÁFICA BTC ─────────────────────────────────────────────────── */}
+      {tab === "dashboard" && (
+        <div style={{ borderBottom: "1px solid var(--border)" }}>
+          <div style={{ padding: "12px 20px" }}>
+            {/* FIX v5.0: target pasado directamente como prop — ReferenceLine siempre actualizado */}
+            <PriceChart data={priceHistory} target={target} />
+          </div>
+        </div>
+      )}
+
+      {/* ── LOG DE EVENTOS ──────────────────────────────────────────────── */}
+      {tab === "dashboard" && (
+        <div style={{ borderBottom: "1px solid var(--border)" }}>
+          <div style={{ padding: "12px 20px" }}>
+            <div style={{
+              display: "flex", justifyContent: "space-between", alignItems: "center",
+              marginBottom: 8,
+            }}>
+              <div style={{ fontSize: 9, color: "#444", letterSpacing: "0.15em" }}>
+                LOG DE EVENTOS
+              </div>
+              <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
+                <div style={{ fontSize: 9, color: "#222" }}>
+                  ↻ 5s · {events.length} mensajes
+                </div>
+                {events.length > 0 && (
+                  <button onClick={() => setEvents([])} style={{
+                    background: "none", border: "1px solid #1a1a2e", color: "#333",
+                    fontSize: 8, padding: "2px 6px", borderRadius: 2,
+                    cursor: "pointer", fontFamily: "inherit",
+                  }}>
+                    LIMPIAR
+                  </button>
+                )}
+              </div>
+            </div>
+            <div style={{
+              maxHeight: 220, overflowY: "auto",
+              background: "#010108", border: "1px solid var(--border)",
+              borderRadius: 3, padding: "8px 10px",
+            }}>
+              {events.length === 0 ? (
+                <div style={{ fontSize: 10, color: "#2a2a3a" }}>
+                  Sin eventos — esperando mensajes del bot
+                  {botState.running && (
+                    <span style={{ color: "#333", marginLeft: 8 }}>
+                      · verifica FRONTEND_URL en Railway
+                    </span>
+                  )}
+                </div>
+              ) : (
+                events.map(ev => (
+                  <div key={ev.id} style={{
+                    fontSize: 10, color: eventColor(ev.text),
+                    marginBottom: 3, lineHeight: 1.55,
+                    borderBottom: "1px solid #0a0a14", paddingBottom: 3,
+                  }}>
+                    <span style={{ color: "#444", marginRight: 8, userSelect: "none" }}>
+                      {fmtTime(ev.ts_iso ?? ev.ts)}
+                    </span>
+                    <span style={{ whiteSpace: "pre-wrap" }}>{ev.text}</span>
+                  </div>
+                ))
+              )}
+            </div>
           </div>
         </div>
       )}
@@ -349,7 +509,6 @@ export default function Dashboard() {
       {tab === "dashboard" && (
         <div style={{ padding: "20px 24px", borderBottom: "1px solid var(--border)" }}>
           <ModeSelector />
-          <ArbModeSelector />
         </div>
       )}
 
@@ -380,36 +539,6 @@ export default function Dashboard() {
             )}
           </div>
           <BetsTable bets={bets} />
-        </div>
-      )}
-
-      {/* ── ARBITRAJE ───────────────────────────────────────────────────── */}
-      {tab === "arbitraje" && (
-        <div>
-          <div style={{
-            display: "flex", justifyContent: "space-between", alignItems: "center",
-            padding: "12px 20px", borderBottom: "1px solid var(--border)",
-            background: "#02020a",
-          }}>
-            <span style={{ fontSize: 10, color: "#444", letterSpacing: "0.12em" }}>
-              ⚖ HISTORIAL ARBITRAJE · SUPABASE
-            </span>
-          </div>
-          <ArbHistorial />
-        </div>
-      )}
-
-      {/* ── COMPARATIVA ─────────────────────────────────────────────────── */}
-      {tab === "comparativa" && (
-        <div>
-          <div style={{
-            padding: "12px 20px", borderBottom: "1px solid var(--border)",
-            background: "#02020a",
-            fontSize: 10, color: "#444", letterSpacing: "0.12em",
-          }}>
-            COMPARATIVA — ESTRATEGIA DIRECCIONAL vs ARBITRAJE
-          </div>
-          <Comparativa />
         </div>
       )}
 
