@@ -1,15 +1,17 @@
 /**
- * components/ConfigPanel.jsx — v1.2
+ * components/ConfigPanel.jsx — v1.3
  *
+ * v1.3 — Aviso "requiere editar config.yaml" en umbrales y capital
+ *         (max_ops_dia, stop_loss_pct). Solo stake_usdc se persiste en Supabase.
  * v1.2 — Botón GUARDAR stake_usdc con feedback visual (✅ / ❌).
- *         POST /api/config persiste el valor en Supabase para que el bot
- *         lo recoja en el siguiente ciclo de polling (~60s).
  * v1.1 — Grid original (umbrales / capital / env vars)
  */
 
 "use client";
 import { useState } from "react";
 import { WINDOWS } from "../lib/constants";
+
+// ── Sub-componentes ──────────────────────────────────────────────────────────
 
 function Field({ label, sub, value, onChange, color = "var(--green)" }) {
   return (
@@ -33,47 +35,58 @@ function Field({ label, sub, value, onChange, color = "var(--green)" }) {
   );
 }
 
+/** Aviso para parámetros que requieren editar config.yaml en Railway */
+function ConfigYamlNote() {
+  return (
+    <div style={{
+      marginTop: 4, marginBottom: 4,
+      padding: "10px 14px",
+      background: "#02020e",
+      border: "1px solid #1a1a2e",
+      borderRadius: 3,
+      fontSize: 9,
+      color: "#555",
+      lineHeight: 1.8,
+    }}>
+      <span style={{ color: "#333", marginRight: 6 }}>⚠</span>
+      Estos valores son de <span style={{ color: "#888" }}>solo lectura</span> en el dashboard.
+      Para cambiarlos edita{" "}
+      <span style={{ color: "var(--yellow)" }}>config.yaml</span>{" "}
+      en Railway y reinicia el bot.
+    </div>
+  );
+}
+
+// ── Componente principal ─────────────────────────────────────────────────────
+
 export default function ConfigPanel({ config, onChange }) {
   const set = (key) => (val) => onChange(c => ({ ...c, [key]: val }));
 
-  // ── Estado del guardado ──────────────────────────────────────────────────
-  const [saveStatus, setSaveStatus] = useState("idle"); // "idle" | "saving" | "ok" | "error"
+  // Estado del guardado de stake
+  const [saveStatus, setSaveStatus] = useState("idle"); // "idle"|"saving"|"ok"|"error"
   const [saveMsg,    setSaveMsg]    = useState("");
 
   const handleSave = async () => {
     setSaveStatus("saving");
     setSaveMsg("");
-
-    const toSave = [
-      { key: "stake_usdc",    value: String(config.stake_usdc)    },
-    ];
-
     try {
-      const results = await Promise.all(
-        toSave.map(({ key, value }) =>
-          fetch("/api/config", {
-            method:  "POST",
-            headers: { "Content-Type": "application/json" },
-            body:    JSON.stringify({ key, value }),
-          }).then(r => r.json())
-        )
-      );
-
-      const allOk = results.every(r => r.ok !== false && !r.error);
-      if (allOk) {
+      const res  = await fetch("/api/config", {
+        method:  "POST",
+        headers: { "Content-Type": "application/json" },
+        body:    JSON.stringify({ key: "stake_usdc", value: String(config.stake_usdc) }),
+      });
+      const data = await res.json();
+      if (data.ok !== false && !data.error) {
         setSaveStatus("ok");
-        setSaveMsg("✅ Configuración guardada — el bot la cargará en ~60s");
+        setSaveMsg("✅ Stake guardado — el bot lo cargará en ~60s");
       } else {
-        const err = results.find(r => r.error)?.error ?? "Error desconocido";
         setSaveStatus("error");
-        setSaveMsg(`❌ Error: ${err}`);
+        setSaveMsg(`❌ Error: ${data.error ?? "desconocido"}`);
       }
     } catch (e) {
       setSaveStatus("error");
       setSaveMsg(`❌ ${e.message}`);
     }
-
-    // Reset a "idle" tras 4 segundos
     setTimeout(() => { setSaveStatus("idle"); setSaveMsg(""); }, 4000);
   };
 
@@ -100,6 +113,7 @@ export default function ConfigPanel({ config, onChange }) {
             color={w.color}
           />
         ))}
+        <ConfigYamlNote />
       </div>
 
       {/* ── CAPITAL ────────────────────────────────────────────────────── */}
@@ -108,6 +122,7 @@ export default function ConfigPanel({ config, onChange }) {
           GESTIÓN DE CAPITAL
         </div>
 
+        {/* Stake — persiste en Supabase */}
         <Field
           label="STAKE USDC / OPERACIÓN"
           sub="Cantidad apostada en cada entrada"
@@ -115,6 +130,50 @@ export default function ConfigPanel({ config, onChange }) {
           onChange={set("stake_usdc")}
           color="var(--yellow)"
         />
+
+        {/* Botón guardar stake */}
+        <div style={{ marginBottom: 24 }}>
+          <button
+            onClick={handleSave}
+            disabled={saveStatus === "saving"}
+            style={{
+              background: saveStatus === "ok"
+                ? "rgba(0,255,136,0.12)"
+                : saveStatus === "error"
+                  ? "rgba(255,68,102,0.12)"
+                  : "rgba(255,204,0,0.08)",
+              border: `1px solid ${
+                saveStatus === "ok"    ? "rgba(0,255,136,0.4)"  :
+                saveStatus === "error" ? "rgba(255,68,102,0.4)" :
+                                         "rgba(255,204,0,0.3)"
+              }`,
+              color: saveStatus === "ok"
+                ? "var(--green)"
+                : saveStatus === "error"
+                  ? "var(--red)"
+                  : "var(--yellow)",
+              fontSize: 10, letterSpacing: "0.12em",
+              padding: "9px 22px",
+              cursor: saveStatus === "saving" ? "default" : "pointer",
+              fontFamily: "inherit", borderRadius: 3,
+              opacity: saveStatus === "saving" ? 0.6 : 1,
+              transition: "all 0.2s",
+            }}
+          >
+            {saveStatus === "saving" ? "GUARDANDO…" : "GUARDAR STAKE"}
+          </button>
+
+          {saveMsg && (
+            <div style={{
+              marginTop: 10, fontSize: 10, lineHeight: 1.6, maxWidth: 260,
+              color: saveStatus === "ok" ? "var(--green)" : "var(--red)",
+            }}>
+              {saveMsg}
+            </div>
+          )}
+        </div>
+
+        {/* Max ops y stop loss — solo config.yaml */}
         <Field
           label="MAX OPERACIONES / DÍA"
           sub="Límite diario de entradas"
@@ -129,51 +188,7 @@ export default function ConfigPanel({ config, onChange }) {
           onChange={set("stop_loss_pct")}
           color="var(--red)"
         />
-
-        {/* ── Botón guardar ────────────────────────────────────────────── */}
-        <div style={{ marginTop: 8 }}>
-          <button
-            onClick={handleSave}
-            disabled={saveStatus === "saving"}
-            style={{
-              background: saveStatus === "ok"
-                ? "rgba(0,255,136,0.12)"
-                : saveStatus === "error"
-                  ? "rgba(255,68,102,0.12)"
-                  : "rgba(255,204,0,0.08)",
-              border: `1px solid ${
-                saveStatus === "ok"    ? "rgba(0,255,136,0.4)"  :
-                saveStatus === "error" ? "rgba(255,68,102,0.4)" :
-                                          "rgba(255,204,0,0.3)"
-              }`,
-              color: saveStatus === "ok"
-                ? "var(--green)"
-                : saveStatus === "error"
-                  ? "var(--red)"
-                  : "var(--yellow)",
-              fontSize: 10, letterSpacing: "0.12em",
-              padding: "9px 22px", cursor: saveStatus === "saving" ? "default" : "pointer",
-              fontFamily: "inherit", borderRadius: 3,
-              opacity: saveStatus === "saving" ? 0.6 : 1,
-              transition: "all 0.2s",
-            }}
-          >
-            {saveStatus === "saving" ? "GUARDANDO…" : "GUARDAR CONFIG"}
-          </button>
-
-          {/* Mensaje de confirmación */}
-          {saveMsg && (
-            <div style={{
-              marginTop: 10,
-              fontSize: 10,
-              color: saveStatus === "ok" ? "var(--green)" : "var(--red)",
-              lineHeight: 1.6,
-              maxWidth: 260,
-            }}>
-              {saveMsg}
-            </div>
-          )}
-        </div>
+        <ConfigYamlNote />
       </div>
 
       {/* ── ENV VARS (info) ─────────────────────────────────────────────── */}
