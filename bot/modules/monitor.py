@@ -1,6 +1,15 @@
 """
 monitor.py — Loop principal del bot: ventana horaria, stop loss, resolución
 
+v11.0 — CLAIM AUTOMÁTICO CON RETRY + NOTIFICACIONES
+  - import threading añadido.
+  - from .claimer import claim_with_retry añadido.
+  - Tras cada WIN real (not sim_), lanza claim_with_retry() en hilo daemon.
+  - El hilo reintenta 7 veces en ~64 min (ver RETRY_SCHEDULE en claimer.py).
+  - Notificaciones Telegram en cada intento, en el éxito (con TX hash) y
+    en fallo definitivo (con aviso de reclamar manualmente).
+  - El loop principal nunca se bloquea esperando el claim.
+
 v10.9 — FIX CRÍTICO: sincronizar cfg tras cambio de modo
   - Añadida línea cfg["strategy"]["simulate_mode"] = simulate en los dos
     sitios donde simulate se actualiza desde BD (arranque y polling).
@@ -32,6 +41,7 @@ Destino: bot/modules/monitor.py
 import csv
 import logging
 import os
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -40,7 +50,7 @@ import requests
 from .price_feed      import get_btc_price
 from .market_scanner  import get_active_market, get_open_1h_binance
 from .strategy        import evaluate, execute_order, Direction, WINDOWS
-from .claimer         import redimir_posicion
+from .claimer         import redimir_posicion, claim_with_retry
 from .notifier        import (
     notify_start, notify_stop,
     notify_bet, notify_win, notify_loss, notify_stop_loss,
@@ -55,7 +65,7 @@ from .notifier        import (
 )
 from .command_handler  import process_pending_commands
 from .state_reporter   import report_state, report_offline
-from .                 import db
+from . import db
 
 logger = logging.getLogger(__name__)
 
@@ -164,6 +174,7 @@ def _build_trade_row(bet, result, ts_cierre, pnl_usd, pnl_pct, real_exit_odds=No
 # ── Precio CLOB de salida ─────────────────────────────────────────────────────
 
 def _fetch_exit_token_price(token_id: str) -> float:
+    """Lee el precio CLOB live para calcular P&L real al cerrar posición."""
     if not token_id:
         return 0.0
     try:
@@ -192,6 +203,7 @@ def _tokens_to_dict(tokens_raw) -> dict:
 # ── Estadísticas históricas ───────────────────────────────────────────────────
 
 def _load_historical_stats(csv_path: str) -> dict:
+    """Intenta BD primero; si no disponible, cae a CSV local."""
     if db.is_enabled():
         try:
             s = db.fetch_historical_stats()
@@ -521,7 +533,6 @@ def run(cfg: dict):
                     stake     = stake,
                     umbrales  = _umbrales_notif,
                 )
-                logger.info(_SEPARATOR)
 
             # ── Mercado activo ─────────────────────────────────────────────
             new_market = get_active_market()
@@ -688,8 +699,10 @@ def run(cfg: dict):
                     won       = exit_token_price >= 0.95
                     exit_odds = exit_token_price
                 else:
-                    won       = (dir_ == "UP" and price > (active_bet.get("target") or price)) or \
-                                (dir_ == "DOWN" and price < (active_bet.get("target") or price))
+                    won = (
+                        (dir_ == "UP"   and price > (active_bet.get("target") or price)) or
+                        (dir_ == "DOWN" and price < (active_bet.get("target") or price))
+                    )
                     exit_odds = 0.98 if won else 0.02
 
                 result       = "WIN" if won else "LOSS"
@@ -736,10 +749,22 @@ def run(cfg: dict):
                 hour_pnl         += pnl_usd
                 hour_invested    += stake_
 
+                # ── v11.0: WIN → lanzar claim en hilo background ──────────
                 if result == "WIN":
                     session_wins  += 1
                     hour_wins     += 1
                     notify_win(cfg, active_bet, price, pnl_usd, simulated=sim_)
+                    if not sim_:
+                        threading.Thread(
+                            target=claim_with_retry,
+                            args=(active_bet, cfg),
+                            daemon=True,
+                            name=f"claim-{active_bet.get('id', 'x')[:8]}",
+                        ).start()
+                        logger.info(
+                            "[MONITOR] 🧵 Hilo de claim lanzado en background "
+                            "(hasta 7 intentos en ~64 min)"
+                        )
                 else:
                     session_losses += 1
                     hour_losses    += 1

@@ -1,6 +1,12 @@
 """
 notifier.py — Notificaciones Telegram + Dashboard del bot PolyBot
 
+v5.5 — NOTIFICACIONES DE CLAIM
+  - notify_claim_ok()       : 💰 Claim confirmado on-chain (TX hash + P&L)
+  - notify_claim_retrying() : 🔄 Reintentando claim (motivo + espera)
+  - notify_claim_failed()   : 🚨 Claim fallido definitivo + aviso manual
+  Llamadas exclusivamente desde claimer.py → claim_with_retry().
+
 v5.4 — notify_mode_change()
   - Nueva función: notifica por Telegram cuando el bot detecta un cambio
     de modo (SIMULADO ↔ REAL) vía polling de BD en _read_simulate_mode_from_db().
@@ -131,7 +137,6 @@ def notify_mode_change(cfg: dict, old_mode: str, new_mode: str):
     """
     v5.4: Notifica por Telegram cuando el bot detecta un cambio de modo
     (SIMULADO ↔ REAL) vía polling de BD en _read_simulate_mode_from_db().
-
     old_mode / new_mode: "SIMULADO" o "REAL"
     """
     icon_new = "🔵" if new_mode == "SIMULADO" else "🔴"
@@ -289,7 +294,8 @@ def notify_win(cfg: dict, bet: dict, price: float,
     ))
 
 
-def notify_loss(cfg: dict, bet: dict, price: float, simulated: bool = False):
+def notify_loss(cfg: dict, bet: dict, price: float,
+                pnl_usd: float = None, simulated: bool = False):
     sim     = simulated or bet.get("simulated", False)
     sim_tag = "  <i>[SIMULADO]</i>" if sim else ""
     odds_v  = bet.get("odds", 0.5)
@@ -328,6 +334,68 @@ def notify_stop_loss(cfg: dict, bet: dict, price: float, pnl_usd: float,
     lines.append(f"P&L        : <code>{pnl_str} USDC{pct_str}</code>")
 
     _send(cfg, "\n".join(lines))
+
+
+# ── Claim on-chain ────────────────────────────────────────────────────────────
+
+def notify_claim_ok(cfg: dict, bet: dict, tx_hash: str, attempt: int, usdc_est: float):
+    """
+    v5.5: Claim confirmado on-chain. TX hash + USDC recuperado + intento.
+    """
+    direction = bet.get("direction", "—")
+    stake     = bet.get("stake", 0.0)
+    pnl_est   = round(usdc_est - stake, 2)
+    short_tx  = f"{tx_hash[:10]}...{tx_hash[-6:]}" if len(tx_hash) > 16 else tx_hash
+    _send(cfg, (
+        f"💰 <b>CLAIM CONFIRMADO — {direction}</b>\n"
+        f"TX         : <code>{short_tx}</code>\n"
+        f"Recuperado : <code>~{usdc_est:.4f} USDC</code>\n"
+        f"P&amp;L neto   : <code>+${pnl_est:.2f}</code>\n"
+        f"Intento    : <code>{attempt}</code>\n"
+        f"🔗 <a href=\"https://polygonscan.com/tx/{tx_hash}\">Ver en Polygonscan</a>"
+    ))
+
+
+def notify_claim_retrying(cfg: dict, bet: dict, attempt: int, max_attempts: int,
+                          reason: str, wait_secs: int):
+    """
+    v5.5: Se envía ANTES de dormir, para que el usuario vea el motivo del retraso.
+    """
+    direction = bet.get("direction", "—")
+    mins      = wait_secs // 60
+    secs_rem  = wait_secs % 60
+    if mins > 0 and secs_rem > 0:
+        wait_str = f"{mins}m {secs_rem}s"
+    elif mins > 0:
+        wait_str = f"{mins}m"
+    else:
+        wait_str = f"{wait_secs}s"
+    short_err = (reason[:150] + "…") if reason and len(reason) > 150 else (reason or "—")
+    _send(cfg, (
+        f"🔄 <b>Reintentando claim [{attempt}/{max_attempts}]</b>\n"
+        f"Dirección  : <code>{direction}</code>\n"
+        f"Motivo     : <code>{short_err}</code>\n"
+        f"Próximo    : en <code>{wait_str}</code>"
+    ))
+
+
+def notify_claim_failed(cfg: dict, bet: dict, reason: str, attempts: int):
+    """
+    v5.5: Fallo definitivo tras agotar todos los intentos del RETRY_SCHEDULE.
+    Incluye aviso para reclamar manualmente en polymarket.com.
+    """
+    direction = bet.get("direction", "—")
+    stake     = bet.get("stake", 0.0)
+    tokens    = bet.get("tokens", 0.0)
+    short_err = (reason[:250] + "…") if reason and len(reason) > 250 else (reason or "—")
+    _send(cfg, (
+        f"🚨 <b>CLAIM FALLIDO — {direction}</b>\n"
+        f"Intentos   : <code>{attempts}</code>\n"
+        f"Stake      : <code>${stake:.2f} USDC</code>\n"
+        f"Tokens     : <code>{tokens:.4f}</code>\n"
+        f"Error      : <code>{short_err}</code>\n"
+        f"⚠️ <b>Reclamar manualmente en polymarket.com</b>"
+    ))
 
 
 # ── Error ─────────────────────────────────────────────────────────────────────
