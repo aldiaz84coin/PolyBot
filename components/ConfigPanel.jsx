@@ -1,4 +1,14 @@
+/**
+ * components/ConfigPanel.jsx — v1.2
+ *
+ * v1.2 — Botón GUARDAR stake_usdc con feedback visual (✅ / ❌).
+ *         POST /api/config persiste el valor en Supabase para que el bot
+ *         lo recoja en el siguiente ciclo de polling (~60s).
+ * v1.1 — Grid original (umbrales / capital / env vars)
+ */
+
 "use client";
+import { useState } from "react";
 import { WINDOWS } from "../lib/constants";
 
 function Field({ label, sub, value, onChange, color = "var(--green)" }) {
@@ -26,6 +36,48 @@ function Field({ label, sub, value, onChange, color = "var(--green)" }) {
 export default function ConfigPanel({ config, onChange }) {
   const set = (key) => (val) => onChange(c => ({ ...c, [key]: val }));
 
+  // ── Estado del guardado ──────────────────────────────────────────────────
+  const [saveStatus, setSaveStatus] = useState("idle"); // "idle" | "saving" | "ok" | "error"
+  const [saveMsg,    setSaveMsg]    = useState("");
+
+  const handleSave = async () => {
+    setSaveStatus("saving");
+    setSaveMsg("");
+
+    const toSave = [
+      { key: "stake_usdc",    value: String(config.stake_usdc)    },
+    ];
+
+    try {
+      const results = await Promise.all(
+        toSave.map(({ key, value }) =>
+          fetch("/api/config", {
+            method:  "POST",
+            headers: { "Content-Type": "application/json" },
+            body:    JSON.stringify({ key, value }),
+          }).then(r => r.json())
+        )
+      );
+
+      const allOk = results.every(r => r.ok !== false && !r.error);
+      if (allOk) {
+        setSaveStatus("ok");
+        setSaveMsg("✅ Configuración guardada — el bot la cargará en ~60s");
+      } else {
+        const err = results.find(r => r.error)?.error ?? "Error desconocido";
+        setSaveStatus("error");
+        setSaveMsg(`❌ Error: ${err}`);
+      }
+    } catch (e) {
+      setSaveStatus("error");
+      setSaveMsg(`❌ ${e.message}`);
+    }
+
+    // Reset a "idle" tras 4 segundos
+    setTimeout(() => { setSaveStatus("idle"); setSaveMsg(""); }, 4000);
+  };
+
+  // ── Render ───────────────────────────────────────────────────────────────
   return (
     <div style={{
       background: "var(--bg)", minHeight: "calc(100vh - 90px)",
@@ -33,7 +85,7 @@ export default function ConfigPanel({ config, onChange }) {
       gridTemplateColumns: "1fr 1fr 1fr", gap: 48,
     }}>
 
-      {/* Umbrales */}
+      {/* ── UMBRALES ───────────────────────────────────────────────────── */}
       <div>
         <div style={{ fontSize: 9, color: "#444", letterSpacing: "0.15em", marginBottom: 20 }}>
           UMBRALES DE ENTRADA (USD)
@@ -50,17 +102,81 @@ export default function ConfigPanel({ config, onChange }) {
         ))}
       </div>
 
-      {/* Capital */}
+      {/* ── CAPITAL ────────────────────────────────────────────────────── */}
       <div>
         <div style={{ fontSize: 9, color: "#444", letterSpacing: "0.15em", marginBottom: 20 }}>
           GESTIÓN DE CAPITAL
         </div>
-        <Field label="STAKE USDC / OPERACIÓN"  sub="Cantidad apostada en cada entrada"  value={config.stake_usdc}    onChange={set("stake_usdc")}    color="var(--yellow)" />
-        <Field label="MAX OPERACIONES / DÍA"   sub="Límite diario de entradas"          value={config.max_ops_dia}   onChange={set("max_ops_dia")}   color="var(--yellow)" />
-        <Field label="STOP LOSS %"             sub="Salir si la posición pierde este %" value={config.stop_loss_pct} onChange={set("stop_loss_pct")} color="var(--red)"    />
+
+        <Field
+          label="STAKE USDC / OPERACIÓN"
+          sub="Cantidad apostada en cada entrada"
+          value={config.stake_usdc}
+          onChange={set("stake_usdc")}
+          color="var(--yellow)"
+        />
+        <Field
+          label="MAX OPERACIONES / DÍA"
+          sub="Límite diario de entradas"
+          value={config.max_ops_dia}
+          onChange={set("max_ops_dia")}
+          color="var(--yellow)"
+        />
+        <Field
+          label="STOP LOSS %"
+          sub="Salir si la posición pierde este %"
+          value={config.stop_loss_pct}
+          onChange={set("stop_loss_pct")}
+          color="var(--red)"
+        />
+
+        {/* ── Botón guardar ────────────────────────────────────────────── */}
+        <div style={{ marginTop: 8 }}>
+          <button
+            onClick={handleSave}
+            disabled={saveStatus === "saving"}
+            style={{
+              background: saveStatus === "ok"
+                ? "rgba(0,255,136,0.12)"
+                : saveStatus === "error"
+                  ? "rgba(255,68,102,0.12)"
+                  : "rgba(255,204,0,0.08)",
+              border: `1px solid ${
+                saveStatus === "ok"    ? "rgba(0,255,136,0.4)"  :
+                saveStatus === "error" ? "rgba(255,68,102,0.4)" :
+                                          "rgba(255,204,0,0.3)"
+              }`,
+              color: saveStatus === "ok"
+                ? "var(--green)"
+                : saveStatus === "error"
+                  ? "var(--red)"
+                  : "var(--yellow)",
+              fontSize: 10, letterSpacing: "0.12em",
+              padding: "9px 22px", cursor: saveStatus === "saving" ? "default" : "pointer",
+              fontFamily: "inherit", borderRadius: 3,
+              opacity: saveStatus === "saving" ? 0.6 : 1,
+              transition: "all 0.2s",
+            }}
+          >
+            {saveStatus === "saving" ? "GUARDANDO…" : "GUARDAR CONFIG"}
+          </button>
+
+          {/* Mensaje de confirmación */}
+          {saveMsg && (
+            <div style={{
+              marginTop: 10,
+              fontSize: 10,
+              color: saveStatus === "ok" ? "var(--green)" : "var(--red)",
+              lineHeight: 1.6,
+              maxWidth: 260,
+            }}>
+              {saveMsg}
+            </div>
+          )}
+        </div>
       </div>
 
-      {/* Info */}
+      {/* ── ENV VARS (info) ─────────────────────────────────────────────── */}
       <div>
         <div style={{ fontSize: 9, color: "#444", letterSpacing: "0.15em", marginBottom: 20 }}>
           VARIABLES DE ENTORNO (RAILWAY / VERCEL)
@@ -85,7 +201,9 @@ export default function ConfigPanel({ config, onChange }) {
         }}>
           <div style={{ color: "#2a4a3a", marginBottom: 6 }}>⚠ SEGURIDAD</div>
           Nunca expongas tu <span style={{ color: "var(--red)" }}>PRIVATE_KEY</span> en el código.
-          Usa variables de entorno en Railway y Vercel. El archivo <span style={{ color: "var(--green)" }}>.env.local</span> está en <span style={{ color: "var(--muted)" }}>.gitignore</span>.
+          Usa variables de entorno en Railway y Vercel. El archivo{" "}
+          <span style={{ color: "var(--green)" }}>.env.local</span> está en{" "}
+          <span style={{ color: "var(--muted)" }}>.gitignore</span>.
         </div>
       </div>
     </div>
