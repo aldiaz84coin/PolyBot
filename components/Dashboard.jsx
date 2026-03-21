@@ -27,6 +27,7 @@ import ConfigPanel   from "./ConfigPanel";
 import StatsPanel    from "./StatsPanel";
 import ModeSelector  from "./ModeSelector";
 import BalanceWidget from "./BalanceWidget";
+import DataLab from "./DataLab";
 
 const LS_KEY         = "polymarket_bets_v2";
 const BETS_POLL_MS   = 10_000;
@@ -228,6 +229,7 @@ export default function Dashboard() {
           { key: "dashboard", label: "DASHBOARD"    },
           { key: "historial", label: "HISTORIAL"    },
           { key: "stats",     label: "ESTADÍSTICAS" },
+          { key: "datalab",   label: "DATA LAB"     },
           { key: "config",    label: "CONFIG"       },
         ].map(({ key, label }) => (
           <button key={key} onClick={() => setTab(key)} style={{
@@ -498,6 +500,7 @@ export default function Dashboard() {
       )}
 
       {tab === "stats"  && <StatsPanel />}
+      {tab === "datalab" && <DataLab />}
       {tab === "config" && <ConfigPanel config={config} onChange={setConfig} />}
     </div>
   );
