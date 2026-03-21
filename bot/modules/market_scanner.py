@@ -509,6 +509,58 @@ def get_open_1h_binance(slug: str | None = None) -> float | None:
     logger.error("[SCANNER] ❌ No se pudo obtener Price to Beat (Binance + Kraken fallidos)")
     return None
 
-
+# ── v3.0: Kline completo para DataLab ────────────────────────────────────────
+ 
+def get_full_1h_candle(slug: str | None = None) -> dict | None:
+    """
+    Retorna la vela 1H completa de Binance con todos los campos OHLCV.
+    Mismo throttle de hosts que get_open_1h_binance().
+    Devuelve None si todos los hosts fallan.
+ 
+    Campos devueltos:
+      open_time_ms, open_price, high_price, low_price, close_price,
+      volume_btc, volume_usdt, trades_count
+    """
+    now = datetime.now(timezone.utc)
+    params: dict = {"symbol": "BTCUSDT", "interval": "1h", "limit": "1"}
+    if slug:
+        start_ms = _slug_to_candle_start_ms(slug, now)
+        if start_ms:
+            params["startTime"] = str(start_ms)
+            logger.debug(f"[SCANNER] get_full_1h_candle startTime={start_ms}")
+ 
+    hosts = [
+        "https://api.binance.com/api/v3/klines",
+        "https://api1.binance.com/api/v3/klines",
+        "https://api2.binance.com/api/v3/klines",
+        "https://api3.binance.com/api/v3/klines",
+    ]
+    for host in hosts:
+        try:
+            r = requests.get(host, params=params, timeout=TIMEOUT)
+            r.raise_for_status()
+            klines = r.json()
+            if klines:
+                k = klines[0]
+                candle = {
+                    "open_time_ms": int(k[0]),
+                    "open_price":   float(k[1]),
+                    "high_price":   float(k[2]),
+                    "low_price":    float(k[3]),
+                    "close_price":  float(k[4]),
+                    "volume_btc":   float(k[5]),
+                    "volume_usdt":  float(k[7]),
+                    "trades_count": int(k[8]),
+                }
+                logger.info(
+                    f"[SCANNER] get_full_1h_candle OK — "
+                    f"open=${candle['open_price']:,.2f}  "
+                    f"vol={candle['volume_btc']:.2f}BTC  "
+                    f"trades={candle['trades_count']}"
+                )
+                return candle
+        except Exception as e:
+            logger.warning(f"[SCANNER] get_full_1h_candle ({host}): {e}")
+    return None
 # Alias público — usado por command_handler para verificación CLOB
 get_clob_price = _fetch_live_price
