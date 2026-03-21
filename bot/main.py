@@ -32,6 +32,23 @@ def setup_logging(cfg: dict):
         ],
     )
 
+    # ── Silenciar loggers de bajo nivel que saturan Railway ───────────────
+    # hpack/httpcore/httpx generan cientos de líneas DEBUG por cada request
+    # HTTP2, agotando el rate limit de logs de Railway (255 msgs dropeados).
+    for _noisy in (
+        "hpack",
+        "hpack.hpack",
+        "hpack.table",
+        "httpcore",
+        "httpcore.http2",
+        "httpcore.http11",
+        "httpcore.connection",
+        "httpx",
+        "urllib3",
+        "urllib3.connectionpool",
+    ):
+        logging.getLogger(_noisy).setLevel(logging.WARNING)
+
 
 def main():
     print("=" * 60)
