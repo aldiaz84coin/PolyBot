@@ -126,26 +126,29 @@ function HourSelector({ selected, onChange }) {
 }
 
 // ── Gráfico: evolución de precio de tokens en el tiempo ──────────────────────
+// v1.1 — FIX: XAxis numérico (ts_ms) para que ReferenceLine se posicione correctamente.
+//         Con XAxis categórico (strings) Recharts no puede interpolar la posición
+//         exacta de x={time} y las líneas no se renderizan o aparecen fuera de lugar.
 
 function TokenPriceChart({ data, loading }) {
   if (loading) return <div style={{ color: C.dim, fontSize: 10, padding: 20 }}>Cargando datos…</div>;
   if (!data.length) return <div style={{ color: "#333", fontSize: 10, padding: 20 }}>Sin datos para el filtro seleccionado.</div>;
 
-  // Agregar ventanas al dataset y formatear tiempo para el eje X
+  // Usar timestamp numérico como dataKey del eje X
   const chartData = data.map(row => ({
     ...row,
-    time: fmtTime(row.ts),
+    ts_ms:     new Date(row.ts).getTime(),   // número para XAxis — garantiza posicionamiento exacto
     yes_price: row.yes_price ? parseFloat(row.yes_price) : null,
     no_price:  row.no_price  ? parseFloat(row.no_price)  : null,
     btc_price: row.btc_price ? parseFloat(row.btc_price) : null,
   }));
 
-  // Encontrar cambios de ventana para añadir líneas de referencia
+  // Detectar cambios de ventana usando ts_ms
   const windowChanges = [];
   let prevVentana = null;
-  chartData.forEach((row, i) => {
+  chartData.forEach((row) => {
     if (row.ventana && row.ventana !== prevVentana) {
-      windowChanges.push({ index: i, ventana: row.ventana, time: row.time });
+      windowChanges.push({ ts_ms: row.ts_ms, ventana: row.ventana });
       prevVentana = row.ventana;
     }
   });
@@ -155,9 +158,13 @@ function TokenPriceChart({ data, loading }) {
       <LineChart data={chartData} margin={{ top: 5, right: 10, left: 0, bottom: 5 }}>
         <CartesianGrid strokeDasharray="3 3" stroke="#0a0a18" />
         <XAxis
-          dataKey="time"
+          dataKey="ts_ms"
+          type="number"
+          scale="time"
+          domain={["dataMin", "dataMax"]}
+          tickFormatter={v => fmtTime(new Date(v).toISOString())}
           tick={{ fontSize: 8, fill: "#444" }}
-          interval="preserveStartEnd"
+          tickCount={6}
           tickLine={false}
         />
         <YAxis
@@ -167,25 +174,28 @@ function TokenPriceChart({ data, loading }) {
           width={36}
           tickLine={false}
         />
-        <Tooltip content={<TokenTooltip />} />
+        <Tooltip
+          content={<TokenTooltip />}
+          labelFormatter={v => fmtTime(new Date(v).toISOString())}
+        />
         <Legend
           wrapperStyle={{ fontSize: 9, color: C.dim }}
           iconType="circle"
           iconSize={6}
         />
-        {/* Líneas de referencia por cambio de ventana */}
-        {windowChanges.map(({ time, ventana }) => (
+        {/* Líneas de referencia por cambio de ventana — ahora con eje numérico funcionan */}
+        {windowChanges.map(({ ts_ms, ventana }) => (
           <ReferenceLine
-            key={`${time}-${ventana}`}
-            x={time}
-            stroke={VENTANA_COLORS[ventana] || "#333"}
+            key={`${ts_ms}-${ventana}`}
+            x={ts_ms}
+            stroke={VENTANA_COLORS[ventana] || "#555"}
             strokeDasharray="4 4"
-            strokeWidth={1}
+            strokeWidth={1.5}
             label={{
               value: ventana,
-              position: "top",
-              fontSize: 8,
-              fill: VENTANA_COLORS[ventana] || "#333",
+              position: "insideTopRight",
+              fontSize: 9,
+              fill: VENTANA_COLORS[ventana] || "#555",
             }}
           />
         ))}
