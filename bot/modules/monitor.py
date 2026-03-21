@@ -985,14 +985,12 @@ def run(cfg: dict):
             # ── Dashboard state reporting ──────────────────────────────────
             try:
                 report_state(
-                    cfg       = cfg,
-                    price     = price,
-                    target    = target,
-                    mins_left = mins_left,
-                    simulate  = simulate,
-                    active_bet= active_bet,
-                    ops_hoy   = ops_hoy,
-                    max_ops   = max_ops,
+                    market        = market,
+                    target        = target,
+                    price         = price,
+                    ops_today     = ops_hoy,
+                    bet_active    = active_bet is not None,
+                    simulate_mode = simulate,
                 )
             except Exception:
                 pass
