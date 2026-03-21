@@ -1,29 +1,38 @@
 """
 claimer.py — Redención automática de tokens ganadores on-chain (Polygon)
 
-v2.1 — SELL FALLBACK + RETRY MEJORADO
-  - RETRY_SCHEDULE: primer intento con 3 min de espera (el mercado no se resuelve
-    on-chain instantáneamente — el primer intento inmediato siempre fallaba).
-  - Ventana total extendida a ~2h 8 min (8 intentos vs 7 anteriores).
-  - sell_fallback_clob(): si se agotan todos los reintentos del claim, intenta
-    vender los tokens ganadores en el CLOB a precio de mercado (~0.999).
-    Esto recupera el valor sin necesidad de resolución on-chain.
-  - _get_winning_token_id(): extrae el token_id ganador del market dict incluido
-    en bet (tokens list con outcome Yes/No, o fallback a clobTokenIds).
-  - _fetch_clob_midpoint(): precio live del token ganador en el CLOB.
-  - notify_claim_scheduled(): nueva notificación al lanzar el hilo de claim,
-    informa al usuario que el primer intento será en 3 min.
+v3.0 — REDISEÑO COMPLETO DEL TIMING + DIAGNÓSTICO MEJORADO
+  - RETRY_SCHEDULE: [7200, 3600] — solo 2 intentos:
+      · Intento 1: espera 2h tras el cierre del mercado ("dentro de 2 ventanas")
+      · Intento 2: +1h adicional si el primero falla
+      · Total ventana: ~3h desde el cierre
+    Rationale: Polymarket puede tardar 1-2h en resolver on-chain.
+    Intentar antes siempre da "result for condition not received yet".
 
+  - _check_condition_resolved(): PRE-CHECK ON-CHAIN antes de estimate_gas.
+    Llama payoutDenominator() en el CTF — si devuelve 0, el mercado aún no
+    está resuelto y el intento se descarta sin consumir gas ni generar ruido.
+    Si devuelve > 0, el mercado está resuelto y procedemos con redeemPositions.
+
+  - NOTIFICACIONES ENRIQUECIDAS: cada mensaje incluye slug del mercado,
+    conditionId (primeros 20 chars), dirección, stake, tokens y odds.
+
+  - SELL FALLBACK ROBUSTO:
+    · _get_winning_token_id_with_diagnostics(): devuelve (token_id, info_debug)
+      con diagnóstico de qué campos se encontraron en el market dict.
+    · _fetch_clob_midpoint_with_retry(): 3 reintentos con 10s de espera.
+    · Si midpoint < 0.80 o None, la razón exacta se loguea y notifica.
+    · URL directa al mercado en Polymarket para reclamo manual.
+
+  - WORKAROUND ADICIONAL en fallback: si sell_position() falla en el precio
+    normal, se reintenta con precio más agresivo (mid - 0.015) antes de rendir.
+
+v2.1 — SELL FALLBACK + RETRY MEJORADO (8 intentos, 3min-2h)
 v2.0 — RETRY + FALLBACK + NOTIFICACIONES
-  - claim_with_retry(): reintenta según RETRY_SCHEDULE (hasta ~64 min total)
-  - 4 RPCs de Polygon con fallback automático
-  - Notificaciones Telegram para: reintento, éxito con TX, fallo definitivo
-  - Se ejecuta en hilo daemon desde monitor.py → no bloquea el loop principal
-  - condition_id acepta formato "0x..." y sin prefijo
-  - estimate_gas detecta si el mercado no está resuelto aún (error esperado)
 
 Destino: bot/modules/claimer.py
 """
+import json as _json
 import logging
 import time
 
@@ -51,7 +60,19 @@ CTF_ABI = [
         ],
         "outputs": [],
         "stateMutability": "nonpayable",
-    }
+    },
+    {
+        # v3.0: Para pre-check de resolución sin gastar gas
+        "name": "payoutDenominator",
+        "type": "function",
+        "inputs": [
+            {"name": "conditionId", "type": "bytes32"},
+        ],
+        "outputs": [
+            {"name": "", "type": "uint256"},
+        ],
+        "stateMutability": "view",
+    },
 ]
 
 # ── RPCs de Polygon (se prueban en orden; el primero que responde se usa) ─────
@@ -62,25 +83,22 @@ POLYGON_RPCS = [
     "https://rpc-mainnet.matic.quiknode.pro",
 ]
 
-# ── CLOB endpoint para midpoint ───────────────────────────────────────────────
-CLOB_MIDPOINT = "https://clob.polymarket.com/midpoint"
+# ── Endpoints externos ────────────────────────────────────────────────────────
+CLOB_MIDPOINT  = "https://clob.polymarket.com/midpoint"
+GAMMA_MARKETS  = "https://gamma-api.polymarket.com/markets"
 
 # ── Calendario de reintentos ──────────────────────────────────────────────────
-# Cada valor = segundos de ESPERA ANTES de ese intento.
-# v2.1 FIX: RETRY_SCHEDULE[0] = 180 (3 min) — el mercado no se resuelve
-# on-chain instantáneamente; el intento inmediato previo siempre fallaba.
+# v3.0: Solo 2 intentos, bien espaciados.
 #
-# Intento 1 →  3 min  (esperar resolución on-chain inicial)
-# Intento 2 → +2 min  (5 min total)
-# Intento 3 → +3 min  (8 min total)
-# Intento 4 → +5 min  (13 min total)
-# Intento 5 → +10 min (23 min total)
-# Intento 6 → +15 min (38 min total)
-# Intento 7 → +30 min (68 min total ~1h)
-# Intento 8 → +60 min (128 min total ~2h)
-# ─────────────────────────────────────────────────────────────────
-# Si todos fallan → SELL FALLBACK en CLOB (~0.999)
-RETRY_SCHEDULE = [180, 120, 180, 300, 600, 900, 1800, 3600]
+# El mercado BTC hourly tarda entre 1-2h en resolverse on-chain.
+# Intentar antes de ese punto siempre da "result for condition not received yet".
+#
+# Intento 1 → 2h (7200s)  — "dentro de 2 ventanas" desde el cierre
+# Intento 2 → +1h (3600s) — si el primero falla, última oportunidad on-chain
+# ─────────────────────────────────────────────────────────────────────────────
+# Si ambos fallan → SELL FALLBACK (2 intentos de precio)
+# Si SELL también falla → aviso manual con URL directa al mercado
+RETRY_SCHEDULE = [7200, 3600]
 
 
 # ── Helpers internos ──────────────────────────────────────────────────────────
@@ -111,48 +129,161 @@ def _condition_id_to_bytes(condition_id: str) -> bytes:
     return bytes.fromhex(hex_str)
 
 
-def _get_winning_token_id(bet: dict) -> str | None:
+def _check_condition_resolved(condition_id: str, w3: Web3) -> tuple[bool, int]:
     """
-    Extrae el token_id del lado ganador (YES si UP, NO si DOWN).
-    Busca primero en market["tokens"] (lista con outcome), luego en clobTokenIds.
+    v3.0: Pre-check on-chain ANTES de llamar estimate_gas.
+    Llama payoutDenominator(conditionId) en el CTF.
+
+    Returns:
+        (is_resolved: bool, payout_denominator: int)
+        - is_resolved=True  → mercado resuelto, proceder con redeemPositions
+        - is_resolved=False → mercado aún no resuelto, esperar
+    """
+    try:
+        ctf = w3.eth.contract(
+            address=w3.to_checksum_address(CTF_ADDRESS),
+            abi=CTF_ABI,
+        )
+        cond_bytes  = _condition_id_to_bytes(condition_id)
+        denom       = ctf.functions.payoutDenominator(cond_bytes).call()
+        is_resolved = denom > 0
+        logger.info(
+            f"[CLAIMER] 🔍 payoutDenominator = {denom} "
+            f"→ {'✅ RESUELTO' if is_resolved else '⏳ NO RESUELTO AÚN'}"
+        )
+        return is_resolved, denom
+    except Exception as e:
+        logger.warning(
+            f"[CLAIMER] ⚠ payoutDenominator check falló: {e} "
+            f"— asumiendo no resuelto"
+        )
+        return False, 0
+
+
+def _check_gamma_resolution(condition_id: str) -> dict:
+    """
+    v3.0: Consulta Gamma API para estado de resolución del mercado.
+    Útil para enriquecer el error cuando el on-chain pre-check falla.
+    """
+    try:
+        r = requests.get(
+            GAMMA_MARKETS,
+            params={"condition_id": condition_id},
+            timeout=8,
+        )
+        r.raise_for_status()
+        data = r.json()
+        if isinstance(data, list) and data:
+            m = data[0]
+            return {
+                "resolved":   m.get("resolved", False),
+                "resolution": m.get("resolution", "—"),
+                "question":   (m.get("question", "—") or "")[:80],
+                "slug":       m.get("slug", "—"),
+                "closed":     m.get("closed", False),
+            }
+        return {"resolved": False, "resolution": "sin datos en Gamma"}
+    except Exception as e:
+        logger.warning(f"[CLAIMER] ⚠ Gamma check falló: {e}")
+        return {"resolved": False, "resolution": f"error Gamma: {e}"}
+
+
+def _get_winning_token_id_with_diagnostics(bet: dict) -> tuple[str | None, str]:
+    """
+    v3.0: Extrae el token_id del lado ganador con diagnóstico completo.
+    Returns:
+        (token_id: str | None, diagnostics: str)
     """
     market    = bet.get("market", {})
     direction = bet.get("direction", "UP")
-    tokens    = market.get("tokens", [])
 
-    if isinstance(tokens, list) and tokens:
-        for t in tokens:
+    diag = []
+    market_keys = list(market.keys()) if market else []
+    diag.append(f"market_keys={market_keys}")
+
+    # Intento 1: tokens list con outcome
+    tokens_list = market.get("tokens", [])
+    diag.append(
+        f"tokens_field={'present' if tokens_list else 'ABSENT'} "
+        f"(len={len(tokens_list) if isinstance(tokens_list, list) else 'N/A'})"
+    )
+
+    if isinstance(tokens_list, list) and tokens_list:
+        for t in tokens_list:
             outcome = t.get("outcome", "").lower()
             if direction == "UP" and outcome == "yes":
-                return t.get("token_id")
+                tid = t.get("token_id") or t.get("tokenId")
+                diag.append(f"✅ via tokens[outcome=yes] → {(tid or 'NONE')[:20]}")
+                return tid, " | ".join(diag)
             if direction == "DOWN" and outcome == "no":
-                return t.get("token_id")
+                tid = t.get("token_id") or t.get("tokenId")
+                diag.append(f"✅ via tokens[outcome=no] → {(tid or 'NONE')[:20]}")
+                return tid, " | ".join(diag)
+        diag.append(f"tokens present but no matching outcome for {direction}")
+    else:
+        diag.append("tokens list empty or absent")
 
-    # Fallback: clobTokenIds (índice 0=YES/UP, 1=NO/DOWN)
-    import json as _json
+    # Intento 2: clobTokenIds (índice 0=YES/UP, 1=NO/DOWN)
     clob_raw = market.get("clobTokenIds")
+    diag.append(f"clobTokenIds={'present' if clob_raw else 'ABSENT'}")
+
     if clob_raw:
         try:
             clob_ids = _json.loads(clob_raw) if isinstance(clob_raw, str) else clob_raw
             if isinstance(clob_ids, list) and len(clob_ids) >= 2:
-                return clob_ids[0] if direction == "UP" else clob_ids[1]
-        except Exception:
-            pass
+                idx = 0 if direction == "UP" else 1
+                tid = clob_ids[idx]
+                diag.append(f"✅ via clobTokenIds[{idx}] → {str(tid)[:20]}")
+                return tid, " | ".join(diag)
+            else:
+                diag.append(f"clobTokenIds malformed: {clob_ids}")
+        except Exception as ex:
+            diag.append(f"clobTokenIds parse error: {ex}")
+    else:
+        diag.append("clobTokenIds not in market dict")
 
-    logger.warning(f"[CLAIMER] ⚠ No se pudo extraer token_id ganador del mercado")
+    # Intento 3: token_id directo en bet
+    direct = bet.get("token_id") or bet.get("winning_token_id")
+    if direct:
+        diag.append(f"✅ via bet.token_id → {str(direct)[:20]}")
+        return direct, " | ".join(diag)
+
+    diag.append("❌ ALL ATTEMPTS FAILED — no token_id extractable")
+    return None, " | ".join(diag)
+
+
+def _fetch_clob_midpoint_with_retry(token_id: str, max_retries: int = 3) -> float | None:
+    """v3.0: Consulta midpoint CLOB con hasta 3 reintentos espaciados 10s."""
+    for attempt in range(1, max_retries + 1):
+        try:
+            r = requests.get(CLOB_MIDPOINT, params={"token_id": token_id}, timeout=8)
+            r.raise_for_status()
+            mid = r.json().get("mid")
+            if mid is not None:
+                logger.info(
+                    f"[CLAIMER] 📊 Midpoint CLOB (intento {attempt}/{max_retries}): "
+                    f"{float(mid):.6f}"
+                )
+                return float(mid)
+            logger.warning(
+                f"[CLAIMER] ⚠ midpoint=null en respuesta CLOB (intento {attempt})"
+            )
+        except Exception as e:
+            logger.warning(
+                f"[CLAIMER] ⚠ Midpoint CLOB intento {attempt}/{max_retries} falló: {e}"
+            )
+        if attempt < max_retries:
+            time.sleep(10)
     return None
 
 
-def _fetch_clob_midpoint(token_id: str) -> float | None:
-    """Consulta el precio live del token en el CLOB."""
-    try:
-        r = requests.get(CLOB_MIDPOINT, params={"token_id": token_id}, timeout=8)
-        r.raise_for_status()
-        mid = r.json().get("mid")
-        return float(mid) if mid is not None else None
-    except Exception as e:
-        logger.warning(f"[CLAIMER] ⚠ No se pudo obtener midpoint CLOB: {e}")
-        return None
+def _get_market_url(bet: dict) -> str:
+    """Devuelve URL directa al mercado en Polymarket para acción manual."""
+    market = bet.get("market", {})
+    slug   = market.get("slug", "")
+    if slug:
+        return f"https://polymarket.com/event/{slug}"
+    return "https://polymarket.com/portfolio"
 
 
 # ── Núcleo: un intento de redención ──────────────────────────────────────────
@@ -161,24 +292,50 @@ def _redimir_once(
     condition_id: str,
     direction: str,
     private_key: str,
+    bet: dict | None = None,
 ) -> str:
     """
-    Intento único de redeemPositions() con fallback de RPCs.
-    Devuelve tx_hash (hex string). Lanza excepción si falla.
+    v3.0: Intento único de redeemPositions() con:
+      1. Pre-check payoutDenominator — falla rápido + consulta Gamma si no resuelto
+      2. Logging detallado con mercado, wallet, gas, RPC usado
+      3. Lanza excepción descriptiva si falla
+
+    Devuelve tx_hash (hex string).
     """
     index_set = [1] if direction == "UP" else [2]
+    market = bet.get("market", {}) if bet else {}
+    slug   = market.get("slug", "—")
 
     logger.info(
-        f"[CLAIMER] Iniciando redención\n"
-        f"          Direction    : {direction}  →  index_set={index_set}\n"
-        f"          Condition ID : {condition_id}"
+        f"[CLAIMER] ════════════════════════════════════════\n"
+        f"          Intento de redención on-chain\n"
+        f"          Mercado   : {slug}\n"
+        f"          Direction : {direction}  →  index_set={index_set}\n"
+        f"          CondID    : {condition_id[:20]}...{condition_id[-8:]}\n"
+        f"          ════════════════════════════════════════"
     )
 
     w3      = _connect_polygon()
     account = w3.eth.account.from_key(private_key)
     logger.info(f"[CLAIMER] Wallet: {account.address}")
 
-    # Verificar balance POL (gas)
+    # ── PRE-CHECK: ¿está el mercado resuelto on-chain? ───────────────────────
+    is_resolved, payout_denom = _check_condition_resolved(condition_id, w3)
+    if not is_resolved:
+        gamma = _check_gamma_resolution(condition_id)
+        raise RuntimeError(
+            f"Mercado NO resuelto on-chain (payoutDenominator=0). "
+            f"Gamma → resolved={gamma.get('resolved')}, "
+            f"resolution='{gamma.get('resolution')}', "
+            f"closed={gamma.get('closed')}"
+        )
+
+    logger.info(
+        f"[CLAIMER] ✅ Resuelto on-chain (payoutDenominator={payout_denom}). "
+        f"Procediendo con redeemPositions..."
+    )
+
+    # Balance POL
     try:
         bal_pol = float(w3.from_wei(w3.eth.get_balance(account.address), "ether"))
         logger.info(f"[CLAIMER] Balance POL: {bal_pol:.6f}")
@@ -204,13 +361,14 @@ def _redimir_once(
         index_set,
     )
 
-    # estimate_gas falla si el mercado no está resuelto on-chain todavía
+    # estimate_gas (solo falla si ya fue reclamado u otro error real post-resolución)
     try:
         gas_estimate = fn.estimate_gas({"from": account.address})
         gas = int(gas_estimate * GAS_MARGIN)
     except Exception as e:
         raise RuntimeError(
-            f"estimate_gas falló (mercado no resuelto aún, o ya reclamado): {e}"
+            f"estimate_gas falló TRAS confirmar resolución on-chain. "
+            f"Posiblemente ya reclamado anteriormente. Error: {e}"
         ) from e
 
     gas_price    = w3.eth.gas_price
@@ -260,9 +418,13 @@ def _redimir_once(
 
 def _sell_fallback_clob(bet: dict, cfg: dict) -> None:
     """
-    v2.1: Fallback cuando el claim on-chain falla definitivamente.
-    Vende los tokens ganadores en el CLOB al precio de mercado actual (~0.999).
-    Notifica el resultado (éxito o fallo) por Telegram.
+    v3.0: Fallback cuando el claim on-chain falla definitivamente.
+
+    Mejoras vs v2.1:
+      - Diagnóstico completo de qué campos tiene market dict (token_id extraction)
+      - Retry de midpoint CLOB (3 intentos × 10s)
+      - 2 intentos de SELL: precio normal y precio agresivo
+      - URL directa al mercado Polymarket en el mensaje de fallo manual
     """
     from .notifier import notify_sell_fallback_ok, notify_sell_fallback_failed
 
@@ -270,48 +432,113 @@ def _sell_fallback_clob(bet: dict, cfg: dict) -> None:
     stake       = bet.get("stake", 0.0)
     entry_odds  = bet.get("odds", 0.5)
     tokens_held = round(stake / max(entry_odds, 0.001), 4)
+    market      = bet.get("market", {})
+    slug        = market.get("slug", "—")
+    market_url  = _get_market_url(bet)
 
-    token_id = _get_winning_token_id(bet)
-    if not token_id:
-        msg = "No se pudo extraer token_id — SELL no ejecutado"
-        logger.error(f"[CLAIMER] ❌ {msg}")
-        notify_sell_fallback_failed(cfg, bet, msg)
-        return
-
-    # Precio live del token
-    mid = _fetch_clob_midpoint(token_id)
-    if mid is None or mid < 0.80:
-        msg = f"Midpoint CLOB no disponible o muy bajo ({mid}) — SELL no ejecutado"
-        logger.error(f"[CLAIMER] ❌ {msg}")
-        notify_sell_fallback_failed(cfg, bet, msg)
-        return
-
-    # Precio de venta: midpoint redondeado a 2 decimales, con un pequeño margen
-    # para garantizar fill. Mínimo 0.90.
-    sell_price = max(0.90, round(mid - 0.005, 3))
     logger.info(
-        f"[CLAIMER] 💰 SELL FALLBACK\n"
-        f"          Token    : {token_id[:16]}...\n"
-        f"          Tokens   : {tokens_held}\n"
-        f"          Midpoint : {mid:.4f}  →  Sell @ {sell_price:.4f}\n"
-        f"          USDC est.: ~{tokens_held * sell_price:.2f}"
+        f"[CLAIMER] 🔄 SELL FALLBACK iniciado\n"
+        f"          Mercado   : {slug}\n"
+        f"          URL       : {market_url}\n"
+        f"          Dirección : {direction}\n"
+        f"          Stake     : {stake} USDC\n"
+        f"          Tokens    : {tokens_held}\n"
+        f"          Odds ent. : {entry_odds}"
     )
 
+    # ── Extraer token_id con diagnóstico ─────────────────────────────────────
+    token_id, token_diag = _get_winning_token_id_with_diagnostics(bet)
+    logger.info(f"[CLAIMER] 🔍 Token ID diagnóstico:\n          {token_diag}")
+
+    if not token_id:
+        msg = (
+            f"No se pudo extraer token_id del mercado.\n"
+            f"Diagnóstico: {token_diag[:400]}"
+        )
+        logger.error(f"[CLAIMER] ❌ {msg}")
+        notify_sell_fallback_failed(cfg, bet, msg, market_url=market_url)
+        return
+
+    logger.info(
+        f"[CLAIMER] Token ganador: {token_id[:20]}...{token_id[-8:] if len(token_id) > 28 else ''}"
+    )
+
+    # ── Midpoint CLOB con retry ───────────────────────────────────────────────
+    mid = _fetch_clob_midpoint_with_retry(token_id, max_retries=3)
+
+    if mid is None:
+        msg = (
+            f"Midpoint CLOB no disponible tras 3 intentos (×10s).\n"
+            f"Token: {token_id[:24]}..."
+        )
+        logger.error(f"[CLAIMER] ❌ {msg}")
+        notify_sell_fallback_failed(cfg, bet, msg, market_url=market_url)
+        return
+
+    if mid < 0.80:
+        msg = (
+            f"Midpoint CLOB demasiado bajo: {mid:.4f} (mínimo 0.80).\n"
+            f"El mercado puede no haber resuelto a favor o aún estar en proceso.\n"
+            f"Token: {token_id[:24]}..."
+        )
+        logger.error(f"[CLAIMER] ❌ {msg}")
+        notify_sell_fallback_failed(cfg, bet, msg, market_url=market_url)
+        return
+
+    # ── Intento 1: precio normal ──────────────────────────────────────────────
     from .strategy import sell_position
-    market = bet.get("market", {})
+
+    sell_price = max(0.90, round(mid - 0.005, 3))
+    logger.info(
+        f"[CLAIMER] 💰 SELL FALLBACK — Intento 1 (precio normal)\n"
+        f"          Token    : {token_id[:24]}...\n"
+        f"          Tokens   : {tokens_held}\n"
+        f"          Midpoint : {mid:.6f}  →  Sell @ {sell_price:.4f}\n"
+        f"          USDC est.: ~{tokens_held * sell_price:.4f}"
+    )
+
     resp = sell_position(token_id, tokens_held, sell_price, cfg, market)
 
     if resp:
         usdc_received = round(tokens_held * sell_price, 4)
         logger.info(
-            f"[CLAIMER] ✅ SELL ejecutado — "
-            f"~{usdc_received:.4f} USDC recuperados"
+            f"[CLAIMER] ✅ SELL ejecutado — ~{usdc_received:.4f} USDC recuperados"
         )
         notify_sell_fallback_ok(cfg, bet, resp, sell_price, usdc_received)
-    else:
-        msg = "sell_position() devolvió None — orden no ejecutada"
-        logger.error(f"[CLAIMER] ❌ {msg}")
-        notify_sell_fallback_failed(cfg, bet, msg)
+        return
+
+    # ── Intento 2: precio agresivo (workaround adicional) ────────────────────
+    logger.warning(
+        "[CLAIMER] ⚠ Intento 1 SELL falló — reintentando con precio más agresivo..."
+    )
+    time.sleep(5)
+
+    sell_price_2 = max(0.85, round(mid - 0.015, 3))
+    logger.info(
+        f"[CLAIMER] 💰 SELL FALLBACK — Intento 2 (precio agresivo)\n"
+        f"          Sell @ {sell_price_2:.4f}  (antes: {sell_price:.4f})\n"
+        f"          USDC est.: ~{tokens_held * sell_price_2:.4f}"
+    )
+
+    resp2 = sell_position(token_id, tokens_held, sell_price_2, cfg, market)
+
+    if resp2:
+        usdc_received = round(tokens_held * sell_price_2, 4)
+        logger.info(
+            f"[CLAIMER] ✅ SELL exitoso en intento 2 — ~{usdc_received:.4f} USDC"
+        )
+        notify_sell_fallback_ok(cfg, bet, resp2, sell_price_2, usdc_received)
+        return
+
+    # ── Ambos intentos fallaron ───────────────────────────────────────────────
+    msg = (
+        f"sell_position() devolvió None en 2 intentos.\n"
+        f"Precio 1: {sell_price:.4f}  |  Precio 2: {sell_price_2:.4f}\n"
+        f"Token: {token_id[:24]}...\n"
+        f"Midpoint: {mid:.6f}"
+    )
+    logger.error(f"[CLAIMER] ❌ {msg}")
+    notify_sell_fallback_failed(cfg, bet, msg, market_url=market_url)
 
 
 # ── API pública: intento único (compatibilidad) ───────────────────────────────
@@ -337,21 +564,16 @@ def redimir_posicion(market: dict, direction: str, cfg: dict) -> str:
 
 def claim_with_retry(bet: dict, cfg: dict) -> None:
     """
-    Reintenta el claim siguiendo RETRY_SCHEDULE.
+    v3.0: 2 intentos espaciados 2h + 1h. Luego SELL FALLBACK.
     Diseñado para ejecutarse en un hilo daemon (no bloquea el loop del bot).
 
-    v2.1:
-      - Primer intento con 3 min de espera (mercado no resuelto on-chain aún).
-      - Ventana total ~2h 8 min (8 intentos).
-      - Si todos los intentos fallan → intenta SELL FALLBACK en CLOB.
-
     Notificaciones Telegram:
-      · notify_claim_scheduled   — al lanzar el hilo (primer intento en 3 min)
-      · notify_claim_retrying    — antes de cada reintento (2º en adelante)
-      · notify_claim_ok          — en cuanto confirma on-chain
-      · notify_claim_failed      — si se agotan todos los intentos
-      · notify_sell_fallback_ok  — si el SELL FALLBACK tuvo éxito
-      · notify_sell_fallback_failed — si el SELL FALLBACK también falló
+      · notify_claim_scheduled   — al lanzar (primer intento en 2h)
+      · notify_claim_retrying    — antes del 2º intento
+      · notify_claim_ok          — claim confirmado on-chain
+      · notify_claim_failed      — si ambos intentos fallaron
+      · notify_sell_fallback_ok  — SELL CLOB exitoso
+      · notify_sell_fallback_failed — todo falló + URL manual
 
     Uso en monitor.py:
         import threading
@@ -373,6 +595,8 @@ def claim_with_retry(bet: dict, cfg: dict) -> None:
     direction = bet.get("direction", "UP")
     tokens    = bet.get("tokens", 0.0)
     stake     = bet.get("stake", 0.0)
+    odds      = bet.get("odds", 0.5)
+    slug      = market.get("slug", "—")
 
     condition_id = (
         market.get("conditionId")
@@ -380,11 +604,20 @@ def claim_with_retry(bet: dict, cfg: dict) -> None:
     )
     private_key = cfg["polymarket"]["private_key"]
 
+    logger.info(
+        f"[CLAIMER] 🚀 claim_with_retry iniciado\n"
+        f"          Mercado   : {slug}\n"
+        f"          Dirección : {direction}\n"
+        f"          Stake     : {stake} USDC\n"
+        f"          Tokens    : {tokens}\n"
+        f"          Odds ent. : {odds}\n"
+        f"          CondID    : {(condition_id[:20] + '...') if condition_id else 'AUSENTE'}"
+    )
+
     # Validación temprana
     if not condition_id:
         logger.error(
-            "[CLAIMER] ❌ claim_with_retry: conditionId ausente en active_bet — "
-            "no se puede reclamar"
+            "[CLAIMER] ❌ conditionId ausente — pasando directamente a SELL FALLBACK"
         )
         notify_claim_failed(cfg, bet, "conditionId no disponible en el mercado", attempts=0)
         _sell_fallback_clob(bet, cfg)
@@ -393,25 +626,23 @@ def claim_with_retry(bet: dict, cfg: dict) -> None:
     max_attempts = len(RETRY_SCHEDULE)
     last_error   = "desconocido"
 
-    # Notificación inicial: el usuario sabe que el bot esperará antes del primer intento
+    # Notificación inicial
     first_wait = RETRY_SCHEDULE[0]
     notify_claim_scheduled(cfg, bet, first_wait_secs=first_wait, max_attempts=max_attempts)
     logger.info(
-        f"[CLAIMER] ⏳ Claim programado — primer intento en {first_wait}s "
-        f"({first_wait//60}m {first_wait%60}s)"
+        f"[CLAIMER] ⏳ Primer intento en {first_wait}s "
+        f"({first_wait // 3600}h {(first_wait % 3600) // 60}m)"
     )
 
     for attempt_idx, wait_secs in enumerate(RETRY_SCHEDULE):
         attempt_num = attempt_idx + 1
 
-        # Esperar antes del intento
         if wait_secs > 0:
             logger.info(
-                f"[CLAIMER] ⏳ Esperando {wait_secs}s antes del intento "
-                f"{attempt_num}/{max_attempts}..."
+                f"[CLAIMER] ⏳ Esperando {wait_secs}s "
+                f"({wait_secs // 3600}h {(wait_secs % 3600) // 60}m) "
+                f"antes del intento {attempt_num}/{max_attempts}..."
             )
-            # La notificación de reintento se envía desde el 2º intento en adelante
-            # (el primero ya fue notificado por notify_claim_scheduled)
             if attempt_num > 1:
                 notify_claim_retrying(
                     cfg, bet,
@@ -422,25 +653,34 @@ def claim_with_retry(bet: dict, cfg: dict) -> None:
                 )
             time.sleep(wait_secs)
 
-        logger.info(f"[CLAIMER] 🔄 Intento {attempt_num}/{max_attempts}...")
+        logger.info(
+            f"[CLAIMER] 🔄 ══ Intento {attempt_num}/{max_attempts} ══\n"
+            f"          Mercado   : {slug}\n"
+            f"          Dirección : {direction}\n"
+            f"          CondID    : {condition_id[:20]}...\n"
+            f"          Stake     : {stake} USDC  |  Tokens: {tokens}  |  Odds: {odds}"
+        )
 
         try:
-            tx_hash  = _redimir_once(condition_id, direction, private_key)
-            usdc_est = round(tokens, 4)   # tokens ganadores valen 1 USDC c/u
+            tx_hash  = _redimir_once(condition_id, direction, private_key, bet=bet)
+            usdc_est = round(tokens, 4)
             notify_claim_ok(cfg, bet, tx_hash, attempt=attempt_num, usdc_est=usdc_est)
             logger.info(f"[CLAIMER] ✅ Claim exitoso en intento {attempt_num}")
-            return  # ← éxito, terminar el hilo
+            return
 
         except Exception as e:
             last_error = str(e)
             logger.warning(
-                f"[CLAIMER] ⚠ Intento {attempt_num}/{max_attempts} fallido: {last_error}"
+                f"[CLAIMER] ⚠ Intento {attempt_num}/{max_attempts} fallido:\n"
+                f"          {last_error}"
             )
 
-    # ── Se agotaron todos los intentos → intentar SELL FALLBACK ──────────────
+    # ── Se agotaron los intentos ──────────────────────────────────────────────
     logger.error(
-        f"[CLAIMER] ❌ Claim fallido tras {max_attempts} intentos. "
-        f"Último error: {last_error}"
+        f"[CLAIMER] ❌ Claim fallido tras {max_attempts} intentos.\n"
+        f"          Mercado   : {slug}\n"
+        f"          CondID    : {condition_id[:20]}...\n"
+        f"          Último err: {last_error}"
     )
     notify_claim_failed(cfg, bet, reason=last_error, attempts=max_attempts)
 
