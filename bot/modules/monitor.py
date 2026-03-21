@@ -444,7 +444,8 @@ def run(cfg: dict):
     # ── Estado inicial ─────────────────────────────────────────────────────
     hist_stats = _load_historical_stats(csv_path)
     _log_accumulated_stats(hist_stats, label="HISTORIAL AL ARRANCAR")
-    notify_startup_summary(cfg, hist_stats)
+    _umbrales = {"t20": cfg.get("strategy",{}).get("t20_umbral_usd","—"), "t15": cfg.get("strategy",{}).get("t15_umbral_usd","—"), "t10": cfg.get("strategy",{}).get("t10_umbral_usd","—"), "t5": cfg.get("strategy",{}).get("t5_umbral_usd","—")}
+    notify_startup_summary(cfg, "SIMULADO" if simulate else "REAL", stake, stop_pct, _umbrales)
 
     active_bet               = None
     fired_window             = None
