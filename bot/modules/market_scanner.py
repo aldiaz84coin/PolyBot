@@ -180,8 +180,17 @@ def _enrich_token_prices(tokens: list) -> list:
     """
     Reemplaza los precios de Gamma (cacheados) por precios live del CLOB.
     Fallback: mantiene precio de Gamma si el CLOB no responde.
+    Garantiza siempre que t["price"] sea float o None (nunca string).
     """
     for t in tokens:
+        # Normalizar precio Gamma a float — puede venir como string "0.54"
+        gamma_price = t.get("price")
+        if gamma_price is not None:
+            try:
+                t["price"] = float(gamma_price)
+            except (TypeError, ValueError):
+                t["price"] = None
+
         token_id = t.get("token_id")
         if not token_id:
             continue
@@ -190,7 +199,7 @@ def _enrich_token_prices(tokens: list) -> list:
             t["price"]        = live
             t["price_source"] = "clob"
         else:
-            t["price_source"] = "gamma"
+            t["price_source"] = "gamma" if t.get("price") is not None else "none"
     return tokens
 
 
@@ -284,8 +293,8 @@ def get_active_market(cfg: dict | None = None) -> dict | None:
 
     tokens = _enrich_token_prices(tokens)
 
-    yes_p = next((t["price"] for t in tokens if t.get("outcome") == "Yes"), None)
-    no_p  = next((t["price"] for t in tokens if t.get("outcome") == "No"),  None)
+    yes_p = next((t.get("price") for t in tokens if t.get("outcome") == "Yes"), None)
+    no_p  = next((t.get("price") for t in tokens if t.get("outcome") == "No"),  None)
 
     end_ms = _parse_end_ms(m)
     if not end_ms:
