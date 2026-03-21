@@ -1,6 +1,11 @@
 "use client";
 /**
- * Dashboard.jsx — v5.0
+ * Dashboard.jsx — v5.1
+ *
+ * CAMBIOS v5.1
+ *   - Import de BalanceWidget añadido
+ *   - Sección "MODO DE TRADING" convertida en grid 2 columnas:
+ *     izquierda → ModeSelector, derecha → BalanceWidget (liquidez + evolución)
  *
  * CAMBIOS v5.0 — Corrección integral (todos los bugs reportados)
  * ─────────────────────────────────────────────────────────────────────
@@ -40,16 +45,17 @@ import {
   fmt, fmtUSD,
 } from "../lib/constants";
 import { useBotState, useBTCPrice, useMarket, useClock } from "../lib/hooks";
-import PriceChart  from "./PriceChart";
-import WindowBar   from "./WindowBar";
-import MarketInfo  from "./MarketInfo";
-import BetsTable   from "./BetsTable";
-import ConfigPanel from "./ConfigPanel";
-import StatsPanel  from "./StatsPanel";
-import ModeSelector from "./ModeSelector";
+import PriceChart   from "./PriceChart";
+import WindowBar    from "./WindowBar";
+import MarketInfo   from "./MarketInfo";
+import BetsTable    from "./BetsTable";
+import ConfigPanel  from "./ConfigPanel";
+import StatsPanel   from "./StatsPanel";
+import ModeSelector  from "./ModeSelector";
+import BalanceWidget from "./BalanceWidget";
 
-const LS_KEY        = "polymarket_bets_v2";
-const BETS_POLL_MS  = 10_000;
+const LS_KEY         = "polymarket_bets_v2";
+const BETS_POLL_MS   = 10_000;
 const EVENTS_POLL_MS = 5_000;
 
 // ── Micro-componentes ─────────────────────────────────────────────────────────
@@ -124,7 +130,6 @@ export default function Dashboard() {
   const dist   = price != null && target != null ? price - target : null;
 
   // FIX v5.0 BUG 1: pasar el umbral numérico de la ventana activa, no el config completo.
-  // Si no hay ventana activa, se puede usar el t5_umbral como mínimo (o null → señal null).
   const umbral   = activeWindow ? (config[activeWindow.configKey] ?? 200) : null;
   const decision = price != null && target != null && umbral != null
     ? getDecision(price, target, umbral)
@@ -251,7 +256,6 @@ export default function Dashboard() {
           )}
         </div>
         <div style={{ display: "flex", gap: 16, alignItems: "center" }}>
-          {/* FIX v5.0: target viene de botState.target, no de mercado */}
           {target != null && (
             <span style={{ fontSize: 10, color: "var(--yellow)", letterSpacing: "0.08em" }}>
               TARGET{" "}
@@ -337,7 +341,6 @@ export default function Dashboard() {
               </div>
             )}
 
-            {/* TARGET con distancia */}
             {target != null ? (
               <div style={{ fontSize: 11, color: "#888", marginTop: 8 }}>
                 TARGET{" "}
@@ -505,10 +508,26 @@ export default function Dashboard() {
         </div>
       )}
 
-      {/* ── MODO DE TRADING ─────────────────────────────────────────────── */}
+      {/* ── MODO DE TRADING + LIQUIDEZ ──────────────────────────────────── */}
       {tab === "dashboard" && (
-        <div style={{ padding: "20px 24px", borderBottom: "1px solid var(--border)" }}>
-          <ModeSelector />
+        <div style={{
+          display: "grid",
+          gridTemplateColumns: "1fr 1fr",
+          gap: 0,
+          borderBottom: "1px solid var(--border)",
+        }}>
+          {/* Columna izquierda: modo de trading */}
+          <div style={{
+            padding: "20px 24px",
+            borderRight: "1px solid var(--border)",
+          }}>
+            <ModeSelector />
+          </div>
+
+          {/* Columna derecha: liquidez + gráfico evolución */}
+          <div style={{ padding: "20px 24px" }}>
+            <BalanceWidget />
+          </div>
         </div>
       )}
 
