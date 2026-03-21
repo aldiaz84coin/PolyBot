@@ -1,6 +1,13 @@
 """
 market_scanner.py — Descubrimiento de mercado activo y Price to Beat
 
+v6.3 — FIX TOKEN_ID CORRUPTO:
+  Gamma devuelve tokens con token_id de 1 carácter ('"') cuando clobTokenIds
+  llega como JSON string y se accede por índice de carácter en vez de elemento.
+  - _enrich_token_prices(): rechaza token_ids con len < 10 con WARNING
+  - get_active_market(): log DEBUG de token_ids crudos antes de enriquecer
+  - get_active_market(): blindar logger.info final contra yes_p/no_p = None
+
 v6.2 — FIX SLUG AÑO:
   Polymarket cambió el formato del slug para incluir el año:
     Antes : bitcoin-up-or-down-march-16-12pm-et
@@ -180,10 +187,18 @@ def _enrich_token_prices(tokens: list) -> list:
     """
     FIX v6: Reemplaza los precios de Gamma (cacheados) por precios live del CLOB.
     Fallback: mantiene precio de Gamma si el CLOB no responde.
+    FIX v6.3: rechazar token_ids corruptos (< 10 chars) — evita 404 con %22
     """
     for t in tokens:
         token_id = t.get("token_id")
         if not token_id:
+            continue
+        # FIX v6.3: un token_id válido de Polymarket tiene 66 chars (0x + 64 hex).
+        # Si llega algo más corto (ej. '"' = 1 char) es basura del parseo de clobTokenIds.
+        if len(str(token_id)) < 10:
+            logger.warning(
+                f"[SCANNER] ⚠ token_id inválido descartado (len={len(str(token_id))}): {token_id!r}"
+            )
             continue
         live = _fetch_live_price(token_id)
         if live is not None:
@@ -320,6 +335,12 @@ def get_active_market() -> dict | None:
         if tokens:
             m["tokens"] = tokens
 
+    # FIX v6.3 DEBUG: loguear token_ids crudos ANTES de enriquecer para detectar corrupción
+    logger.debug(
+        f"[SCANNER] tokens raw pre-enrich: "
+        f"{[(t.get('outcome'), repr(str(t.get('token_id', ''))[:20])) for t in tokens]}"
+    )
+
     # FIX v6: enriquecer SIEMPRE con precios live del CLOB
     tokens = _enrich_token_prices(tokens)
 
@@ -345,14 +366,16 @@ def get_active_market() -> dict | None:
     _last_slug = slug
 
     sources = {t.get("outcome"): t.get("price_source", "?") for t in tokens}
+    yes_str = f"{yes_p:.4f}" if yes_p is not None else "— (none)"
+    no_str  = f"{no_p:.4f}"  if no_p  is not None else "— (none)"
     logger.info(
         f"[SCANNER] Mercado activo:\n"
         f"           Pregunta   : {question}\n"
         f"           Slug       : {slug}\n"
         f"           ConditionID: {cond_id}\n"
         f"           Cierre     : {end_date}\n"
-        f"           YES price  : {yes_p:.4f} ({sources.get('Yes','?')})  "
-        f"NO price: {no_p:.4f} ({sources.get('No','?')})"
+        f"           YES price  : {yes_str} ({sources.get('Yes','?')})  "
+        f"NO price: {no_str} ({sources.get('No','?')})"
     )
 
     return {
