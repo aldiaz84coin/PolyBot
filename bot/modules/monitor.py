@@ -605,6 +605,23 @@ def run(cfg: dict):
 
             _log_cycle(price, target, mins_left, ops_hoy, max_ops, simulate)
 
+
+            # ── Reportar estado al dashboard (v10.7 restaurado en v12.0) ──
+            _active_win_rep = next(
+                (w["key"] for w in WINDOWS if w["min"] <= mins_left < w["max"]),
+                None,
+            )
+            _signal_rep = evaluate(price, target, mins_left, cfg)
+            report_state(
+                market        = market,
+                target        = target,
+                price         = price,
+                direction     = _signal_rep.direction.value if _signal_rep else None,
+                window        = _active_win_rep,
+                ops_today     = ops_hoy,
+                bet_active    = active_bet is not None,
+                simulate_mode = simulate,
+            )
             # ── v12.0: Log precio de tokens YES/NO (throttle ~30s) ────────
             # Los datos ya están en market (dict en memoria) — cero llamadas nuevas
             _now_ts = time.time()
@@ -725,7 +742,8 @@ def run(cfg: dict):
                     continue
 
             # ── Evaluación de señal ────────────────────────────────────────
-            signal = evaluate(price, target, mins_left, cfg)
+            # Reutiliza el evaluate() ya llamado para report_state (evita doble llamada)
+            signal = _signal_rep
 
             if signal:
                 signal_key = (signal.window, signal.direction.value)
