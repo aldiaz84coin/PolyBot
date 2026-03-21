@@ -1,18 +1,20 @@
 """
 notifier.py — Notificaciones Telegram + Dashboard del bot PolyBot
 
+v5.8 — CLAIM ENRIQUECIDO + SELL FALLBACK DESHABILITADO
+  - _bet_context(): helper privado con slug, conditionId, stake, tokens, direction.
+  - notify_claim_scheduled(): añade slug, conditionId, stake, tokens.
+  - notify_claim_attempt(): NUEVA — enviada antes de cada intento on-chain,
+    muestra resultado del check Gamma API (resolved, outcome, error).
+  - notify_claim_retrying(): añade slug, conditionId, stake.
+  - notify_claim_ok(): añade slug, conditionId, P&L detallado. Acepta extra_note.
+  - notify_claim_failed(): aviso manual directo con enlace a /event/{slug}.
+    Ya NO dice "Intentando SELL FALLBACK" (fallback deshabilitado).
+  - notify_sell_fallback_failed(): título SELL FALLBACK DESHABILITADO.
+  - notify_sell_fallback_ok(): añade slug, conditionId (para cuando se reactive).
+
 v5.6 — SELL FALLBACK + CLAIM SCHEDULED
-  - notify_claim_scheduled() : ⏳ Al lanzar el hilo de claim, informa que el
-    primer intento será en N minutos (evita la confusión de ver silencio tras WIN).
-  - notify_sell_fallback_ok() : 💸 Venta CLOB exitosa como fallback del claim.
-  - notify_sell_fallback_failed() : 🚨 Venta CLOB también fallida + aviso manual.
-  Llamadas exclusivamente desde claimer.py → _sell_fallback_clob().
-
-v5.5 — NOTIFICACIONES DE CLAIM
-  - notify_claim_ok()       : 💰 Claim confirmado on-chain (TX hash + P&L)
-  - notify_claim_retrying() : 🔄 Reintentando claim (motivo + espera)
-  - notify_claim_failed()   : 🚨 Claim fallido definitivo + aviso manual
-
+v5.5 — NOTIFICACIONES DE CLAIM (notify_claim_ok, retrying, failed)
 v5.4 — notify_mode_change()
 v5.3 — FIX: notify_signal_eval restaurada a firma de 8 argumentos
 v5.2 — _post_event(): replica cada mensaje al dashboard (/api/events)
@@ -299,8 +301,10 @@ def notify_hour_summary(cfg: dict, hour_utc, hour_wins: int, hour_losses: int,
         pnl_t   = hist_stats.get("total_pnl", 0.0)
         sign_t  = "+" if pnl_t >= 0 else ""
         lines.append(
-            f"\n📊 <b>Acumulado total</b>: "
-            f"{wins_h}W/{loss_h}L  WR={wr_h}%  P&L: <code>{sign_t}${pnl_t:,.2f}</code>"
+            f"\n📈 <b>Acumulado total</b>\n"
+            f"Ops: <code>{hist_stats.get('total_ops', 0)}</code>  "
+            f"W/L: <code>{wins_h}W/{loss_h}L  WR={wr_h}%</code>\n"
+            f"P&L: <code>{sign_t}${pnl_t:,.2f} USDC</code>"
         )
 
     _send(cfg, "\n".join(lines))
@@ -308,32 +312,31 @@ def notify_hour_summary(cfg: dict, hour_utc, hour_wins: int, hour_losses: int,
 
 # ── Apuesta ──────────────────────────────────────────────────────────────────
 
-def notify_bet(cfg: dict, bet: dict, simulated: bool = False):
-    sim_tag = "  <i>[SIMULADO]</i>" if simulated else ""
-    direction  = bet.get("direction", "—")
-    entry      = bet.get("entry", 0)
-    target     = bet.get("target", 0)
-    window     = bet.get("window", "—")
-    stake      = bet.get("stake", 0)
-    odds       = bet.get("odds", 0.5)
-    tokens     = round(stake / max(odds, 0.001), 4)
-    ret_est    = round(tokens, 2)
-    pnl_est    = round(ret_est - stake, 2)
-    pct_est    = round((pnl_est / stake) * 100, 1) if stake > 0 else 0
-    arrow      = "🟢" if direction == "UP" else "🔴"
+def notify_bet(cfg: dict, bet: dict, signal=None, simulated: bool = False):
+    sim     = simulated or bet.get("simulated", False)
+    sim_tag = "  <i>[SIMULADO]</i>" if sim else ""
+    odds_v  = bet.get("odds", 0.5)
+    stake   = bet.get("stake", 0)
+    tokens  = round(stake / max(odds_v, 0.001), 4)
+    pnl_est = round(tokens - stake, 2)
+    ret_est = round(tokens, 2)
+    pct_est = round((pnl_est / stake * 100) if stake else 0, 1)
     _send(cfg, (
-        f"{arrow} <b>APUESTA {direction}</b>{sim_tag}\n"
-        f"BTC entrada : <code>${entry:,.2f}</code>\n"
-        f"Target      : <code>${target:,.2f}</code>\n"
-        f"Ventana     : <code>{window}</code>\n"
+        f"{'🟢' if bet['direction'] == 'UP' else '🔴'} "
+        f"<b>Apuesta {bet['direction']} [{bet.get('window', '—')}]</b>{sim_tag}\n"
+        f"BTC entrada : <code>${bet.get('entry', 0):,.2f}</code>\n"
+        f"Target      : <code>${bet.get('target', 0):,.2f}</code>\n"
+        f"Odds        : <code>{odds_v:.4f}  ({odds_v * 100:.1f}%)</code>\n"
         f"Stake       : <code>${stake:.2f} USDC</code>\n"
-        f"Odds        : <code>{odds:.4f}  ({odds*100:.1f}%)</code>\n"
         f"Tokens      : <code>{tokens:.4f}</code>\n"
         f"Ret. est.   : <code>${ret_est:.2f} (+${pnl_est:.2f} / +{pct_est:.1f}%)</code>"
     ))
 
 
+# ── Orden fallida ─────────────────────────────────────────────────────────────
+
 def notify_order_failed(cfg: dict, signal):
+    """v5.8: Alerta cuando execute_order() devuelve None."""
     window    = getattr(signal, "window", "—")
     direction = getattr(signal, "direction", "—")
     _send(cfg, (
@@ -381,8 +384,8 @@ def notify_loss(cfg: dict, bet: dict, price: float,
 def notify_stop_loss(cfg: dict, bet: dict, price: float, pnl_usd: float,
                      pnl_pct: float = None, exit_token_price: float = None,
                      stop_pct: float = None, simulated: bool = False):
-    sim     = simulated or bet.get("simulated", False)
-    sim_tag = "  <i>[SIMULADO]</i>" if sim else ""
+    sim       = simulated or bet.get("simulated", False)
+    sim_tag   = "  <i>[SIMULADO]</i>" if sim else ""
     direction = bet.get("direction", "—")
     entry_btc = bet.get("entry", 0)
     odds_in   = bet.get("odds", 0)
@@ -409,99 +412,206 @@ def notify_error(cfg: dict, message: str):
     _send(cfg, f"🚨 <b>Error crítico</b>\n<code>{message[:500]}</code>")
 
 
+# ── Helper privado: extrae contexto resumido de una apuesta ──────────────────
+
+def _bet_context(bet: dict) -> dict:
+    """
+    Devuelve un dict con los campos más útiles de bet para los mensajes de claim.
+    Siempre devuelve valores seguros (sin KeyError ni None crudo).
+    """
+    market       = bet.get("market", {}) or {}
+    condition_id = (
+        market.get("conditionId")
+        or market.get("condition_id", "")
+        or ""
+    )
+    slug       = market.get("slug", "—") or "—"
+    stake      = bet.get("stake", 0.0) or 0.0
+    tokens     = bet.get("tokens", 0.0) or 0.0
+    odds       = bet.get("odds", 0.0) or 0.0
+    direction  = bet.get("direction", "—") or "—"
+    short_cond = (condition_id[:12] + "...") if len(condition_id) > 12 else (condition_id or "—")
+    return {
+        "slug":       slug,
+        "short_cond": short_cond,
+        "stake":      stake,
+        "tokens":     tokens,
+        "odds":       odds,
+        "direction":  direction,
+    }
+
+
 # ── Claim on-chain ────────────────────────────────────────────────────────────
 
 def notify_claim_scheduled(cfg: dict, bet: dict, first_wait_secs: int, max_attempts: int):
     """
-    v5.6: Se envía al lanzar el hilo de claim.
-    Informa que el primer intento será en N min (el mercado necesita tiempo para
-    resolverse on-chain — intentarlo de inmediato siempre fallaba).
+    v5.8: Se envía al lanzar el hilo de claim.
+    Muestra slug, conditionId, stake, tokens y cuándo será el primer intento.
     """
-    direction = bet.get("direction", "—")
-    mins      = first_wait_secs // 60
-    secs_rem  = first_wait_secs % 60
+    ctx      = _bet_context(bet)
+    mins     = first_wait_secs // 60
+    secs_rem = first_wait_secs % 60
     if mins > 0 and secs_rem > 0:
         wait_str = f"{mins}m {secs_rem}s"
     elif mins > 0:
         wait_str = f"{mins}m"
     else:
         wait_str = f"{first_wait_secs}s"
+
     _send(cfg, (
-        f"⏳ <b>Claim programado — {direction}</b>\n"
+        f"⏳ <b>Claim programado — {ctx['direction']}</b>\n"
+        f"Mercado    : <code>{ctx['slug']}</code>\n"
+        f"ConditionId: <code>{ctx['short_cond']}</code>\n"
+        f"Stake      : <code>${ctx['stake']:.2f}</code>  "
+        f"Tokens: <code>{ctx['tokens']:.4f}</code>\n"
         f"Primer intento en : <code>{wait_str}</code>\n"
         f"Máx intentos      : <code>{max_attempts}</code>\n"
-        f"<i>El mercado necesita tiempo para resolverse on-chain.</i>"
+        f"<i>Polymarket resuelve BTC/USD entre 1h y 3h tras el cierre.</i>"
     ))
 
 
-def notify_claim_ok(cfg: dict, bet: dict, tx_hash: str, attempt: int, usdc_est: float):
-    """v5.5: Claim confirmado on-chain."""
-    direction = bet.get("direction", "—")
-    stake     = bet.get("stake", 0.0)
-    pnl_est   = round(usdc_est - stake, 2)
-    short_tx  = f"{tx_hash[:10]}...{tx_hash[-6:]}" if len(tx_hash) > 16 else tx_hash
+def notify_claim_attempt(
+    cfg: dict,
+    bet: dict,
+    attempt: int,
+    max_attempts: int,
+    gamma: dict,
+):
+    """
+    v5.8: NUEVA. Enviada justo antes de ejecutar el intento on-chain.
+    Muestra el resultado de la consulta Gamma API para dar contexto.
+    """
+    ctx      = _bet_context(bet)
+    resolved = gamma.get("resolved", False)
+    closed   = gamma.get("closed", False)
+    outcome  = gamma.get("outcome", "") or "—"
+    g_err    = gamma.get("error", "") or ""
+
+    if g_err:
+        gamma_line = f"⚠️ Gamma error: <code>{g_err[:80]}</code>"
+    elif resolved:
+        gamma_line = f"✅ Gamma: <b>RESUELTO</b>  outcome=<code>{outcome}</code>"
+    elif closed:
+        gamma_line = "🔒 Gamma: mercado cerrado (resolución pendiente on-chain)"
+    else:
+        gamma_line = "⏳ Gamma: mercado aún NO resuelto (esperado — puede tardar)"
+
     _send(cfg, (
-        f"💰 <b>CLAIM CONFIRMADO — {direction}</b>\n"
-        f"TX         : <code>{short_tx}</code>\n"
-        f"Recuperado : <code>~{usdc_est:.4f} USDC</code>\n"
-        f"P&amp;L neto   : <code>+${pnl_est:.2f}</code>\n"
-        f"Intento    : <code>{attempt}</code>\n"
-        f"🔗 <a href=\"https://polygonscan.com/tx/{tx_hash}\">Ver en Polygonscan</a>"
+        f"🔄 <b>Intentando claim [{attempt}/{max_attempts}]</b>\n"
+        f"Mercado    : <code>{ctx['slug']}</code>\n"
+        f"Dirección  : <code>{ctx['direction']}</code>  "
+        f"Stake: <code>${ctx['stake']:.2f}</code>  "
+        f"Tokens: <code>{ctx['tokens']:.4f}</code>\n"
+        f"ConditionId: <code>{ctx['short_cond']}</code>\n"
+        f"{gamma_line}"
     ))
 
 
-def notify_claim_retrying(cfg: dict, bet: dict, attempt: int, max_attempts: int,
-                          reason: str, wait_secs: int):
-    """v5.5: Se envía ANTES de dormir (2º intento en adelante)."""
-    direction = bet.get("direction", "—")
-    mins      = wait_secs // 60
-    secs_rem  = wait_secs % 60
+def notify_claim_ok(
+    cfg: dict,
+    bet: dict,
+    tx_hash: str,
+    attempt: int,
+    usdc_est: float,
+    extra_note: str = "",
+):
+    """v5.8: Claim confirmado on-chain. Incluye slug, conditionId y P&L."""
+    ctx       = _bet_context(bet)
+    pnl_est   = round(usdc_est - ctx["stake"], 2)
+    short_tx  = f"{tx_hash[:10]}...{tx_hash[-6:]}" if len(tx_hash) > 16 else tx_hash
+    note_line = f"\n<i>{extra_note}</i>" if extra_note else ""
+
+    _send(cfg, (
+        f"💰 <b>CLAIM CONFIRMADO — {ctx['direction']}</b>\n"
+        f"Mercado    : <code>{ctx['slug']}</code>\n"
+        f"ConditionId: <code>{ctx['short_cond']}</code>\n"
+        f"Recuperado : <code>~{usdc_est:.4f} USDC</code>\n"
+        f"Stake in   : <code>${ctx['stake']:.2f}</code>  "
+        f"P&amp;L: <code>+${pnl_est:.2f}</code>\n"
+        f"Intento    : <code>{attempt}</code>\n"
+        f"TX         : <code>{short_tx}</code>\n"
+        f"🔗 <a href=\"https://polygonscan.com/tx/{tx_hash}\">Ver en Polygonscan</a>"
+        f"{note_line}"
+    ))
+
+
+def notify_claim_retrying(
+    cfg: dict,
+    bet: dict,
+    attempt: int,
+    max_attempts: int,
+    reason: str,
+    wait_secs: int,
+):
+    """v5.8: Enviada ANTES de dormir (2º intento en adelante). Incluye contexto."""
+    ctx      = _bet_context(bet)
+    mins     = wait_secs // 60
+    secs_rem = wait_secs % 60
     if mins > 0 and secs_rem > 0:
         wait_str = f"{mins}m {secs_rem}s"
     elif mins > 0:
         wait_str = f"{mins}m"
     else:
         wait_str = f"{wait_secs}s"
-    short_err = (reason[:150] + "…") if reason and len(reason) > 150 else (reason or "—")
+    short_err = (reason[:180] + "…") if reason and len(reason) > 180 else (reason or "—")
+
     _send(cfg, (
         f"🔄 <b>Reintentando claim [{attempt}/{max_attempts}]</b>\n"
-        f"Dirección  : <code>{direction}</code>\n"
-        f"Motivo     : <code>{short_err}</code>\n"
+        f"Mercado    : <code>{ctx['slug']}</code>\n"
+        f"Dirección  : <code>{ctx['direction']}</code>  "
+        f"Stake: <code>${ctx['stake']:.2f}</code>\n"
+        f"Motivo ant.: <code>{short_err}</code>\n"
         f"Próximo    : en <code>{wait_str}</code>"
     ))
 
 
 def notify_claim_failed(cfg: dict, bet: dict, reason: str, attempts: int):
-    """v5.5: Fallo definitivo + aviso manual."""
-    direction = bet.get("direction", "—")
-    short_err = (reason[:200] + "…") if reason and len(reason) > 200 else (reason or "—")
+    """v5.8: Fallo definitivo. SELL FALLBACK deshabilitado — aviso manual directo."""
+    ctx       = _bet_context(bet)
+    short_err = (reason[:220] + "…") if reason and len(reason) > 220 else (reason or "—")
+    slug      = ctx["slug"]
+    poly_url  = (
+        f"https://polymarket.com/event/{slug}"
+        if slug != "—"
+        else "https://polymarket.com/portfolio"
+    )
     _send(cfg, (
-        f"🚨 <b>Claim fallido — {direction}</b>\n"
+        f"🚨 <b>Claim fallido — {ctx['direction']}</b>\n"
+        f"Mercado    : <code>{slug}</code>\n"
+        f"ConditionId: <code>{ctx['short_cond']}</code>\n"
+        f"Stake      : <code>${ctx['stake']:.2f}</code>  "
+        f"Tokens: <code>{ctx['tokens']:.4f}</code>\n"
         f"Intentos   : <code>{attempts}</code>\n"
         f"Último err : <code>{short_err}</code>\n"
-        f"⚠️ Intentando SELL FALLBACK en CLOB...\n"
-        f"Si también falla: reclamar manualmente en "
-        f"<a href=\"https://polymarket.com\">polymarket.com</a>"
+        f"⚠️ <b>ACCIÓN MANUAL REQUERIDA:</b>\n"
+        f"1. Abre: <a href=\"{poly_url}\">{slug}</a>\n"
+        f"2. Verifica tu posición ganadora ({ctx['direction']})\n"
+        f"3. Reclama manualmente en Polymarket"
     ))
 
 
 # ── SELL Fallback (cuando claim on-chain falla definitivamente) ───────────────
 
-def notify_sell_fallback_ok(cfg: dict, bet: dict, resp: dict,
-                            sell_price: float, usdc_received: float):
-    """
-    v5.6: Venta en CLOB exitosa como alternativa al claim on-chain.
-    Se activa cuando el claim falla tras agotar todos los reintentos.
-    """
-    direction  = bet.get("direction", "—")
-    stake      = bet.get("stake", 0.0)
-    pnl        = round(usdc_received - stake, 2)
-    pnl_sign   = "+" if pnl >= 0 else ""
-    order_id   = resp.get("id", "—")
-    short_id   = f"{order_id[:10]}..." if len(str(order_id)) > 10 else str(order_id)
+def notify_sell_fallback_ok(
+    cfg: dict,
+    bet: dict,
+    resp: dict,
+    sell_price: float,
+    usdc_received: float,
+):
+    """v5.8: Venta en CLOB exitosa. Incluye slug, conditionId y P&L detallado."""
+    ctx      = _bet_context(bet)
+    pnl      = round(usdc_received - ctx["stake"], 2)
+    pnl_sign = "+" if pnl >= 0 else ""
+    order_id = resp.get("id", "—") if isinstance(resp, dict) else "—"
+    short_id = f"{str(order_id)[:10]}..." if len(str(order_id)) > 10 else str(order_id)
+
     _send(cfg, (
-        f"💸 <b>SELL FALLBACK OK — {direction}</b>\n"
-        f"Venta CLOB : <code>@ {sell_price:.4f}</code>\n"
+        f"💸 <b>SELL FALLBACK OK — {ctx['direction']}</b>\n"
+        f"Mercado    : <code>{ctx['slug']}</code>\n"
+        f"ConditionId: <code>{ctx['short_cond']}</code>\n"
+        f"Venta CLOB : <code>@ {sell_price:.4f}</code>  "
+        f"Tokens: <code>{ctx['tokens']:.4f}</code>\n"
         f"Recuperado : <code>~{usdc_received:.4f} USDC</code>\n"
         f"P&amp;L     : <code>{pnl_sign}${pnl:.2f} USDC</code>\n"
         f"Order ID   : <code>{short_id}</code>\n"
@@ -510,17 +620,24 @@ def notify_sell_fallback_ok(cfg: dict, bet: dict, resp: dict,
 
 
 def notify_sell_fallback_failed(cfg: dict, bet: dict, reason: str):
-    """
-    v5.6: Tanto el claim on-chain como el SELL CLOB fallaron.
-    El usuario debe actuar manualmente.
-    """
-    direction = bet.get("direction", "—")
-    short_err = (reason[:200] + "…") if reason and len(reason) > 200 else (reason or "—")
+    """v5.8: SELL FALLBACK deshabilitado — aviso manual con enlace directo al mercado."""
+    ctx       = _bet_context(bet)
+    short_err = (reason[:220] + "…") if reason and len(reason) > 220 else (reason or "—")
+    slug      = ctx["slug"]
+    poly_url  = (
+        f"https://polymarket.com/event/{slug}"
+        if slug != "—"
+        else "https://polymarket.com/portfolio"
+    )
     _send(cfg, (
-        f"🚨 <b>SELL FALLBACK FALLIDO — {direction}</b>\n"
-        f"Motivo : <code>{short_err}</code>\n"
+        f"⚠️ <b>SELL FALLBACK DESHABILITADO — {ctx['direction']}</b>\n"
+        f"Mercado    : <code>{slug}</code>\n"
+        f"ConditionId: <code>{ctx['short_cond']}</code>\n"
+        f"Stake      : <code>${ctx['stake']:.2f}</code>  "
+        f"Tokens: <code>{ctx['tokens']:.4f}</code>\n"
+        f"Motivo     : <code>{short_err}</code>\n"
         f"⚠️ <b>ACCIÓN MANUAL REQUERIDA:</b>\n"
-        f"1. Ve a <a href=\"https://polymarket.com\">polymarket.com</a>\n"
-        f"2. Verifica tu posición ganadora\n"
-        f"3. Reclama o vende manualmente"
+        f"1. Abre: <a href=\"{poly_url}\">{slug}</a>\n"
+        f"2. Verifica tu posición ganadora ({ctx['direction']})\n"
+        f"3. Reclama manualmente en Polymarket"
     ))

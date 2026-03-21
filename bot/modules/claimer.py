@@ -1,29 +1,31 @@
 """
 claimer.py — Redención automática de tokens ganadores on-chain (Polygon)
 
+v3.1 — SELL FALLBACK DESHABILITADO
+  - SELL_FALLBACK_ENABLED = False: deshabilitado hasta verificar que 0.99
+    tiene contrapartida en el mercado resuelto. Si el claim falla → aviso manual.
+  - SELL_FALLBACK_PRICE = 0.99: precio límite correcto para cuando se reactive.
+    Vender a menos de ~0.99 en una posición WIN implica pérdida real.
+
+v3.0 — TIMING FIX + GAMMA CHECK + FALLBACK MEJORADO
+  - RETRY_SCHEDULE: [7200, 1800] — primer intento a las 2h post-WIN, segundo
+    a las 2h30min. Solo 2 intentos on-chain bien temporizados.
+  - _check_gamma_resolved(): consulta Gamma API antes de cada intento on-chain.
+  - _redimir_once_no_estimate(): workaround con gas fijo (150k), activo solo
+    si Gamma confirma resolución pero estimate_gas sigue fallando.
+  - Notificaciones enriquecidas con slug, conditionId, stake, tokens.
+  - notify_claim_attempt(): nueva, enviada antes de cada TX con diagnóstico Gamma.
+
 v2.1 — SELL FALLBACK + RETRY MEJORADO
-  - RETRY_SCHEDULE: primer intento con 3 min de espera (el mercado no se resuelve
-    on-chain instantáneamente — el primer intento inmediato siempre fallaba).
-  - Ventana total extendida a ~2h 8 min (8 intentos vs 7 anteriores).
-  - sell_fallback_clob(): si se agotan todos los reintentos del claim, intenta
-    vender los tokens ganadores en el CLOB a precio de mercado (~0.999).
-    Esto recupera el valor sin necesidad de resolución on-chain.
-  - _get_winning_token_id(): extrae el token_id ganador del market dict incluido
-    en bet (tokens list con outcome Yes/No, o fallback a clobTokenIds).
-  - _fetch_clob_midpoint(): precio live del token ganador en el CLOB.
-  - notify_claim_scheduled(): nueva notificación al lanzar el hilo de claim,
-    informa al usuario que el primer intento será en 3 min.
+  - RETRY_SCHEDULE: primer intento con 3 min de espera.
+  - Ventana total ~2h 8 min (8 intentos).
+  - sell_fallback_clob(): intenta vender en CLOB al fallar claim on-chain.
 
 v2.0 — RETRY + FALLBACK + NOTIFICACIONES
-  - claim_with_retry(): reintenta según RETRY_SCHEDULE (hasta ~64 min total)
-  - 4 RPCs de Polygon con fallback automático
-  - Notificaciones Telegram para: reintento, éxito con TX, fallo definitivo
-  - Se ejecuta en hilo daemon desde monitor.py → no bloquea el loop principal
-  - condition_id acepta formato "0x..." y sin prefijo
-  - estimate_gas detecta si el mercado no está resuelto aún (error esperado)
 
 Destino: bot/modules/claimer.py
 """
+import json as _json
 import logging
 import time
 
@@ -36,8 +38,9 @@ logger = logging.getLogger(__name__)
 CTF_ADDRESS  = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
 USDC_POLYGON = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
 CHAIN_ID     = 137
-GAS_MARGIN   = 1.25   # +25% sobre el estimado
-CONFIRM_TIMEOUT = 90  # segundos esperando recibo on-chain
+GAS_MARGIN   = 1.25       # +25% sobre el estimado
+GAS_FIXED    = 150_000    # gas fijo para workaround sin estimate_gas
+CONFIRM_TIMEOUT = 90      # segundos esperando recibo on-chain
 
 CTF_ABI = [
     {
@@ -62,25 +65,21 @@ POLYGON_RPCS = [
     "https://rpc-mainnet.matic.quiknode.pro",
 ]
 
-# ── CLOB endpoint para midpoint ───────────────────────────────────────────────
+# ── Endpoints ─────────────────────────────────────────────────────────────────
 CLOB_MIDPOINT = "https://clob.polymarket.com/midpoint"
+GAMMA_API     = "https://gamma-api.polymarket.com/markets"
 
 # ── Calendario de reintentos ──────────────────────────────────────────────────
-# Cada valor = segundos de ESPERA ANTES de ese intento.
-# v2.1 FIX: RETRY_SCHEDULE[0] = 180 (3 min) — el mercado no se resuelve
-# on-chain instantáneamente; el intento inmediato previo siempre fallaba.
+# v3.0: Solo 2 intentos, bien temporizados.
+# Los mercados BTC/USD en Polymarket se resuelven on-chain entre 1h y 3h
+# después del cierre de la vela. Intentar antes siempre falla (error:
+# "result for condition not received yet").
 #
-# Intento 1 →  3 min  (esperar resolución on-chain inicial)
-# Intento 2 → +2 min  (5 min total)
-# Intento 3 → +3 min  (8 min total)
-# Intento 4 → +5 min  (13 min total)
-# Intento 5 → +10 min (23 min total)
-# Intento 6 → +15 min (38 min total)
-# Intento 7 → +30 min (68 min total ~1h)
-# Intento 8 → +60 min (128 min total ~2h)
-# ─────────────────────────────────────────────────────────────────
-# Si todos fallan → SELL FALLBACK en CLOB (~0.999)
-RETRY_SCHEDULE = [180, 120, 180, 300, 600, 900, 1800, 3600]
+# Intento 1 → +2h 00min desde WIN  (7200s)
+# Intento 2 → +2h 30min desde WIN  (+1800s)
+# ──────────────────────────────────────────────────────────────────────────────
+# Si ambos fallan → SELL FALLBACK en CLOB
+RETRY_SCHEDULE = [7200, 1800]
 
 
 # ── Helpers internos ──────────────────────────────────────────────────────────
@@ -129,7 +128,6 @@ def _get_winning_token_id(bet: dict) -> str | None:
                 return t.get("token_id")
 
     # Fallback: clobTokenIds (índice 0=YES/UP, 1=NO/DOWN)
-    import json as _json
     clob_raw = market.get("clobTokenIds")
     if clob_raw:
         try:
@@ -139,7 +137,7 @@ def _get_winning_token_id(bet: dict) -> str | None:
         except Exception:
             pass
 
-    logger.warning(f"[CLAIMER] ⚠ No se pudo extraer token_id ganador del mercado")
+    logger.warning("[CLAIMER] ⚠ No se pudo extraer token_id ganador del mercado")
     return None
 
 
@@ -155,7 +153,58 @@ def _fetch_clob_midpoint(token_id: str) -> float | None:
         return None
 
 
-# ── Núcleo: un intento de redención ──────────────────────────────────────────
+def _check_gamma_resolved(condition_id: str) -> dict:
+    """
+    v3.0 — Workaround: consulta la Gamma API para verificar si el mercado
+    ha sido resuelto antes de intentar el claim on-chain.
+
+    Retorna un dict con:
+      resolved    (bool)   — True si el mercado está marcado como resuelto
+      closed      (bool)   — True si el mercado está cerrado para trading
+      outcome     (str)    — "Yes" / "No" / "" según Gamma
+      question    (str)    — título del mercado
+      end_date    (str)    — fecha de cierre programada (ISO)
+      error       (str)    — razón si la consulta falló
+    """
+    result = {
+        "resolved": False,
+        "closed":   False,
+        "outcome":  "",
+        "question": "—",
+        "end_date": "—",
+        "error":    "",
+    }
+    if not condition_id:
+        result["error"] = "conditionId vacío"
+        return result
+
+    try:
+        r = requests.get(
+            GAMMA_API,
+            params={"conditionId": condition_id},
+            timeout=10,
+        )
+        r.raise_for_status()
+        data = r.json()
+        if not data or not isinstance(data, list):
+            result["error"] = "Gamma API devolvió respuesta vacía o inesperada"
+            return result
+
+        mkt = data[0]
+        result["resolved"] = bool(mkt.get("resolved") or mkt.get("resolutionSource"))
+        result["closed"]   = bool(mkt.get("closed") or mkt.get("active") is False)
+        result["outcome"]  = str(mkt.get("outcome", "") or mkt.get("resolution", ""))
+        result["question"] = str(mkt.get("question", "—"))[:80]
+        result["end_date"] = str(mkt.get("endDate", "—"))
+
+    except Exception as e:
+        result["error"] = str(e)
+        logger.warning(f"[CLAIMER] ⚠ Error consultando Gamma API: {e}")
+
+    return result
+
+
+# ── Núcleo: un intento de redención (con estimate_gas) ────────────────────────
 
 def _redimir_once(
     condition_id: str,
@@ -169,7 +218,7 @@ def _redimir_once(
     index_set = [1] if direction == "UP" else [2]
 
     logger.info(
-        f"[CLAIMER] Iniciando redención\n"
+        f"[CLAIMER] Iniciando redención (estimate_gas)\n"
         f"          Direction    : {direction}  →  index_set={index_set}\n"
         f"          Condition ID : {condition_id}"
     )
@@ -194,9 +243,7 @@ def _redimir_once(
         address=w3.to_checksum_address(CTF_ADDRESS),
         abi=CTF_ABI,
     )
-
     cond_bytes = _condition_id_to_bytes(condition_id)
-
     fn = ctf.functions.redeemPositions(
         w3.to_checksum_address(USDC_POLYGON),
         b"\x00" * 32,
@@ -213,10 +260,60 @@ def _redimir_once(
             f"estimate_gas falló (mercado no resuelto aún, o ya reclamado): {e}"
         ) from e
 
+    return _send_redeem_tx(w3, fn, account, private_key, gas)
+
+
+def _redimir_once_no_estimate(
+    condition_id: str,
+    direction: str,
+    private_key: str,
+) -> str:
+    """
+    v3.0 — Workaround adicional: intenta redeemPositions() con gas_limit FIJO
+    (GAS_FIXED = 150 000) sin llamar a estimate_gas.
+
+    Usar SOLO cuando Gamma API confirma que el mercado está resuelto pero
+    estimate_gas sigue fallando — puede indicar un delay en el nodo RPC o
+    un problema transitorio de la cadena.
+
+    AVISO: si el mercado no está resuelto, esta TX fallará on-chain y consumirá
+    gas de todas formas. Por eso solo se activa cuando Gamma confirma resolución.
+    """
+    index_set = [1] if direction == "UP" else [2]
+
+    logger.info(
+        f"[CLAIMER] Iniciando redención SIN estimate_gas (gas fijo={GAS_FIXED})\n"
+        f"          Direction    : {direction}  →  index_set={index_set}\n"
+        f"          Condition ID : {condition_id}"
+    )
+
+    w3      = _connect_polygon()
+    account = w3.eth.account.from_key(private_key)
+
+    ctf        = w3.eth.contract(
+        address=w3.to_checksum_address(CTF_ADDRESS),
+        abi=CTF_ABI,
+    )
+    cond_bytes = _condition_id_to_bytes(condition_id)
+    fn         = ctf.functions.redeemPositions(
+        w3.to_checksum_address(USDC_POLYGON),
+        b"\x00" * 32,
+        cond_bytes,
+        index_set,
+    )
+
+    return _send_redeem_tx(w3, fn, account, private_key, GAS_FIXED)
+
+
+def _send_redeem_tx(w3, fn, account, private_key: str, gas: int) -> str:
+    """
+    Construye, firma y envía la TX de redeemPositions. Espera recibo.
+    Devuelve tx_hash. Lanza RuntimeError si la TX es rechazada on-chain.
+    """
     gas_price    = w3.eth.gas_price
     pol_cost_est = w3.from_wei(gas * gas_price, "ether")
     logger.info(
-        f"[CLAIMER] Gas: {gas_estimate} units (+{(GAS_MARGIN-1)*100:.0f}% → {gas})  "
+        f"[CLAIMER] Gas: {gas} units  "
         f"@ {w3.from_wei(gas_price, 'gwei'):.2f} Gwei  "
         f"≈ {pol_cost_est:.6f} POL"
     )
@@ -258,43 +355,67 @@ def _redimir_once(
 
 # ── Fallback: vender posición en el CLOB ─────────────────────────────────────
 
+# v3.1: SELL FALLBACK DESHABILITADO temporalmente.
+# Razón: vender a cualquier precio por debajo de ~0.99 implica pérdidas en una
+# posición ganadora. El precio correcto es 0.99, pero el CLOB no cotiza el token
+# resuelto (devuelve mid=None) — la orden no se llenaría de todas formas.
+# Cuando se reactive: usar SELL_FALLBACK_PRICE = 0.99 y verificar que el token
+# siga activo en el CLOB antes de enviar la orden.
+# Para reactivar: cambiar SELL_FALLBACK_ENABLED = True.
+SELL_FALLBACK_ENABLED = False
+SELL_FALLBACK_PRICE   = 0.99   # precio límite cuando se reactive
+
+
 def _sell_fallback_clob(bet: dict, cfg: dict) -> None:
     """
-    v2.1: Fallback cuando el claim on-chain falla definitivamente.
-    Vende los tokens ganadores en el CLOB al precio de mercado actual (~0.999).
-    Notifica el resultado (éxito o fallo) por Telegram.
-    """
-    from .notifier import notify_sell_fallback_ok, notify_sell_fallback_failed
+    v3.1: DESHABILITADO. Cuando SELL_FALLBACK_ENABLED=True, vende los tokens
+    ganadores en el CLOB a SELL_FALLBACK_PRICE (0.99) para recuperar valor
+    sin necesidad de resolución on-chain.
 
-    direction   = bet.get("direction", "UP")
-    stake       = bet.get("stake", 0.0)
+    Precio fijado a 0.99 (no mid - descuento) porque:
+    - Los tokens ganadores valen exactamente 1.00 USDC tras resolución.
+    - Vender a menos de ~0.99 implica pérdida real en una posición WIN.
+    - Si no hay contrapartida al 0.99, la orden queda pendiente hasta que
+      alguien compre (o se cancela manualmente).
+    """
+    from .notifier import notify_sell_fallback_failed
+
+    slug      = bet.get("market", {}).get("slug", "—")
+    direction = bet.get("direction", "UP")
+
+    if not SELL_FALLBACK_ENABLED:
+        msg = (
+            f"SELL FALLBACK deshabilitado (SELL_FALLBACK_ENABLED=False). "
+            f"Reclamar manualmente en polymarket.com — mercado: {slug}"
+        )
+        logger.warning(f"[CLAIMER] ⚠ {msg}")
+        notify_sell_fallback_failed(cfg, bet, msg)
+        return
+
+    # ── Código activo cuando SELL_FALLBACK_ENABLED = True ────────────────────
+    from .notifier import notify_sell_fallback_ok
+
     entry_odds  = bet.get("odds", 0.5)
+    stake       = bet.get("stake", 0.0)
     tokens_held = round(stake / max(entry_odds, 0.001), 4)
 
     token_id = _get_winning_token_id(bet)
     if not token_id:
-        msg = "No se pudo extraer token_id — SELL no ejecutado"
+        msg = "No se pudo extraer token_id del bet — SELL no ejecutado"
         logger.error(f"[CLAIMER] ❌ {msg}")
         notify_sell_fallback_failed(cfg, bet, msg)
         return
 
-    # Precio live del token
     mid = _fetch_clob_midpoint(token_id)
-    if mid is None or mid < 0.80:
-        msg = f"Midpoint CLOB no disponible o muy bajo ({mid}) — SELL no ejecutado"
-        logger.error(f"[CLAIMER] ❌ {msg}")
-        notify_sell_fallback_failed(cfg, bet, msg)
-        return
+    sell_price = SELL_FALLBACK_PRICE
 
-    # Precio de venta: midpoint redondeado a 2 decimales, con un pequeño margen
-    # para garantizar fill. Mínimo 0.90.
-    sell_price = max(0.90, round(mid - 0.005, 3))
     logger.info(
         f"[CLAIMER] 💰 SELL FALLBACK\n"
         f"          Token    : {token_id[:16]}...\n"
         f"          Tokens   : {tokens_held}\n"
-        f"          Midpoint : {mid:.4f}  →  Sell @ {sell_price:.4f}\n"
-        f"          USDC est.: ~{tokens_held * sell_price:.2f}"
+        f"          Midpoint : {mid!r}  →  Sell @ {sell_price:.4f}\n"
+        f"          USDC est.: ~{tokens_held * sell_price:.2f}\n"
+        f"          Slug     : {slug}"
     )
 
     from .strategy import sell_position
@@ -304,12 +425,11 @@ def _sell_fallback_clob(bet: dict, cfg: dict) -> None:
     if resp:
         usdc_received = round(tokens_held * sell_price, 4)
         logger.info(
-            f"[CLAIMER] ✅ SELL ejecutado — "
-            f"~{usdc_received:.4f} USDC recuperados"
+            f"[CLAIMER] ✅ SELL ejecutado — ~{usdc_received:.4f} USDC recuperados"
         )
         notify_sell_fallback_ok(cfg, bet, resp, sell_price, usdc_received)
     else:
-        msg = "sell_position() devolvió None — orden no ejecutada"
+        msg = f"sell_position() devolvió None (mid={mid!r}, sell_price={sell_price:.4f})"
         logger.error(f"[CLAIMER] ❌ {msg}")
         notify_sell_fallback_failed(cfg, bet, msg)
 
@@ -340,14 +460,19 @@ def claim_with_retry(bet: dict, cfg: dict) -> None:
     Reintenta el claim siguiendo RETRY_SCHEDULE.
     Diseñado para ejecutarse en un hilo daemon (no bloquea el loop del bot).
 
-    v2.1:
-      - Primer intento con 3 min de espera (mercado no resuelto on-chain aún).
-      - Ventana total ~2h 8 min (8 intentos).
-      - Si todos los intentos fallan → intenta SELL FALLBACK en CLOB.
+    v3.0:
+      - RETRY_SCHEDULE = [7200, 1800] — 2 intentos: a las 2h y a las 2h30min.
+      - Antes de cada intento consulta Gamma API (_check_gamma_resolved) para
+        diagnosticar si el mercado ya está resuelto on-chain.
+      - Si Gamma dice "resuelto" pero estimate_gas falla → activa el workaround
+        _redimir_once_no_estimate() con gas fijo (150k).
+      - Si ambos intentos (y workarounds) fallan → SELL FALLBACK en CLOB.
+      - Todas las notificaciones incluyen: slug, conditionId, stake, tokens.
 
     Notificaciones Telegram:
-      · notify_claim_scheduled   — al lanzar el hilo (primer intento en 3 min)
-      · notify_claim_retrying    — antes de cada reintento (2º en adelante)
+      · notify_claim_scheduled   — al lanzar el hilo
+      · notify_claim_attempt     — justo antes de cada intento (NEW v3.0)
+      · notify_claim_retrying    — antes del 2º intento
       · notify_claim_ok          — en cuanto confirma on-chain
       · notify_claim_failed      — si se agotan todos los intentos
       · notify_sell_fallback_ok  — si el SELL FALLBACK tuvo éxito
@@ -367,12 +492,14 @@ def claim_with_retry(bet: dict, cfg: dict) -> None:
         notify_claim_retrying,
         notify_claim_failed,
         notify_claim_scheduled,
+        notify_claim_attempt,
     )
 
-    market    = bet.get("market", {})
-    direction = bet.get("direction", "UP")
-    tokens    = bet.get("tokens", 0.0)
-    stake     = bet.get("stake", 0.0)
+    market       = bet.get("market", {})
+    direction    = bet.get("direction", "UP")
+    tokens       = bet.get("tokens", 0.0)
+    stake        = bet.get("stake", 0.0)
+    slug         = market.get("slug", "—")
 
     condition_id = (
         market.get("conditionId")
@@ -384,7 +511,7 @@ def claim_with_retry(bet: dict, cfg: dict) -> None:
     if not condition_id:
         logger.error(
             "[CLAIMER] ❌ claim_with_retry: conditionId ausente en active_bet — "
-            "no se puede reclamar"
+            "no se puede reclamar on-chain"
         )
         notify_claim_failed(cfg, bet, "conditionId no disponible en el mercado", attempts=0)
         _sell_fallback_clob(bet, cfg)
@@ -393,12 +520,14 @@ def claim_with_retry(bet: dict, cfg: dict) -> None:
     max_attempts = len(RETRY_SCHEDULE)
     last_error   = "desconocido"
 
-    # Notificación inicial: el usuario sabe que el bot esperará antes del primer intento
+    # Notificación inicial
     first_wait = RETRY_SCHEDULE[0]
     notify_claim_scheduled(cfg, bet, first_wait_secs=first_wait, max_attempts=max_attempts)
     logger.info(
-        f"[CLAIMER] ⏳ Claim programado — primer intento en {first_wait}s "
-        f"({first_wait//60}m {first_wait%60}s)"
+        f"[CLAIMER] ⏳ Claim programado — slug={slug}\n"
+        f"          conditionId : {condition_id}\n"
+        f"          Stake       : ${stake:.2f}  Tokens: {tokens:.4f}\n"
+        f"          Primer intento en {first_wait}s ({first_wait // 60}m)"
     )
 
     for attempt_idx, wait_secs in enumerate(RETRY_SCHEDULE):
@@ -408,10 +537,8 @@ def claim_with_retry(bet: dict, cfg: dict) -> None:
         if wait_secs > 0:
             logger.info(
                 f"[CLAIMER] ⏳ Esperando {wait_secs}s antes del intento "
-                f"{attempt_num}/{max_attempts}..."
+                f"{attempt_num}/{max_attempts} ..."
             )
-            # La notificación de reintento se envía desde el 2º intento en adelante
-            # (el primero ya fue notificado por notify_claim_scheduled)
             if attempt_num > 1:
                 notify_claim_retrying(
                     cfg, bet,
@@ -422,19 +549,69 @@ def claim_with_retry(bet: dict, cfg: dict) -> None:
                 )
             time.sleep(wait_secs)
 
-        logger.info(f"[CLAIMER] 🔄 Intento {attempt_num}/{max_attempts}...")
+        logger.info(f"[CLAIMER] 🔄 Intento {attempt_num}/{max_attempts} ...")
 
+        # ── Workaround: consultar Gamma API antes del intento on-chain ──────
+        gamma = _check_gamma_resolved(condition_id)
+        logger.info(
+            f"[CLAIMER] 📡 Gamma status — "
+            f"resolved={gamma['resolved']}  closed={gamma['closed']}  "
+            f"outcome='{gamma['outcome']}'  error='{gamma['error']}'"
+        )
+
+        # Notificar intento con contexto completo
+        notify_claim_attempt(
+            cfg, bet,
+            attempt=attempt_num,
+            max_attempts=max_attempts,
+            gamma=gamma,
+        )
+
+        # ── Intento estándar (con estimate_gas) ─────────────────────────────
         try:
             tx_hash  = _redimir_once(condition_id, direction, private_key)
-            usdc_est = round(tokens, 4)   # tokens ganadores valen 1 USDC c/u
+            usdc_est = round(tokens, 4)
             notify_claim_ok(cfg, bet, tx_hash, attempt=attempt_num, usdc_est=usdc_est)
             logger.info(f"[CLAIMER] ✅ Claim exitoso en intento {attempt_num}")
-            return  # ← éxito, terminar el hilo
+            return  # éxito
 
         except Exception as e:
             last_error = str(e)
             logger.warning(
-                f"[CLAIMER] ⚠ Intento {attempt_num}/{max_attempts} fallido: {last_error}"
+                f"[CLAIMER] ⚠ Intento {attempt_num}/{max_attempts} estándar falló: {last_error}"
+            )
+
+        # ── Workaround adicional: si Gamma dice resuelto, intenta sin estimate_gas
+        if gamma.get("resolved"):
+            logger.info(
+                "[CLAIMER] 🔁 Gamma dice RESUELTO — intentando redención "
+                "con gas fijo (sin estimate_gas)..."
+            )
+            try:
+                tx_hash  = _redimir_once_no_estimate(condition_id, direction, private_key)
+                usdc_est = round(tokens, 4)
+                notify_claim_ok(
+                    cfg, bet, tx_hash,
+                    attempt=attempt_num,
+                    usdc_est=usdc_est,
+                    extra_note="(workaround: gas fijo sin estimate_gas)",
+                )
+                logger.info(
+                    f"[CLAIMER] ✅ Claim exitoso (workaround gas fijo) "
+                    f"en intento {attempt_num}"
+                )
+                return  # éxito por workaround
+
+            except Exception as e2:
+                we_error = str(e2)
+                logger.warning(
+                    f"[CLAIMER] ⚠ Workaround gas fijo también falló: {we_error}"
+                )
+                last_error = f"{last_error} | gas_fijo: {we_error}"
+        else:
+            logger.info(
+                "[CLAIMER] ℹ Gamma NO confirma resolución todavía — "
+                "workaround gas fijo omitido"
             )
 
     # ── Se agotaron todos los intentos → intentar SELL FALLBACK ──────────────
