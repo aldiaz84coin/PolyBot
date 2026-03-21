@@ -305,15 +305,17 @@ def get_active_market(cfg: dict | None = None) -> dict | None:
         )
     _last_slug = slug
 
-    sources = {t.get("outcome"): t.get("price_source", "?") for t in tokens}
+    sources  = {t.get("outcome"): t.get("price_source", "?") for t in tokens}
+    yes_str  = f"{yes_p:.4f}" if yes_p is not None else "—"
+    no_str   = f"{no_p:.4f}"  if no_p  is not None else "—"
     logger.info(
         f"[SCANNER] Mercado activo:\n"
         f"           Pregunta   : {question}\n"
         f"           Slug       : {slug}\n"
         f"           ConditionID: {cond_id}\n"
         f"           Cierre     : {end_date}\n"
-        f"           YES price  : {yes_p:.4f} ({sources.get('Yes','?')})  "
-        f"NO price: {no_p:.4f} ({sources.get('No','?')})"
+        f"           YES price  : {yes_str} ({sources.get('Yes','?')})  "
+        f"NO price: {no_str} ({sources.get('No','?')})"
     )
 
     return {
