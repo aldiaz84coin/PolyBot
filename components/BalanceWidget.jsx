@@ -1,18 +1,31 @@
 "use client";
 /**
- * components/BalanceWidget.jsx — v2.0
+ * components/BalanceWidget.jsx — v3.0
  *
- * CAMBIOS v2.0
+ * CAMBIOS v3.0
  * ─────────────────────────────────────────────────────────────────────
- *  Nuevos bloques visuales:
- *    · TOTAL PORTFOLIO  = USDC líquido + valor posiciones activas
- *    · POSICIONES       = número de tokens abiertos + valor total
- *    · Tabla expandible con detalle de cada posición (título, outcome,
- *      tokens, precio medio, precio actual, valor)
+ *  Migración localStorage → Supabase
+ *    El historial de snapshots de portfolio se persiste ahora en la
+ *    tabla `balance_history` de Supabase via /api/balance-history,
+ *    en lugar de en localStorage del navegador.
  *
- *  El gráfico de área ahora traza "total_portfolio" si hay posiciones,
- *  o "usdc" si no hay posiciones (retrocompatible con historial anterior).
+ *    Ventajas:
+ *      · Historial compartido entre dispositivos y sesiones
+ *      · No se pierde al limpiar el navegador
+ *      · Datos accesibles desde cualquier dashboard / análisis
  *
+ *    Estrategia de carga:
+ *      1. Al montar: GET /api/balance-history → pinta el gráfico
+ *         con histórico real desde Supabase
+ *      2. Tras cada fetchBalance exitoso: si Δtotal ≥ SNAPSHOT_MIN_DELTA
+ *         → POST /api/balance-history con el nuevo punto
+ *      3. El estado local `history` se actualiza optimistamente (sin
+ *         esperar la respuesta del POST) para que el gráfico sea inmediato
+ *
+ *    Fallback: si /api/balance-history falla, el widget sigue funcionando
+ *    normalmente — solo sin persistencia entre sesiones.
+ *
+ * (v2.0 — USDC + posiciones activas + tabla expandible + gráfico)
  * (v1.0 — USDC + POL + gráfico evolución)
  */
 
@@ -23,25 +36,11 @@ import {
 
 // ── Constantes ────────────────────────────────────────────────────────────────
 
-const LS_KEY             = "polymarket_balance_history_v2";   // v2: incluye total_portfolio
 const MAX_HISTORY        = 500;
 const POLL_INTERVAL_MS   = 60_000;
 const SNAPSHOT_MIN_DELTA = 0.001;
 
 // ── Utilidades ────────────────────────────────────────────────────────────────
-
-function loadHistory() {
-  try {
-    const raw = localStorage.getItem(LS_KEY);
-    if (!raw) return [];
-    const arr = JSON.parse(raw);
-    return Array.isArray(arr) ? arr : [];
-  } catch { return []; }
-}
-
-function saveHistory(h) {
-  try { localStorage.setItem(LS_KEY, JSON.stringify(h.slice(-MAX_HISTORY))); } catch {}
-}
 
 function fmtTime(iso) {
   try {
@@ -53,49 +52,34 @@ function xLabel(iso) {
   try {
     const d   = new Date(iso);
     const now = new Date();
-    const sameDay = d.getDate() === now.getDate()
+    const sameDay = d.getDate()     === now.getDate()
       && d.getMonth()    === now.getMonth()
       && d.getFullYear() === now.getFullYear();
     return sameDay
       ? d.toLocaleTimeString("es-ES", { hour: "2-digit", minute: "2-digit" })
-      : `${d.toLocaleDateString("es-ES", { day: "2-digit", month: "2-digit" })} ${d.toLocaleTimeString("es-ES", { hour: "2-digit", minute: "2-digit" })}`;
+      : d.toLocaleDateString("es-ES", { month: "2-digit", day: "2-digit" });
   } catch { return ""; }
 }
 
-// ── Tooltip del gráfico ───────────────────────────────────────────────────────
+// ── Subcomponente: tooltip del gráfico ───────────────────────────────────────
 
 function ChartTooltip({ active, payload, label }) {
   if (!active || !payload?.length) return null;
-  const total = payload.find(p => p.dataKey === "total")?.value;
-  const usdc  = payload.find(p => p.dataKey === "usdc")?.value;
   return (
     <div style={{
-      background: "#05050f", border: "1px solid #1a1a2e",
-      padding: "7px 11px", fontSize: 9, color: "#aaa",
-      fontFamily: "'JetBrains Mono', monospace",
+      background: "#010108", border: "1px solid #0d0d1a",
+      padding: "4px 8px", fontSize: 9, fontFamily: "inherit",
     }}>
-      <div style={{ color: "#444", marginBottom: 3 }}>{label}</div>
-      {total != null && (
-        <div style={{ color: "#00ff88", fontWeight: 700 }}>
-          Total ${total.toFixed(4)}
-        </div>
-      )}
-      {usdc != null && total != null && (
-        <div style={{ color: "#555" }}>Líquido ${usdc.toFixed(4)}</div>
-      )}
-      {usdc != null && total == null && (
-        <div style={{ color: "#00ff88", fontWeight: 700 }}>
-          USDC ${usdc.toFixed(4)}
-        </div>
-      )}
+      <div style={{ color: "#444" }}>{label}</div>
+      <div style={{ color: "#00ff88" }}>${payload[0]?.value?.toFixed(4)}</div>
     </div>
   );
 }
 
-// ── Fila de posición ──────────────────────────────────────────────────────────
+// ── Subcomponente: fila de posición ──────────────────────────────────────────
 
 function PositionRow({ pos }) {
-  const pnlPct = pos.avgPrice > 0
+  const pnlPct   = pos.avgPrice > 0
     ? ((pos.curPrice - pos.avgPrice) / pos.avgPrice) * 100
     : null;
   const pnlColor = pnlPct == null ? "#555" : pnlPct >= 0 ? "#00ff88" : "#ff4466";
@@ -104,42 +88,34 @@ function PositionRow({ pos }) {
     <div style={{
       display: "grid",
       gridTemplateColumns: "1fr 48px 60px 52px 52px 64px",
-      gap: 6,
-      padding: "5px 8px",
+      gap: 6, padding: "4px 8px",
       borderBottom: "1px solid #07070f",
       fontSize: 9,
-      color: "#777",
-      alignItems: "center",
     }}>
-      {/* Título + outcome */}
+      {/* Mercado + outcome */}
       <div style={{ overflow: "hidden" }}>
         <div style={{
           whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
-          color: "#aaa", fontSize: 9,
+          color: "#888", fontSize: 8,
         }}>
           {pos.title}
         </div>
         <div style={{
-          fontSize: 8, marginTop: 1,
+          fontSize: 8, fontWeight: 700,
           color: pos.outcome === "YES" ? "#00ff88" : "#ff4466",
           letterSpacing: "0.1em",
         }}>
           {pos.outcome}
         </div>
       </div>
-      {/* Tokens */}
       <div style={{ textAlign: "right" }}>{pos.size.toFixed(2)}</div>
-      {/* Precio medio */}
       <div style={{ textAlign: "right" }}>${pos.avgPrice.toFixed(4)}</div>
-      {/* Precio actual */}
       <div style={{ textAlign: "right", color: pnlColor }}>
         ${pos.curPrice.toFixed(4)}
       </div>
-      {/* % cambio */}
       <div style={{ textAlign: "right", color: pnlColor }}>
         {pnlPct != null ? `${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(1)}%` : "—"}
       </div>
-      {/* Valor actual */}
       <div style={{ textAlign: "right", color: "#00cc77", fontWeight: 700 }}>
         ${pos.currentValue.toFixed(4)}
       </div>
@@ -157,6 +133,7 @@ export default function BalanceWidget() {
   const [positions,      setPositions]      = useState([]);
   const [totalPortfolio, setTotalPortfolio] = useState(null);
   const [loading,        setLoading]        = useState(false);
+  const [histLoading,    setHistLoading]    = useState(true);
   const [error,          setError]          = useState(null);
   const [posError,       setPosError]       = useState(null);
   const [lastFetch,      setLastFetch]      = useState(null);
@@ -164,11 +141,41 @@ export default function BalanceWidget() {
   const [showPositions,  setShowPositions]  = useState(false);
   const [history,        setHistory]        = useState([]);
 
-  useEffect(() => { setHistory(loadHistory()); }, []);
-
   const prevTotal = useRef(null);
 
-  // ── Fetch ─────────────────────────────────────────────────────────────────
+  // ── Cargar historial desde Supabase al montar ─────────────────────────────
+  useEffect(() => {
+    async function loadHistory() {
+      setHistLoading(true);
+      try {
+        const res  = await fetch(`/api/balance-history?limit=${MAX_HISTORY}`);
+        const data = await res.json();
+        if (data.ok && Array.isArray(data.data)) {
+          setHistory(data.data);
+        }
+      } catch (e) {
+        console.warn("[BalanceWidget] No se pudo cargar historial:", e.message);
+      } finally {
+        setHistLoading(false);
+      }
+    }
+    loadHistory();
+  }, []);
+
+  // ── Guardar snapshot en Supabase ──────────────────────────────────────────
+  const saveSnapshot = useCallback(async (ts, usdc, total) => {
+    try {
+      await fetch("/api/balance-history", {
+        method:  "POST",
+        headers: { "Content-Type": "application/json" },
+        body:    JSON.stringify({ ts, usdc, total }),
+      });
+    } catch (e) {
+      console.warn("[BalanceWidget] Error guardando snapshot:", e.message);
+    }
+  }, []);
+
+  // ── Fetch balance ─────────────────────────────────────────────────────────
   const fetchBalance = useCallback(async () => {
     setLoading(true);
     setError(null);
@@ -181,7 +188,7 @@ export default function BalanceWidget() {
         return;
       }
 
-      const now   = new Date().toISOString();
+      const now      = new Date().toISOString();
       const newUsdc  = data.usdc;
       const newTotal = data.total_portfolio ?? newUsdc;
 
@@ -195,14 +202,20 @@ export default function BalanceWidget() {
       setLastFetch(now);
       setRpcUsed(data.rpc_used ?? null);
 
-      // Guardar snapshot si cambió
+      // ── Snapshot: solo si el total cambió significativamente ─────────────
       setHistory(prev => {
         const last    = prev[prev.length - 1];
-        const changed = !last || Math.abs((last.total ?? last.usdc ?? 0) - newTotal) >= SNAPSHOT_MIN_DELTA;
+        const changed = !last ||
+          Math.abs((last.total ?? last.usdc ?? 0) - newTotal) >= SNAPSHOT_MIN_DELTA;
+
         if (!changed) return prev;
+
         const point = { ts: now, usdc: newUsdc, total: newTotal };
         const next  = [...prev, point].slice(-MAX_HISTORY);
-        saveHistory(next);
+
+        // Persistir en Supabase (fire & forget)
+        saveSnapshot(now, newUsdc, newTotal);
+
         return next;
       });
 
@@ -212,7 +225,7 @@ export default function BalanceWidget() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [saveSnapshot]);
 
   useEffect(() => {
     fetchBalance();
@@ -221,13 +234,12 @@ export default function BalanceWidget() {
   }, [fetchBalance]);
 
   // ── Derived ───────────────────────────────────────────────────────────────
-  const firstTotal  = history.length > 1 ? (history[0].total ?? history[0].usdc) : null;
-  const deltaTotal  = totalPortfolio != null && firstTotal != null
+  const firstTotal = history.length > 1 ? (history[0].total ?? history[0].usdc) : null;
+  const deltaTotal = totalPortfolio != null && firstTotal != null
     ? totalPortfolio - firstTotal : null;
-  const deltaPct    = deltaTotal != null && firstTotal > 0
+  const deltaPct   = deltaTotal != null && firstTotal > 0
     ? (deltaTotal / firstTotal) * 100 : null;
 
-  // Gráfico: trazar total si existe, sino usdc
   const chartData = (() => {
     if (!history.length) return [];
     const src = history.length <= 100
@@ -240,15 +252,14 @@ export default function BalanceWidget() {
     }));
   })();
 
-  const chartKey    = "total";
-  const vals        = chartData.map(d => d[chartKey]).filter(v => v != null);
-  const minV        = vals.length ? Math.min(...vals) : 0;
-  const maxV        = vals.length ? Math.max(...vals) : 1;
-  const pad         = Math.max((maxV - minV) * 0.1, 0.5);
-  const yMin        = Math.max(0, minV - pad);
-  const yMax        = maxV + pad;
-  const trendColor  = deltaTotal == null ? "#0066ff" : deltaTotal >= 0 ? "#00ff88" : "#ff4466";
-  const firstVal    = chartData.length > 0 ? chartData[0][chartKey] : null;
+  const vals       = chartData.map(d => d.total).filter(v => v != null);
+  const minV       = vals.length ? Math.min(...vals) : 0;
+  const maxV       = vals.length ? Math.max(...vals) : 1;
+  const pad        = Math.max((maxV - minV) * 0.1, 0.5);
+  const yMin       = Math.max(0, minV - pad);
+  const yMax       = maxV + pad;
+  const trendColor = deltaTotal == null ? "#0066ff" : deltaTotal >= 0 ? "#00ff88" : "#ff4466";
+  const firstVal   = chartData.length > 0 ? chartData[0].total : null;
 
   // ── Render ────────────────────────────────────────────────────────────────
   return (
@@ -276,7 +287,6 @@ export default function BalanceWidget() {
           )}
         </div>
 
-        {/* Divisor */}
         <div style={S.divider} />
 
         {/* ── LIQUIDEZ USDC ── */}
@@ -294,7 +304,6 @@ export default function BalanceWidget() {
           {error && <div style={S.errTxt}>✗ {error}</div>}
         </div>
 
-        {/* Divisor */}
         <div style={S.divider} />
 
         {/* ── POSICIONES ACTIVAS ── */}
@@ -323,7 +332,7 @@ export default function BalanceWidget() {
           )}
         </div>
 
-        {/* Controles alineados a la derecha */}
+        {/* Controles */}
         <div style={S.controls}>
           <button onClick={fetchBalance} disabled={loading} style={S.btn(loading)}>
             {loading ? "…" : "↻"}
@@ -347,7 +356,7 @@ export default function BalanceWidget() {
             </div>
           )}
           <div style={{ ...S.meta, color: "#1a1a2a" }}>
-            {history.length}pt · 60s
+            {history.length}pt · supabase
           </div>
         </div>
       </div>
@@ -355,7 +364,6 @@ export default function BalanceWidget() {
       {/* ══════════════════ TABLA POSICIONES (expandible) ══════════════ */}
       {showPositions && positions.length > 0 && (
         <div style={S.posTable}>
-          {/* Cabecera */}
           <div style={{
             display: "grid",
             gridTemplateColumns: "1fr 48px 60px 52px 52px 64px",
@@ -373,7 +381,6 @@ export default function BalanceWidget() {
           {positions.map((pos, i) => (
             <PositionRow key={i} pos={pos} />
           ))}
-          {/* Totales */}
           <div style={{
             display: "grid",
             gridTemplateColumns: "1fr 48px 60px 52px 52px 64px",
@@ -382,10 +389,7 @@ export default function BalanceWidget() {
             fontSize: 9, color: "#555",
           }}>
             <div style={{ color: "#444", letterSpacing: "0.1em" }}>TOTAL</div>
-            <div />
-            <div />
-            <div />
-            <div />
+            <div /><div /><div /><div />
             <div style={{ textAlign: "right", color: "#00cc77", fontWeight: 700 }}>
               ${(posValue ?? 0).toFixed(4)}
             </div>
@@ -396,21 +400,19 @@ export default function BalanceWidget() {
       {/* ══════════════════ GRÁFICO EVOLUCIÓN ══════════════════════════ */}
       <div style={S.chartWrap}>
         <div style={S.chartLabel}>
-          EVOLUCIÓN PORTFOLIO · {history.length} SNAPSHOTS
+          EVOLUCIÓN PORTFOLIO · {histLoading ? "cargando…" : `${history.length} SNAPSHOTS`}
           {posCount != null && posCount > 0 && (
-            <span style={{ color: "#333", marginLeft: 8 }}>
-              (USDC + posiciones)
-            </span>
+            <span style={{ color: "#333", marginLeft: 8 }}>(USDC + posiciones)</span>
           )}
         </div>
 
-        {chartData.length < 2 ? (
+        {histLoading ? (
+          <div style={S.noData}>Cargando historial desde Supabase…</div>
+        ) : chartData.length < 2 ? (
           <div style={S.noData}>
             Acumulando datos…{" "}
             {chartData.length === 1 && (
-              <span style={{ color: "#333" }}>
-                (primer snapshot, esperando el siguiente)
-              </span>
+              <span style={{ color: "#333" }}>(primer snapshot, esperando el siguiente)</span>
             )}
           </div>
         ) : (
@@ -441,7 +443,7 @@ export default function BalanceWidget() {
               )}
               <Area
                 type="monotone"
-                dataKey={chartKey}
+                dataKey="total"
                 stroke={trendColor}
                 strokeWidth={1.5}
                 fill="url(#portGradient)"
@@ -490,49 +492,57 @@ const S = {
   },
   bigValue: (positive) => ({
     fontSize: 28, fontWeight: 700, lineHeight: 1,
-    color: positive == null ? "#ccc" : positive ? "var(--green, #00ff88)" : "var(--red, #ff4466)",
-    letterSpacing: "-0.02em",
+    color: positive == null ? "#ccc" : positive ? "#00ff88" : "#ff4466",
   }),
   midValue: {
-    fontSize: 20, fontWeight: 700, lineHeight: 1,
-    letterSpacing: "-0.02em",
+    fontSize: 18, fontWeight: 700, lineHeight: 1, marginBottom: 4,
   },
   delta: (positive) => ({
-    fontSize: 10, marginTop: 4,
-    color: positive ? "var(--green, #00ff88)" : "var(--red, #ff4466)",
+    fontSize: 9, marginTop: 4,
+    color: positive ? "#00ff88" : "#ff4466",
+    letterSpacing: "0.05em",
   }),
   sub: {
-    fontSize: 9, color: "#444", marginTop: 4,
+    fontSize: 8, color: "#555", marginTop: 3,
   },
   errTxt: {
-    fontSize: 9, color: "var(--red, #ff4466)", marginTop: 4,
+    fontSize: 8, color: "#ff4466", marginTop: 4,
   },
   controls: {
-    display: "flex", flexDirection: "column", alignItems: "flex-end",
-    gap: 5, flexShrink: 0, marginLeft: "auto",
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "flex-end",
+    gap: 4,
+    flexShrink: 0,
+    minWidth: 60,
   },
-  btn: (loading) => ({
-    background: "none", border: "1px solid #1a1a2a",
-    color: loading ? "#333" : "#555",
-    fontSize: 8, padding: "3px 8px",
-    cursor: loading ? "default" : "pointer",
-    fontFamily: "inherit", borderRadius: 2, letterSpacing: "0.1em",
+  btn: (disabled) => ({
+    background: "none",
+    border: "1px solid #0d0d1a",
+    color: disabled ? "#222" : "#444",
+    fontSize: 9,
+    padding: "2px 6px",
+    cursor: disabled ? "not-allowed" : "pointer",
+    fontFamily: "inherit",
+    letterSpacing: "0.1em",
+    borderRadius: 2,
   }),
   meta: {
-    fontSize: 7, color: "#2a2a3a", textAlign: "right",
+    fontSize: 7, color: "#2a2a3a", letterSpacing: "0.05em",
   },
   posTable: {
-    borderTop: "1px solid #0a0a14",
-    background: "#010108",
+    borderTop: "1px solid #0d0d1a",
   },
   chartWrap: {
-    borderTop: "1px solid #0a0a14",
-    padding: "10px 20px 14px",
+    borderTop: "1px solid #07070f",
+    padding: "8px 8px 8px 0",
   },
   chartLabel: {
-    fontSize: 8, color: "#333", letterSpacing: "0.12em", marginBottom: 6,
+    fontSize: 7, color: "#2a2a3a", letterSpacing: "0.12em",
+    paddingLeft: 12, marginBottom: 4,
   },
   noData: {
-    fontSize: 9, color: "#2a2a3a", textAlign: "center", padding: "20px 0",
+    fontSize: 8, color: "#2a2a3a", textAlign: "center",
+    padding: "16px 0", letterSpacing: "0.1em",
   },
 };
