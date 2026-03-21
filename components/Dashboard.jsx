@@ -1,19 +1,15 @@
 "use client";
 /**
- * Dashboard.jsx — v5.1
+ * Dashboard.jsx — v5.2
  *
- * CAMBIOS v5.1 — Integración BalanceWidget
+ * CAMBIOS v5.2
  * ─────────────────────────────────────────────────────────────────────
- *  - Import de BalanceWidget añadido.
- *  - Nueva sección "BALANCE WALLET" en el tab dashboard, justo después
- *    del bloque ModeSelector.
- *  - Sin cambios en lógica, hooks ni resto del render.
+ *  - BalanceWidget movido encima del grid de 3 columnas (más visible).
+ *    Antes estaba al final del tab, debajo de ModeSelector.
  *
+ * (v5.1 — Integración BalanceWidget)
  * (v5.0 — Corrección integral: getDecision, activeWindow, useBotState,
  *          target en PriceChart)
- * (v4.2 — fmtTime, hints de eventos)
- * (v4.1 — eventos acumulativos)
- * (v4.0 — simplificación MarketInfo, log de eventos)
  */
 
 import { useState, useEffect, useCallback } from "react";
@@ -23,14 +19,14 @@ import {
   fmt, fmtUSD,
 } from "../lib/constants";
 import { useBotState, useBTCPrice, useMarket, useClock } from "../lib/hooks";
-import PriceChart   from "./PriceChart";
-import WindowBar    from "./WindowBar";
-import MarketInfo   from "./MarketInfo";
-import BetsTable    from "./BetsTable";
-import ConfigPanel  from "./ConfigPanel";
-import StatsPanel   from "./StatsPanel";
-import ModeSelector from "./ModeSelector";
-import BalanceWidget from "./BalanceWidget";   // v5.1
+import PriceChart    from "./PriceChart";
+import WindowBar     from "./WindowBar";
+import MarketInfo    from "./MarketInfo";
+import BetsTable     from "./BetsTable";
+import ConfigPanel   from "./ConfigPanel";
+import StatsPanel    from "./StatsPanel";
+import ModeSelector  from "./ModeSelector";
+import BalanceWidget from "./BalanceWidget";
 
 const LS_KEY         = "polymarket_bets_v2";
 const BETS_POLL_MS   = 10_000;
@@ -88,13 +84,10 @@ export default function Dashboard() {
   const [priceHistory, setPriceHistory] = useState([]);
   const [events, setEvents]             = useState([]);
 
-  // ── Hooks de datos ────────────────────────────────────────────────────────
   const botState = useBotState();
   const { price, prev, source, loading: priceLoading } = useBTCPrice(true);
   const { market, endMs, error: marketError, apiResponse: marketApiResponse } = useMarket(botState.raw);
   const now = useClock();
-
-  // ── Valores derivados ─────────────────────────────────────────────────────
 
   const minsLeft     = getMinsLeft(endMs, now);
   const activeWindow = getActiveWindow(minsLeft);
@@ -107,14 +100,13 @@ export default function Dashboard() {
     ? getDecision(price, target, umbral)
     : null;
 
-  // Stats de bets
-  const closedBets = bets.filter(b => b.result && b.result !== "PENDING");
-  const wins       = closedBets.filter(b => b.result === "WIN").length;
-  const losses     = closedBets.filter(b => b.result === "LOSS" || b.result === "STOP").length;
-  const total      = closedBets.length;
-  const winrate    = total > 0 ? (wins / total) * 100 : null;
-  const pnlTotal   = closedBets.reduce((acc, b) => acc + (b.pnl_usd ?? 0), 0);
-  const activeBet  = bets.find(b => b.result === "PENDING") ?? null;
+  const closedBets      = bets.filter(b => b.result && b.result !== "PENDING");
+  const wins            = closedBets.filter(b => b.result === "WIN").length;
+  const losses          = closedBets.filter(b => b.result === "LOSS" || b.result === "STOP").length;
+  const total           = closedBets.length;
+  const winrate         = total > 0 ? (wins / total) * 100 : null;
+  const pnlTotal        = closedBets.reduce((acc, b) => acc + (b.pnl_usd ?? 0), 0);
+  const activeBet       = bets.find(b => b.result === "PENDING") ?? null;
   const marketSlugShort = market?.slug?.split("-").slice(-3).join("-") ?? null;
 
   // ── Fetch bets ────────────────────────────────────────────────────────────
@@ -133,7 +125,6 @@ export default function Dashboard() {
   }, []);
 
   useEffect(() => {
-    // Carga inicial desde caché
     try {
       const cached = localStorage.getItem(LS_KEY);
       if (cached) setBets(JSON.parse(cached));
@@ -208,8 +199,8 @@ export default function Dashboard() {
             animation: botState.running ? "pulse 2s infinite" : "none",
           }} />
           <span style={{ fontSize: 12, fontWeight: 700, letterSpacing: "0.1em" }}>POLYBOT</span>
-          {botState.stale   && <Tag color="var(--yellow)">BOT STALE</Tag>}
-          {marketSlugShort  && <Tag color="#4488ff">{marketSlugShort}</Tag>}
+          {botState.stale  && <Tag color="var(--yellow)">BOT STALE</Tag>}
+          {marketSlugShort && <Tag color="#4488ff">{marketSlugShort}</Tag>}
           {activeBet && (
             <Tag color={activeBet.direction === "UP" ? "var(--green)" : "var(--red)"}>
               {activeBet.direction === "UP" ? "▲" : "▼"} APUESTA ACTIVA
@@ -234,10 +225,10 @@ export default function Dashboard() {
       {/* ── TABS ────────────────────────────────────────────────────────── */}
       <nav style={{ display: "flex", borderBottom: "1px solid var(--border)", background: "#020208" }}>
         {[
-          { key: "dashboard",  label: "DASHBOARD"     },
-          { key: "historial",  label: "HISTORIAL"     },
-          { key: "stats",      label: "ESTADÍSTICAS"  },
-          { key: "config",     label: "CONFIG"        },
+          { key: "dashboard", label: "DASHBOARD"    },
+          { key: "historial", label: "HISTORIAL"    },
+          { key: "stats",     label: "ESTADÍSTICAS" },
+          { key: "config",    label: "CONFIG"       },
         ].map(({ key, label }) => (
           <button key={key} onClick={() => setTab(key)} style={{
             background: "none", border: "none", cursor: "pointer",
@@ -273,6 +264,14 @@ export default function Dashboard() {
           <div style={{ marginLeft: "auto", fontSize: 9, color: "#333", alignSelf: "center" }}>
             ↻ sync cada 10s · fuente: Supabase
           </div>
+        </div>
+      )}
+
+      {/* ── BALANCE WALLET ──────────────────────────────────────────────── */}
+      {/* v5.2: encima del grid principal para máxima visibilidad           */}
+      {tab === "dashboard" && (
+        <div style={{ padding: "20px 24px", borderBottom: "1px solid var(--border)" }}>
+          <BalanceWidget />
         </div>
       )}
 
@@ -341,7 +340,7 @@ export default function Dashboard() {
                     ? "var(--red)"
                     : "#555",
                 }}>
-                  {decision.direction === "UP"   ? "▲ UP"
+                  {decision.direction === "UP"    ? "▲ UP"
                    : decision.direction === "DOWN" ? "▼ DOWN"
                    : "— WAIT"}
                 </div>
@@ -465,14 +464,6 @@ export default function Dashboard() {
       {tab === "dashboard" && (
         <div style={{ padding: "20px 24px", borderBottom: "1px solid var(--border)" }}>
           <ModeSelector />
-        </div>
-      )}
-
-      {/* ── BALANCE WALLET ──────────────────────────────────────────────── */}
-      {/* v5.1: saldo USDC + POL en Polymarket con gráfico de evolución     */}
-      {tab === "dashboard" && (
-        <div style={{ padding: "20px 24px", borderBottom: "1px solid var(--border)" }}>
-          <BalanceWidget />
         </div>
       )}
 
