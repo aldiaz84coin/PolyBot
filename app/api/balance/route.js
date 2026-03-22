@@ -1,36 +1,43 @@
 /**
- * app/api/balance/route.js — v3.2
+ * app/api/balance/route.js — v3.3
  *
- * CAMBIOS v3.2
+ * CAMBIOS v3.3
  * ─────────────────────────────────────────────────────────────────────
- *  Diagnóstico mejorado para el banner de error del widget
+ *  BUG FIX CRÍTICO — Vercel cacheaba la respuesta edge
  *
- *  Problema: cuando la API devolvía { success: false, error: "..." }
- *  el dashboard no tenía información para entender la causa raíz
- *  (¿wallet no configurada? ¿RPC caído?).
+ *  Síntoma: el widget actualizaba (fetchBalance cada 60s), las entradas
+ *  llegaban a Supabase balance_history, pero el valor nunca cambiaba.
+ *  Siempre era el mismo snapshot antiguo.
  *
- *  Cambios:
- *    1. wallet_hint en todos los errores: primeros 10 chars de la wallet
- *       resuelta (o "NULL" si no se encontró). El widget lo muestra en
- *       el banner de error para diagnóstico rápido.
- *    2. rpc_errors: lista de los RPCs que fallaron (con el motivo corto).
- *       Solo se incluye cuando el fallo es por RPCs.
- *    3. Nuevo log de console.info al resolver la wallet para facilitar
- *       diagnóstico en los logs de Vercel.
- *    4. Fallback extra en resolveWallet: busca también la clave "funder"
- *       (sin sufijo _address) en bot_config, por si se usó otro nombre.
+ *  Causa raíz: el route tenía `export const runtime = "edge"` pero NO
+ *  `export const dynamic = "force-dynamic"`. Vercel interpreta las rutas
+ *  edge sin ese flag como candidatas a cacheo en la CDN. El primer hit
+ *  generaba la respuesta real; todos los siguientes la devolvían cacheada,
+ *  ignorando los RPCs de Polygon y la API de Polymarket.
  *
+ *  Correcciones:
+ *    1. `export const dynamic = "force-dynamic"` — deshabilita el cacheo
+ *       de Vercel para esta ruta; cada request ejecuta el handler real.
+ *    2. `Cache-Control: no-store, no-cache` en TODAS las respuestas
+ *       (éxito, error 400, error 503) — segunda línea de defensa.
+ *    3. Migrado de runtime "edge" a "nodejs" para mayor compatibilidad
+ *       con AbortSignal.timeout() y BigInt en todos los entornos.
+ *
+ * (v3.2 — Diagnóstico mejorado wallet_hint + rpc_errors)
  * (v3.1 — Bug FIX posiciones fantasma de mercados resueltos)
  * (v3.0 — RPCs limpios, USDC native + bridged, proxy wallet fix)
  */
 
-export const runtime = "edge";
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";   // ← FIX: desactiva cacheo Vercel
 
 // ── Constantes ────────────────────────────────────────────────────────────────
 
 const USDC_NATIVE   = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359";
 const USDC_BRIDGED  = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
 const DATA_API_BASE = "https://data-api.polymarket.com";
+
+const NO_CACHE = { "Cache-Control": "no-store, no-cache" };   // ← FIX: cabecera en todas las respuestas
 
 const POLYGON_RPCS = [
   "https://polygon-rpc.com",
@@ -48,10 +55,9 @@ async function resolveWallet() {
     ?? process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
 
   if (supabaseUrl && supabaseKey) {
-    // Intentar varias combinaciones de tabla/clave
     const attempts = [
       { table: "bot_config", keyField: "funder_address" },
-      { table: "bot_config", keyField: "funder"         },   // ← nuevo fallback
+      { table: "bot_config", keyField: "funder"         },
       { table: "config",     keyField: "funder"         },
       { table: "config",     keyField: "funder_address" },
     ];
@@ -86,7 +92,7 @@ async function resolveWallet() {
   if (envWallet) {
     console.info(`[balance] wallet resuelta desde env: ${envWallet.slice(0, 10)}…`);
   } else {
-    console.error("[balance] wallet NO encontrada — configura POLYMARKET_FUNDER en Vercel o añade bot_config.funder_address en Supabase");
+    console.error("[balance] wallet NO encontrada — configura POLYMARKET_FUNDER en Vercel");
   }
   return envWallet;
 }
@@ -139,7 +145,6 @@ async function fetchPositions(proxyWallet) {
     }));
 
     // Filtrar solo posiciones verdaderamente abiertas (v3.1)
-    // curPrice entre 0.01 y 0.99 → mercado sin resolver
     const positions = allPositions.filter(p =>
       p.size > 0.001 &&
       p.curPrice > 0.01 &&
@@ -179,7 +184,7 @@ export async function GET() {
       error:       "Wallet no configurada. Añade POLYMARKET_FUNDER en Vercel o bot_config.funder_address en Supabase.",
       wallet_hint: wallet ? wallet.slice(0, 10) + "…" : "NULL",
       rpc_errors:  [],
-    }, { status: 400 });
+    }, { status: 400, headers: NO_CACHE });   // ← FIX: no-store
   }
 
   // 2. Resolver proxy wallet + lanzar fetchPositions en paralelo con on-chain
@@ -255,7 +260,7 @@ export async function GET() {
       error:       `Todos los RPCs de Polygon fallaron. Último: ${lastError}`,
       wallet_hint: wallet.slice(0, 10) + "…",
       rpc_errors:  rpcErrors,
-    }, { status: 503 });
+    }, { status: 503, headers: NO_CACHE });   // ← FIX: no-store
   }
 
   // 4. Esperar proxy wallet y posiciones
@@ -282,9 +287,8 @@ export async function GET() {
     positions_value: posResult.positions_value,
     positions:       posResult.positions,
     positions_error: posResult.positions_error ?? null,
-    // Total = USDC líquido + posiciones verdaderamente abiertas
     total_portfolio: posResult.ok
       ? Math.round((usdc_total + pos_value) * 10000) / 10000
       : null,
-  });
+  }, { headers: NO_CACHE });   // ← FIX: no-store en la respuesta de éxito
 }
