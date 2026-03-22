@@ -1,32 +1,32 @@
 "use client";
 /**
- * components/BalanceWidget.jsx — v3.0
+ * components/BalanceWidget.jsx — v3.1
  *
- * CAMBIOS v3.0
+ * CAMBIOS v3.1
  * ─────────────────────────────────────────────────────────────────────
- *  Migración localStorage → Supabase
- *    El historial de snapshots de portfolio se persiste ahora en la
- *    tabla `balance_history` de Supabase via /api/balance-history,
- *    en lugar de en localStorage del navegador.
+ *  BUG FIX — Portfolio congelado ("la foto")
  *
- *    Ventajas:
- *      · Historial compartido entre dispositivos y sesiones
- *      · No se pierde al limpiar el navegador
- *      · Datos accesibles desde cualquier dashboard / análisis
+ *  Síntoma: el gráfico mostraba el historial de Supabase (snapshot
+ *  pasado) pero los valores live (USDC, posiciones, total) nunca se
+ *  actualizaban.
  *
- *    Estrategia de carga:
- *      1. Al montar: GET /api/balance-history → pinta el gráfico
- *         con histórico real desde Supabase
- *      2. Tras cada fetchBalance exitoso: si Δtotal ≥ SNAPSHOT_MIN_DELTA
- *         → POST /api/balance-history con el nuevo punto
- *      3. El estado local `history` se actualiza optimistamente (sin
- *         esperar la respuesta del POST) para que el gráfico sea inmediato
+ *  Causa raíz: /api/balance devolvía { success: false, error: "..." }
+ *  (wallet no resuelta o todos los RPCs fallando) → fetchBalance()
+ *  hacía early return sin actualizar ningún estado live. El error se
+ *  pintaba en S.errTxt de 8px, prácticamente invisible.
  *
- *    Fallback: si /api/balance-history falla, el widget sigue funcionando
- *    normalmente — solo sin persistencia entre sesiones.
+ *  Correcciones:
+ *    1. Banner de error prominente cuando /api/balance falla, con el
+ *       mensaje completo y diagnóstico (wallet_hint, rpc_errors si los
+ *       devuelve la API v3.2).
+ *    2. Retry automático agresivo: en caso de error reintenta a los 15s
+ *       en vez de esperar los 60s del intervalo normal.
+ *    3. Botón ↻ siempre visible aunque loading=false y haya error.
+ *    4. Indicador "LIVE" / "STALE" junto a la última hora de fetch.
+ *    5. En polling normal (sin error) se mantiene POLL_INTERVAL_MS=60s.
  *
+ * (v3.0 — Migración localStorage → Supabase, historial persistido)
  * (v2.0 — USDC + posiciones activas + tabla expandible + gráfico)
- * (v1.0 — USDC + POL + gráfico evolución)
  */
 
 import { useState, useEffect, useCallback, useRef } from "react";
@@ -38,7 +38,9 @@ import {
 
 const MAX_HISTORY        = 500;
 const POLL_INTERVAL_MS   = 60_000;
+const RETRY_ON_ERROR_MS  = 15_000;   // reintento rápido si /api/balance falla
 const SNAPSHOT_MIN_DELTA = 0.001;
+const STALE_THRESHOLD_MS = 90_000;   // >90s sin éxito → "STALE"
 
 // ── Utilidades ────────────────────────────────────────────────────────────────
 
@@ -88,15 +90,15 @@ function PositionRow({ pos }) {
     <div style={{
       display: "grid",
       gridTemplateColumns: "1fr 48px 60px 52px 52px 64px",
-      gap: 6, padding: "4px 8px",
+      gap: 6, padding: "5px 8px",
       borderBottom: "1px solid #07070f",
-      fontSize: 9,
+      fontSize: 9, alignItems: "center",
     }}>
-      {/* Mercado + outcome */}
       <div style={{ overflow: "hidden" }}>
         <div style={{
-          whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
-          color: "#888", fontSize: 8,
+          overflow: "hidden", textOverflow: "ellipsis",
+          whiteSpace: "nowrap", fontSize: 8, color: "#888",
+          marginBottom: 2,
         }}>
           {pos.title}
         </div>
@@ -123,6 +125,66 @@ function PositionRow({ pos }) {
   );
 }
 
+// ── Subcomponente: banner de error ────────────────────────────────────────────
+
+function ErrorBanner({ error, apiDiag, onRetry, loading }) {
+  if (!error) return null;
+  return (
+    <div style={{
+      margin: "0 12px 10px",
+      padding: "8px 12px",
+      background: "#1a0508",
+      border: "1px solid #ff446633",
+      borderRadius: 3,
+      fontSize: 9,
+      color: "#ff6677",
+      lineHeight: 1.7,
+    }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+        <div>
+          <span style={{ color: "#ff4466", fontWeight: 700, letterSpacing: "0.1em" }}>
+            ✗ /api/balance FALLÓ
+          </span>
+          <div style={{ marginTop: 3, color: "#cc3344", wordBreak: "break-word" }}>
+            {error}
+          </div>
+          {apiDiag?.wallet_hint && (
+            <div style={{ marginTop: 2, color: "#552233" }}>
+              Wallet buscada: <span style={{ color: "#884455" }}>{apiDiag.wallet_hint}</span>
+            </div>
+          )}
+          {apiDiag?.rpc_errors?.length > 0 && (
+            <div style={{ marginTop: 2, color: "#552233" }}>
+              RPCs fallidos: {apiDiag.rpc_errors.join(", ")}
+            </div>
+          )}
+          <div style={{ marginTop: 4, color: "#442233", fontSize: 8 }}>
+            Reintentando en 15s… o pulsa ↻
+          </div>
+        </div>
+        <button
+          onClick={onRetry}
+          disabled={loading}
+          style={{
+            marginLeft: 12,
+            background: "none",
+            border: "1px solid #ff446644",
+            color: loading ? "#442233" : "#ff4466",
+            fontSize: 9,
+            padding: "3px 8px",
+            cursor: loading ? "not-allowed" : "pointer",
+            fontFamily: "inherit",
+            borderRadius: 2,
+            flexShrink: 0,
+          }}
+        >
+          {loading ? "…" : "↻ RETRY"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 // ── Componente principal ──────────────────────────────────────────────────────
 
 export default function BalanceWidget() {
@@ -135,13 +197,22 @@ export default function BalanceWidget() {
   const [loading,        setLoading]        = useState(false);
   const [histLoading,    setHistLoading]    = useState(true);
   const [error,          setError]          = useState(null);
+  const [apiDiag,        setApiDiag]        = useState(null);   // diagnóstico extra de la API
   const [posError,       setPosError]       = useState(null);
-  const [lastFetch,      setLastFetch]      = useState(null);
+  const [lastFetch,      setLastFetch]      = useState(null);   // ISO de último fetch exitoso
+  const [lastAttempt,    setLastAttempt]    = useState(null);   // ISO del último intento
   const [rpcUsed,        setRpcUsed]        = useState(null);
   const [showPositions,  setShowPositions]  = useState(false);
   const [history,        setHistory]        = useState([]);
 
-  const prevTotal = useRef(null);
+  const prevTotal    = useRef(null);
+  const errorTimerRef = useRef(null);   // timer del retry rápido por error
+  const pollTimerRef  = useRef(null);   // timer del poll normal
+
+  // Stale: más de 90s desde el último fetch exitoso
+  const isStale = lastFetch
+    ? (Date.now() - new Date(lastFetch).getTime()) > STALE_THRESHOLD_MS
+    : true;
 
   // ── Cargar historial desde Supabase al montar ─────────────────────────────
   useEffect(() => {
@@ -175,16 +246,34 @@ export default function BalanceWidget() {
     }
   }, []);
 
-  // ── Fetch balance ─────────────────────────────────────────────────────────
+  // ── Fetch balance (definido con useCallback para poder llamarlo manualmente) ─
   const fetchBalance = useCallback(async () => {
+    // Cancelar timer de retry si había uno pendiente
+    if (errorTimerRef.current) {
+      clearTimeout(errorTimerRef.current);
+      errorTimerRef.current = null;
+    }
+
     setLoading(true);
     setError(null);
+    setApiDiag(null);
+    setLastAttempt(new Date().toISOString());
+
     try {
       const res  = await fetch("/api/balance");
       const data = await res.json();
 
       if (!data.success) {
-        setError(data.error ?? "Error desconocido");
+        const errMsg = data.error ?? "Error desconocido";
+        console.error("[BalanceWidget] /api/balance →", errMsg, data);
+        setError(errMsg);
+        // Guardar info de diagnóstico extra que devuelve v3.2
+        setApiDiag({
+          wallet_hint: data.wallet_hint ?? null,
+          rpc_errors:  data.rpc_errors  ?? [],
+        });
+        // Programar retry rápido
+        errorTimerRef.current = setTimeout(fetchBalance, RETRY_ON_ERROR_MS);
         return;
       }
 
@@ -212,25 +301,31 @@ export default function BalanceWidget() {
 
         const point = { ts: now, usdc: newUsdc, total: newTotal };
         const next  = [...prev, point].slice(-MAX_HISTORY);
-
-        // Persistir en Supabase (fire & forget)
         saveSnapshot(now, newUsdc, newTotal);
-
         return next;
       });
 
       prevTotal.current = newTotal;
+
     } catch (e) {
+      console.error("[BalanceWidget] fetchBalance exception:", e.message);
       setError(e.message);
+      // Programar retry rápido
+      errorTimerRef.current = setTimeout(fetchBalance, RETRY_ON_ERROR_MS);
     } finally {
       setLoading(false);
     }
   }, [saveSnapshot]);
 
+  // ── Polling normal ────────────────────────────────────────────────────────
   useEffect(() => {
     fetchBalance();
-    const id = setInterval(fetchBalance, POLL_INTERVAL_MS);
-    return () => clearInterval(id);
+
+    pollTimerRef.current = setInterval(fetchBalance, POLL_INTERVAL_MS);
+    return () => {
+      clearInterval(pollTimerRef.current);
+      if (errorTimerRef.current) clearTimeout(errorTimerRef.current);
+    };
   }, [fetchBalance]);
 
   // ── Derived ───────────────────────────────────────────────────────────────
@@ -301,7 +396,6 @@ export default function BalanceWidget() {
               <span style={{ color: "#555" }}>{pol.toFixed(4)}</span>
             </div>
           )}
-          {error && <div style={S.errTxt}>✗ {error}</div>}
         </div>
 
         <div style={S.divider} />
@@ -348,6 +442,8 @@ export default function BalanceWidget() {
           {lastFetch && (
             <div style={S.meta}>
               {fmtTime(lastFetch)}
+              {isStale && <span style={{ color: "#ff4466", marginLeft: 3 }}>STALE</span>}
+              {!isStale && <span style={{ color: "#00ff88", marginLeft: 3 }}>LIVE</span>}
               {rpcUsed && (
                 <span style={{ marginLeft: 4 }}>
                   · {rpcUsed.replace("https://", "").split("/")[0].split(".").slice(0, 2).join(".")}
@@ -360,6 +456,14 @@ export default function BalanceWidget() {
           </div>
         </div>
       </div>
+
+      {/* ══════════════════ BANNER DE ERROR (prominente) ═══════════════ */}
+      <ErrorBanner
+        error={error}
+        apiDiag={apiDiag}
+        onRetry={fetchBalance}
+        loading={loading}
+      />
 
       {/* ══════════════════ TABLA POSICIONES (expandible) ══════════════ */}
       {showPositions && positions.length > 0 && (
@@ -403,6 +507,11 @@ export default function BalanceWidget() {
           EVOLUCIÓN PORTFOLIO · {histLoading ? "cargando…" : `${history.length} SNAPSHOTS`}
           {posCount != null && posCount > 0 && (
             <span style={{ color: "#333", marginLeft: 8 }}>(USDC + posiciones)</span>
+          )}
+          {error && history.length > 0 && (
+            <span style={{ color: "#ff446688", marginLeft: 8 }}>
+              ⚠ mostrando último snapshot — datos live no disponibles
+            </span>
           )}
         </div>
 
@@ -504,9 +613,6 @@ const S = {
   }),
   sub: {
     fontSize: 8, color: "#555", marginTop: 3,
-  },
-  errTxt: {
-    fontSize: 8, color: "#ff4466", marginTop: 4,
   },
   controls: {
     display: "flex",
