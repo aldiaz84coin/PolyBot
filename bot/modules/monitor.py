@@ -788,13 +788,17 @@ def run(cfg: dict):
                     )
 
                     # v11.0: claim automático en modo LIVE
+                    # v11.5 FIX: orden de args corregido (era cfg, active_bet, token_id)
                     if not sim_ and real_exit_token_id:
+                        _bet_for_claim = active_bet
                         def _do_claim():
                             try:
-                                claim_with_retry(cfg, active_bet, real_exit_token_id)
+                                claim_with_retry(_bet_for_claim, cfg)
+                            except TypeError as _te:
+                                logger.error(f"[MONITOR] ❌ claim TypeError (firma incorrecta): {_te}", exc_info=True)
                             except Exception as _ce:
-                                logger.error(f"[MONITOR] claim error: {_ce}")
-                        threading.Thread(target=_do_claim, daemon=True).start()
+                                logger.error(f"[MONITOR] ❌ claim error: {_ce}", exc_info=True)
+                        threading.Thread(target=_do_claim, daemon=True, name=f"claim-{active_bet.get('id','x')}").start()
 
                 else:
                     exit_odds         = real_exit_price
