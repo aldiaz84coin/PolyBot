@@ -1,30 +1,33 @@
 "use client";
 /**
- * components/BalanceWidget.jsx — v3.1
+ * components/BalanceWidget.jsx — v3.2
  *
- * CAMBIOS v3.1
+ * CAMBIOS v3.2
  * ─────────────────────────────────────────────────────────────────────
- *  BUG FIX — Portfolio congelado ("la foto")
+ *  BUG FIX — Historial Supabase congelado en el snapshot de mount
  *
- *  Síntoma: el gráfico mostraba el historial de Supabase (snapshot
- *  pasado) pero los valores live (USDC, posiciones, total) nunca se
- *  actualizaban.
+ *  Síntoma: las métricas live (USDC, posiciones, total) se actualizaban
+ *  correctamente cada 60s, pero el gráfico "EVOLUCIÓN PORTFOLIO" quedaba
+ *  estancado en los datos que Supabase tenía al cargar la página.
+ *  Si entre tanto entraban nuevos snapshots en balance_history (desde
+ *  esta u otra sesión), el gráfico no los reflejaba.
  *
- *  Causa raíz: /api/balance devolvía { success: false, error: "..." }
- *  (wallet no resuelta o todos los RPCs fallando) → fetchBalance()
- *  hacía early return sin actualizar ningún estado live. El error se
- *  pintaba en S.errTxt de 8px, prácticamente invisible.
+ *  Causa raíz: loadHistory() sólo se llamaba dentro de un useEffect con
+ *  dependencias vacías — es decir, una única vez al montar el componente.
+ *  No había ningún mecanismo de refresco posterior.
  *
  *  Correcciones:
- *    1. Banner de error prominente cuando /api/balance falla, con el
- *       mensaje completo y diagnóstico (wallet_hint, rpc_errors si los
- *       devuelve la API v3.2).
- *    2. Retry automático agresivo: en caso de error reintenta a los 15s
- *       en vez de esperar los 60s del intervalo normal.
- *    3. Botón ↻ siempre visible aunque loading=false y haya error.
- *    4. Indicador "LIVE" / "STALE" junto a la última hora de fetch.
- *    5. En polling normal (sin error) se mantiene POLL_INTERVAL_MS=60s.
+ *    1. loadHistory() migrada a useCallback para poder reutilizarla.
+ *    2. Intervalo HISTORY_POLL_MS (5 min) que recarga el historial
+ *       completo desde Supabase en segundo plano.
+ *    3. Listener visibilitychange: al volver a la pestaña se fuerza un
+ *       loadHistory() inmediato (evita mostrar un gráfico rancio tras
+ *       dejar el tab en segundo plano).
+ *    4. Merge inteligente: los puntos del historial Supabase se fusionan
+ *       con cualquier punto generado en la sesión actual, de forma que
+ *       nunca se pierden datos recientes en memoria.
  *
+ * (v3.1 — BUG FIX portfolio congelado: error /api/balance invisible)
  * (v3.0 — Migración localStorage → Supabase, historial persistido)
  * (v2.0 — USDC + posiciones activas + tabla expandible + gráfico)
  */
@@ -37,10 +40,11 @@ import {
 // ── Constantes ────────────────────────────────────────────────────────────────
 
 const MAX_HISTORY        = 500;
-const POLL_INTERVAL_MS   = 60_000;
-const RETRY_ON_ERROR_MS  = 15_000;   // reintento rápido si /api/balance falla
+const POLL_INTERVAL_MS   = 60_000;       // refresco live balance
+const RETRY_ON_ERROR_MS  = 15_000;       // reintento rápido si /api/balance falla
+const HISTORY_POLL_MS    = 5 * 60_000;   // v3.2: refresco periódico historial Supabase
 const SNAPSHOT_MIN_DELTA = 0.001;
-const STALE_THRESHOLD_MS = 90_000;   // >90s sin éxito → "STALE"
+const STALE_THRESHOLD_MS = 90_000;       // >90s sin éxito → "STALE"
 
 // ── Utilidades ────────────────────────────────────────────────────────────────
 
@@ -63,124 +67,31 @@ function xLabel(iso) {
   } catch { return ""; }
 }
 
-// ── Subcomponente: tooltip del gráfico ───────────────────────────────────────
+// v3.2: merge historial Supabase con puntos en memoria (evita duplicados por ts)
+function mergeHistory(fromDb, inMemory) {
+  const map = new Map();
+  for (const p of fromDb)      map.set(p.ts, p);
+  for (const p of inMemory)    map.set(p.ts, p);   // memoria gana en caso de colisión
+  return Array.from(map.values())
+    .sort((a, b) => new Date(a.ts) - new Date(b.ts))
+    .slice(-MAX_HISTORY);
+}
+
+// ── Tooltip personalizado ─────────────────────────────────────────────────────
 
 function ChartTooltip({ active, payload, label }) {
   if (!active || !payload?.length) return null;
+  const d = payload[0].payload;
   return (
     <div style={{
-      background: "#010108", border: "1px solid #0d0d1a",
-      padding: "4px 8px", fontSize: 9, fontFamily: "inherit",
+      background: "#0a0a14", border: "1px solid #1a1a2e",
+      padding: "6px 10px", fontSize: 9, fontFamily: "inherit", color: "#ccc",
     }}>
-      <div style={{ color: "#444" }}>{label}</div>
-      <div style={{ color: "#00ff88" }}>${payload[0]?.value?.toFixed(4)}</div>
-    </div>
-  );
-}
-
-// ── Subcomponente: fila de posición ──────────────────────────────────────────
-
-function PositionRow({ pos }) {
-  const pnlPct   = pos.avgPrice > 0
-    ? ((pos.curPrice - pos.avgPrice) / pos.avgPrice) * 100
-    : null;
-  const pnlColor = pnlPct == null ? "#555" : pnlPct >= 0 ? "#00ff88" : "#ff4466";
-
-  return (
-    <div style={{
-      display: "grid",
-      gridTemplateColumns: "1fr 48px 60px 52px 52px 64px",
-      gap: 6, padding: "5px 8px",
-      borderBottom: "1px solid #07070f",
-      fontSize: 9, alignItems: "center",
-    }}>
-      <div style={{ overflow: "hidden" }}>
-        <div style={{
-          overflow: "hidden", textOverflow: "ellipsis",
-          whiteSpace: "nowrap", fontSize: 8, color: "#888",
-          marginBottom: 2,
-        }}>
-          {pos.title}
-        </div>
-        <div style={{
-          fontSize: 8, fontWeight: 700,
-          color: pos.outcome === "YES" ? "#00ff88" : "#ff4466",
-          letterSpacing: "0.1em",
-        }}>
-          {pos.outcome}
-        </div>
-      </div>
-      <div style={{ textAlign: "right" }}>{pos.size.toFixed(2)}</div>
-      <div style={{ textAlign: "right" }}>${pos.avgPrice.toFixed(4)}</div>
-      <div style={{ textAlign: "right", color: pnlColor }}>
-        ${pos.curPrice.toFixed(4)}
-      </div>
-      <div style={{ textAlign: "right", color: pnlColor }}>
-        {pnlPct != null ? `${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(1)}%` : "—"}
-      </div>
-      <div style={{ textAlign: "right", color: "#00cc77", fontWeight: 700 }}>
-        ${pos.currentValue.toFixed(4)}
-      </div>
-    </div>
-  );
-}
-
-// ── Subcomponente: banner de error ────────────────────────────────────────────
-
-function ErrorBanner({ error, apiDiag, onRetry, loading }) {
-  if (!error) return null;
-  return (
-    <div style={{
-      margin: "0 12px 10px",
-      padding: "8px 12px",
-      background: "#1a0508",
-      border: "1px solid #ff446633",
-      borderRadius: 3,
-      fontSize: 9,
-      color: "#ff6677",
-      lineHeight: 1.7,
-    }}>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
-        <div>
-          <span style={{ color: "#ff4466", fontWeight: 700, letterSpacing: "0.1em" }}>
-            ✗ /api/balance FALLÓ
-          </span>
-          <div style={{ marginTop: 3, color: "#cc3344", wordBreak: "break-word" }}>
-            {error}
-          </div>
-          {apiDiag?.wallet_hint && (
-            <div style={{ marginTop: 2, color: "#552233" }}>
-              Wallet buscada: <span style={{ color: "#884455" }}>{apiDiag.wallet_hint}</span>
-            </div>
-          )}
-          {apiDiag?.rpc_errors?.length > 0 && (
-            <div style={{ marginTop: 2, color: "#552233" }}>
-              RPCs fallidos: {apiDiag.rpc_errors.join(", ")}
-            </div>
-          )}
-          <div style={{ marginTop: 4, color: "#442233", fontSize: 8 }}>
-            Reintentando en 15s… o pulsa ↻
-          </div>
-        </div>
-        <button
-          onClick={onRetry}
-          disabled={loading}
-          style={{
-            marginLeft: 12,
-            background: "none",
-            border: "1px solid #ff446644",
-            color: loading ? "#442233" : "#ff4466",
-            fontSize: 9,
-            padding: "3px 8px",
-            cursor: loading ? "not-allowed" : "pointer",
-            fontFamily: "inherit",
-            borderRadius: 2,
-            flexShrink: 0,
-          }}
-        >
-          {loading ? "…" : "↻ RETRY"}
-        </button>
-      </div>
+      <div style={{ color: "#444", marginBottom: 3 }}>{label}</div>
+      <div>TOTAL <span style={{ color: "#0066ff" }}>${(d.total ?? 0).toFixed(4)}</span></div>
+      {d.usdc != null && d.usdc !== d.total && (
+        <div>USDC <span style={{ color: "#888" }}>${d.usdc.toFixed(4)}</span></div>
+      )}
     </div>
   );
 }
@@ -194,44 +105,65 @@ export default function BalanceWidget() {
   const [posValue,       setPosValue]       = useState(null);
   const [positions,      setPositions]      = useState([]);
   const [totalPortfolio, setTotalPortfolio] = useState(null);
-  const [loading,        setLoading]        = useState(false);
-  const [histLoading,    setHistLoading]    = useState(true);
-  const [error,          setError]          = useState(null);
-  const [apiDiag,        setApiDiag]        = useState(null);   // diagnóstico extra de la API
   const [posError,       setPosError]       = useState(null);
-  const [lastFetch,      setLastFetch]      = useState(null);   // ISO de último fetch exitoso
-  const [lastAttempt,    setLastAttempt]    = useState(null);   // ISO del último intento
+  const [loading,        setLoading]        = useState(false);
+  const [histLoading,    setHistLoading]    = useState(false);
+  const [error,          setError]          = useState(null);
+  const [apiDiag,        setApiDiag]        = useState(null);
+  const [lastFetch,      setLastFetch]      = useState(null);
+  const [lastAttempt,    setLastAttempt]    = useState(null);
   const [rpcUsed,        setRpcUsed]        = useState(null);
-  const [showPositions,  setShowPositions]  = useState(false);
   const [history,        setHistory]        = useState([]);
+  const [expanded,       setExpanded]       = useState(false);
 
-  const prevTotal    = useRef(null);
-  const errorTimerRef = useRef(null);   // timer del retry rápido por error
-  const pollTimerRef  = useRef(null);   // timer del poll normal
+  const pollTimerRef    = useRef(null);
+  const errorTimerRef   = useRef(null);
+  const histTimerRef    = useRef(null);   // v3.2: timer refresco historial
+  const prevTotal       = useRef(null);
 
-  // Stale: más de 90s desde el último fetch exitoso
-  const isStale = lastFetch
-    ? (Date.now() - new Date(lastFetch).getTime()) > STALE_THRESHOLD_MS
-    : true;
+  const isStale = !lastFetch
+    ? true
+    : (Date.now() - new Date(lastFetch).getTime()) > STALE_THRESHOLD_MS;
 
-  // ── Cargar historial desde Supabase al montar ─────────────────────────────
+  // ── v3.2: loadHistory como useCallback para reutilizarla ─────────────────
+  const loadHistory = useCallback(async () => {
+    setHistLoading(true);
+    try {
+      const res  = await fetch(`/api/balance-history?limit=${MAX_HISTORY}`);
+      const data = await res.json();
+      if (data.ok && Array.isArray(data.data)) {
+        // Merge con lo que ya tenemos en memoria (no perder puntos recientes)
+        setHistory(prev => mergeHistory(data.data, prev));
+      }
+    } catch (e) {
+      console.warn("[BalanceWidget] No se pudo cargar historial:", e.message);
+    } finally {
+      setHistLoading(false);
+    }
+  }, []);
+
+  // ── Cargar historial al montar ────────────────────────────────────────────
   useEffect(() => {
-    async function loadHistory() {
-      setHistLoading(true);
-      try {
-        const res  = await fetch(`/api/balance-history?limit=${MAX_HISTORY}`);
-        const data = await res.json();
-        if (data.ok && Array.isArray(data.data)) {
-          setHistory(data.data);
-        }
-      } catch (e) {
-        console.warn("[BalanceWidget] No se pudo cargar historial:", e.message);
-      } finally {
-        setHistLoading(false);
+    loadHistory();
+  }, [loadHistory]);
+
+  // ── v3.2: Refresco periódico del historial (cada 5 min) ──────────────────
+  useEffect(() => {
+    histTimerRef.current = setInterval(loadHistory, HISTORY_POLL_MS);
+    return () => clearInterval(histTimerRef.current);
+  }, [loadHistory]);
+
+  // ── v3.2: Refresco al volver a primer plano (visibilitychange) ───────────
+  useEffect(() => {
+    function onVisible() {
+      if (document.visibilityState === "visible") {
+        console.log("[BalanceWidget] Tab visible → recargando historial");
+        loadHistory();
       }
     }
-    loadHistory();
-  }, []);
+    document.addEventListener("visibilitychange", onVisible);
+    return () => document.removeEventListener("visibilitychange", onVisible);
+  }, [loadHistory]);
 
   // ── Guardar snapshot en Supabase ──────────────────────────────────────────
   const saveSnapshot = useCallback(async (ts, usdc, total) => {
@@ -246,9 +178,8 @@ export default function BalanceWidget() {
     }
   }, []);
 
-  // ── Fetch balance (definido con useCallback para poder llamarlo manualmente) ─
+  // ── Fetch balance ─────────────────────────────────────────────────────────
   const fetchBalance = useCallback(async () => {
-    // Cancelar timer de retry si había uno pendiente
     if (errorTimerRef.current) {
       clearTimeout(errorTimerRef.current);
       errorTimerRef.current = null;
@@ -267,12 +198,10 @@ export default function BalanceWidget() {
         const errMsg = data.error ?? "Error desconocido";
         console.error("[BalanceWidget] /api/balance →", errMsg, data);
         setError(errMsg);
-        // Guardar info de diagnóstico extra que devuelve v3.2
         setApiDiag({
           wallet_hint: data.wallet_hint ?? null,
           rpc_errors:  data.rpc_errors  ?? [],
         });
-        // Programar retry rápido
         errorTimerRef.current = setTimeout(fetchBalance, RETRY_ON_ERROR_MS);
         return;
       }
@@ -300,7 +229,7 @@ export default function BalanceWidget() {
         if (!changed) return prev;
 
         const point = { ts: now, usdc: newUsdc, total: newTotal };
-        const next  = [...prev, point].slice(-MAX_HISTORY);
+        const next  = mergeHistory(prev, [point]);
         saveSnapshot(now, newUsdc, newTotal);
         return next;
       });
@@ -310,7 +239,6 @@ export default function BalanceWidget() {
     } catch (e) {
       console.error("[BalanceWidget] fetchBalance exception:", e.message);
       setError(e.message);
-      // Programar retry rápido
       errorTimerRef.current = setTimeout(fetchBalance, RETRY_ON_ERROR_MS);
     } finally {
       setLoading(false);
@@ -320,7 +248,6 @@ export default function BalanceWidget() {
   // ── Polling normal ────────────────────────────────────────────────────────
   useEffect(() => {
     fetchBalance();
-
     pollTimerRef.current = setInterval(fetchBalance, POLL_INTERVAL_MS);
     return () => {
       clearInterval(pollTimerRef.current);
@@ -360,148 +287,140 @@ export default function BalanceWidget() {
   return (
     <div style={S.root}>
 
-      {/* ══════════════════ FILA SUPERIOR: 3 métricas ══════════════════ */}
-      <div style={S.metricsRow}>
-
-        {/* ── TOTAL PORTFOLIO ── */}
-        <div style={S.metricBlock}>
-          <div style={S.label}>TOTAL PORTFOLIO</div>
-          <div style={S.bigValue(deltaTotal == null ? null : deltaTotal >= 0)}>
-            {totalPortfolio != null ? `$${totalPortfolio.toFixed(2)}` : (loading ? "…" : "—")}
-          </div>
-          {deltaTotal != null && (
-            <div style={S.delta(deltaTotal >= 0)}>
-              {deltaTotal >= 0 ? "▲" : "▼"}{" "}
-              {deltaTotal >= 0 ? "+" : ""}{deltaTotal.toFixed(4)}
-              {deltaPct != null && (
-                <span style={{ color: "#555", marginLeft: 5 }}>
-                  ({deltaPct >= 0 ? "+" : ""}{deltaPct.toFixed(2)}%)
-                </span>
-              )}
-            </div>
+      {/* ── HEADER ────────────────────────────────────────────────────── */}
+      <div style={S.header}>
+        <span style={S.headerTitle}>WALLET BALANCE</span>
+        <span style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          {lastFetch && (
+            <span style={{ fontSize: 8, color: isStale ? "#ff4466" : "#444" }}>
+              {isStale ? "STALE" : "LIVE"} · {fmtTime(lastFetch)}
+              {rpcUsed && <span style={{ color: "#222", marginLeft: 6 }}>{rpcUsed}</span>}
+            </span>
           )}
-        </div>
-
-        <div style={S.divider} />
-
-        {/* ── LIQUIDEZ USDC ── */}
-        <div style={S.metricBlock}>
-          <div style={S.label}>LIQUIDEZ USDC</div>
-          <div style={{ ...S.midValue, color: "#ccc" }}>
-            {usdc != null ? `$${usdc.toFixed(2)}` : (loading ? "…" : "—")}
-          </div>
-          {pol != null && (
-            <div style={S.sub}>
-              <span style={{ color: "#333" }}>POL gas</span>{" "}
-              <span style={{ color: "#555" }}>{pol.toFixed(4)}</span>
-            </div>
-          )}
-        </div>
-
-        <div style={S.divider} />
-
-        {/* ── POSICIONES ACTIVAS ── */}
-        <div style={S.metricBlock}>
-          <div style={S.label}>POSICIONES ACTIVAS</div>
-          <div style={{ ...S.midValue, color: posCount ? "#4488ff" : "#555" }}>
-            {posCount != null ? posCount : (loading ? "…" : "—")}
-            {posCount != null && (
-              <span style={{ fontSize: 12, color: "#555", marginLeft: 5, fontWeight: 400 }}>
-                tokens
-              </span>
-            )}
-          </div>
-          {posValue != null && (
-            <div style={S.sub}>
-              valor{" "}
-              <span style={{ color: "#00cc77", fontWeight: 700 }}>
-                ${posValue.toFixed(2)}
-              </span>
-            </div>
-          )}
-          {posError && (
-            <div style={{ ...S.sub, color: "#ff4466" }}>
-              ⚠ {posError.slice(0, 40)}
-            </div>
-          )}
-        </div>
-
-        {/* Controles */}
-        <div style={S.controls}>
-          <button onClick={fetchBalance} disabled={loading} style={S.btn(loading)}>
+          <button
+            onClick={fetchBalance}
+            disabled={loading}
+            style={S.refreshBtn}
+            title="Actualizar balance"
+          >
             {loading ? "…" : "↻"}
           </button>
-          {positions.length > 0 && (
-            <button
-              onClick={() => setShowPositions(v => !v)}
-              style={{ ...S.btn(false), color: showPositions ? "#4488ff" : "#444" }}
-            >
-              {showPositions ? "▲ OCULTAR" : "▼ DETALLE"}
-            </button>
-          )}
-          {lastFetch && (
-            <div style={S.meta}>
-              {fmtTime(lastFetch)}
-              {isStale && <span style={{ color: "#ff4466", marginLeft: 3 }}>STALE</span>}
-              {!isStale && <span style={{ color: "#00ff88", marginLeft: 3 }}>LIVE</span>}
-              {rpcUsed && (
-                <span style={{ marginLeft: 4 }}>
-                  · {rpcUsed.replace("https://", "").split("/")[0].split(".").slice(0, 2).join(".")}
-                </span>
-              )}
-            </div>
-          )}
-          <div style={{ ...S.meta, color: "#1a1a2a" }}>
-            {history.length}pt · supabase
-          </div>
-        </div>
+        </span>
       </div>
 
-      {/* ══════════════════ BANNER DE ERROR (prominente) ═══════════════ */}
-      <ErrorBanner
-        error={error}
-        apiDiag={apiDiag}
-        onRetry={fetchBalance}
-        loading={loading}
-      />
-
-      {/* ══════════════════ TABLA POSICIONES (expandible) ══════════════ */}
-      {showPositions && positions.length > 0 && (
-        <div style={S.posTable}>
-          <div style={{
-            display: "grid",
-            gridTemplateColumns: "1fr 48px 60px 52px 52px 64px",
-            gap: 6, padding: "4px 8px",
-            borderBottom: "1px solid #0d0d1a",
-            fontSize: 8, color: "#333", letterSpacing: "0.12em",
-          }}>
-            <div>MERCADO</div>
-            <div style={{ textAlign: "right" }}>TOKENS</div>
-            <div style={{ textAlign: "right" }}>PRECIO MED</div>
-            <div style={{ textAlign: "right" }}>PRECIO ACT</div>
-            <div style={{ textAlign: "right" }}>CAMBIO</div>
-            <div style={{ textAlign: "right" }}>VALOR</div>
+      {/* ── ERROR BANNER ──────────────────────────────────────────────── */}
+      {error && (
+        <div style={S.errorBanner}>
+          <div style={{ fontWeight: 700, marginBottom: 4 }}>
+            ⚠ /api/balance falló · reintentando en {RETRY_ON_ERROR_MS / 1000}s
           </div>
-          {positions.map((pos, i) => (
-            <PositionRow key={i} pos={pos} />
-          ))}
-          <div style={{
-            display: "grid",
-            gridTemplateColumns: "1fr 48px 60px 52px 52px 64px",
-            gap: 6, padding: "5px 8px",
-            borderTop: "1px solid #0d0d1a",
-            fontSize: 9, color: "#555",
-          }}>
-            <div style={{ color: "#444", letterSpacing: "0.1em" }}>TOTAL</div>
-            <div /><div /><div /><div />
-            <div style={{ textAlign: "right", color: "#00cc77", fontWeight: 700 }}>
-              ${(posValue ?? 0).toFixed(4)}
+          <div style={{ color: "#ff446688", fontSize: 9 }}>{error}</div>
+          {apiDiag?.wallet_hint && (
+            <div style={{ color: "#ff446655", fontSize: 9, marginTop: 2 }}>
+              wallet: {apiDiag.wallet_hint}
             </div>
-          </div>
+          )}
+          {apiDiag?.rpc_errors?.length > 0 && (
+            <div style={{ color: "#ff446644", fontSize: 8, marginTop: 2 }}>
+              RPCs fallidos: {apiDiag.rpc_errors.join(", ")}
+            </div>
+          )}
+          {lastAttempt && (
+            <div style={{ color: "#333", fontSize: 8, marginTop: 4 }}>
+              último intento: {fmtTime(lastAttempt)}
+            </div>
+          )}
         </div>
       )}
 
-      {/* ══════════════════ GRÁFICO EVOLUCIÓN ══════════════════════════ */}
+      {/* ── MÉTRICAS ──────────────────────────────────────────────────── */}
+      <div style={S.metricsRow}>
+
+        {/* TOTAL */}
+        <div style={S.metricBlock}>
+          <div style={S.label}>TOTAL PORTFOLIO</div>
+          <div style={S.bigValue(deltaTotal)}>
+            {totalPortfolio != null ? `$${totalPortfolio.toFixed(4)}` : (loading ? "…" : "—")}
+          </div>
+          {deltaPct != null && (
+            <div style={{ fontSize: 10, color: deltaTotal >= 0 ? "#00ff88" : "#ff4466", marginTop: 4 }}>
+              {deltaTotal >= 0 ? "+" : ""}{deltaTotal.toFixed(4)} ({deltaPct.toFixed(2)}%)
+            </div>
+          )}
+        </div>
+
+        <div style={S.divider} />
+
+        {/* USDC LÍQUIDO */}
+        <div style={S.metricBlock}>
+          <div style={S.label}>USDC LÍQUIDO</div>
+          <div style={S.bigValue(null)}>
+            {usdc != null ? `$${usdc.toFixed(4)}` : (loading ? "…" : "—")}
+          </div>
+          {pol != null && (
+            <div style={{ fontSize: 9, color: "#444", marginTop: 4 }}>
+              POL {pol.toFixed(4)}
+            </div>
+          )}
+        </div>
+
+        <div style={S.divider} />
+
+        {/* POSICIONES */}
+        <div style={{ flex: 1 }}>
+          <div style={S.label}>
+            POSICIONES
+            {posCount != null && posCount > 0 && (
+              <button
+                onClick={() => setExpanded(e => !e)}
+                style={S.expandBtn}
+              >
+                {expanded ? "▲ ocultar" : "▼ ver"}
+              </button>
+            )}
+          </div>
+          <div style={S.bigValue(posValue > 0 ? true : null)}>
+            {posValue != null ? `$${posValue.toFixed(4)}` : (loading ? "…" : "—")}
+          </div>
+          {posCount != null && (
+            <div style={{ fontSize: 9, color: "#444", marginTop: 4 }}>
+              {posCount} posición{posCount !== 1 ? "es" : ""}
+              {posError && <span style={{ color: "#ff446688", marginLeft: 8 }}>⚠ parcial</span>}
+            </div>
+          )}
+        </div>
+
+      </div>
+
+      {/* ── TABLA POSICIONES EXPANDIBLE ───────────────────────────────── */}
+      {expanded && positions.length > 0 && (
+        <div style={S.posTable}>
+          <div style={S.posRow(true)}>
+            <span>MERCADO</span>
+            <span>LADO</span>
+            <span>TOKENS</span>
+            <span>PRECIO</span>
+            <span>VALOR</span>
+          </div>
+          {positions.map((p, i) => (
+            <div key={i} style={S.posRow(false)}>
+              <span style={{ color: "#888", maxWidth: 200, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                {p.market_slug ?? p.condition_id?.slice(0, 12) ?? "—"}
+              </span>
+              <span style={{ color: p.side === "YES" ? "#00ff88" : "#ff4466" }}>
+                {p.side ?? "—"}
+              </span>
+              <span>{p.size != null ? p.size.toFixed(4) : "—"}</span>
+              <span>{p.price != null ? p.price.toFixed(4) : "—"}</span>
+              <span style={{ color: "#0066ff" }}>
+                {p.value != null ? `$${p.value.toFixed(4)}` : "—"}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* ── GRÁFICO EVOLUCIÓN ─────────────────────────────────────────── */}
       <div style={S.chartWrap}>
         <div style={S.chartLabel}>
           EVOLUCIÓN PORTFOLIO · {histLoading ? "cargando…" : `${history.length} SNAPSHOTS`}
@@ -513,9 +432,18 @@ export default function BalanceWidget() {
               ⚠ mostrando último snapshot — datos live no disponibles
             </span>
           )}
+          {/* v3.2: botón de recarga manual del historial */}
+          <button
+            onClick={loadHistory}
+            disabled={histLoading}
+            style={{ ...S.refreshBtn, marginLeft: 10, fontSize: 8 }}
+            title="Recargar historial desde Supabase"
+          >
+            {histLoading ? "…" : "↻ BD"}
+          </button>
         </div>
 
-        {histLoading ? (
+        {histLoading && history.length === 0 ? (
           <div style={S.noData}>Cargando historial desde Supabase…</div>
         ) : chartData.length < 2 ? (
           <div style={S.noData}>
@@ -579,6 +507,37 @@ const S = {
     color: "#ccc",
     overflow: "hidden",
   },
+  header: {
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "center",
+    padding: "10px 20px",
+    borderBottom: "1px solid #0d0d1a",
+  },
+  headerTitle: {
+    fontSize: 9,
+    letterSpacing: "0.15em",
+    color: "#333",
+  },
+  refreshBtn: {
+    background: "none",
+    border: "1px solid #1a1a2e",
+    color: "#444",
+    cursor: "pointer",
+    fontSize: 10,
+    padding: "2px 6px",
+    borderRadius: 2,
+    fontFamily: "inherit",
+  },
+  errorBanner: {
+    background: "#1a0008",
+    border: "1px solid #ff446622",
+    margin: "12px 20px",
+    padding: "10px 14px",
+    borderRadius: 3,
+    fontSize: 10,
+    color: "#ff4466",
+  },
   metricsRow: {
     display: "flex",
     alignItems: "flex-start",
@@ -603,52 +562,50 @@ const S = {
     fontSize: 28, fontWeight: 700, lineHeight: 1,
     color: positive == null ? "#ccc" : positive ? "#00ff88" : "#ff4466",
   }),
-  midValue: {
-    fontSize: 18, fontWeight: 700, lineHeight: 1, marginBottom: 4,
-  },
-  delta: (positive) => ({
-    fontSize: 9, marginTop: 4,
-    color: positive ? "#00ff88" : "#ff4466",
-    letterSpacing: "0.05em",
-  }),
-  sub: {
-    fontSize: 8, color: "#555", marginTop: 3,
-  },
-  controls: {
-    display: "flex",
-    flexDirection: "column",
-    alignItems: "flex-end",
-    gap: 4,
-    flexShrink: 0,
-    minWidth: 60,
-  },
-  btn: (disabled) => ({
+  expandBtn: {
     background: "none",
-    border: "1px solid #0d0d1a",
-    color: disabled ? "#222" : "#444",
-    fontSize: 9,
-    padding: "2px 6px",
-    cursor: disabled ? "not-allowed" : "pointer",
+    border: "none",
+    color: "#333",
+    cursor: "pointer",
+    fontSize: 8,
+    marginLeft: 8,
     fontFamily: "inherit",
-    letterSpacing: "0.1em",
-    borderRadius: 2,
-  }),
-  meta: {
-    fontSize: 7, color: "#2a2a3a", letterSpacing: "0.05em",
+    padding: 0,
   },
   posTable: {
-    borderTop: "1px solid #0d0d1a",
+    margin: "0 20px 12px",
+    border: "1px solid #0d0d1a",
+    borderRadius: 3,
+    overflow: "hidden",
+    fontSize: 9,
   },
+  posRow: (header) => ({
+    display: "grid",
+    gridTemplateColumns: "2fr 0.5fr 1fr 1fr 1fr",
+    gap: 8,
+    padding: "5px 10px",
+    background: header ? "#050510" : "transparent",
+    borderBottom: "1px solid #0d0d1a",
+    color: header ? "#333" : "#888",
+    letterSpacing: header ? "0.1em" : 0,
+    fontSize: header ? 7 : 9,
+  }),
   chartWrap: {
-    borderTop: "1px solid #07070f",
-    padding: "8px 8px 8px 0",
+    borderTop: "1px solid #0d0d1a",
+    padding: "10px 20px 14px",
   },
   chartLabel: {
-    fontSize: 7, color: "#2a2a3a", letterSpacing: "0.12em",
-    paddingLeft: 12, marginBottom: 4,
+    fontSize: 7,
+    letterSpacing: "0.15em",
+    color: "#333",
+    marginBottom: 8,
+    display: "flex",
+    alignItems: "center",
   },
   noData: {
-    fontSize: 8, color: "#2a2a3a", textAlign: "center",
-    padding: "16px 0", letterSpacing: "0.1em",
+    fontSize: 9,
+    color: "#222",
+    textAlign: "center",
+    padding: "20px 0",
   },
 };
