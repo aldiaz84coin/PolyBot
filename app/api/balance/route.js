@@ -1,20 +1,26 @@
 /**
- * app/api/balance/route.js — v3.1
+ * app/api/balance/route.js — v3.2
  *
- * CAMBIOS v3.1
+ * CAMBIOS v3.2
  * ─────────────────────────────────────────────────────────────────────
- *  Bug FIX — Posiciones fantasma de mercados resueltos
- *    Polymarket data-api devuelve posiciones de mercados YA RESUELTOS
- *    (curPrice → 0 si perdiste, curPrice → 1 si ganaste pendiente de
- *    redención) junto a las activas. Esto causaba:
- *      · Posiciones activas = 1 cuando en realidad = 0
- *      · total_portfolio inflado (USDC + valor posición resuelta)
+ *  Diagnóstico mejorado para el banner de error del widget
  *
- *    Fix: filtrar posiciones "verdaderamente abiertas" con
- *      curPrice > 0.01 && curPrice < 0.99
- *    Un precio en ese rango indica mercado sin resolver todavía.
- *    Posiciones fuera del rango se excluyen del conteo y del valor total.
+ *  Problema: cuando la API devolvía { success: false, error: "..." }
+ *  el dashboard no tenía información para entender la causa raíz
+ *  (¿wallet no configurada? ¿RPC caído?).
  *
+ *  Cambios:
+ *    1. wallet_hint en todos los errores: primeros 10 chars de la wallet
+ *       resuelta (o "NULL" si no se encontró). El widget lo muestra en
+ *       el banner de error para diagnóstico rápido.
+ *    2. rpc_errors: lista de los RPCs que fallaron (con el motivo corto).
+ *       Solo se incluye cuando el fallo es por RPCs.
+ *    3. Nuevo log de console.info al resolver la wallet para facilitar
+ *       diagnóstico en los logs de Vercel.
+ *    4. Fallback extra en resolveWallet: busca también la clave "funder"
+ *       (sin sufijo _address) en bot_config, por si se usó otro nombre.
+ *
+ * (v3.1 — Bug FIX posiciones fantasma de mercados resueltos)
  * (v3.0 — RPCs limpios, USDC native + bridged, proxy wallet fix)
  */
 
@@ -42,8 +48,15 @@ async function resolveWallet() {
     ?? process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
 
   if (supabaseUrl && supabaseKey) {
-    for (const table of ["bot_config", "config"]) {
-      const keyField = table === "bot_config" ? "funder_address" : "funder";
+    // Intentar varias combinaciones de tabla/clave
+    const attempts = [
+      { table: "bot_config", keyField: "funder_address" },
+      { table: "bot_config", keyField: "funder"         },   // ← nuevo fallback
+      { table: "config",     keyField: "funder"         },
+      { table: "config",     keyField: "funder_address" },
+    ];
+
+    for (const { table, keyField } of attempts) {
       try {
         const res = await fetch(
           `${supabaseUrl}/rest/v1/${table}?key=eq.${keyField}&select=value&limit=1`,
@@ -57,15 +70,25 @@ async function resolveWallet() {
         );
         if (res.ok) {
           const rows = await res.json();
-          if (rows?.[0]?.value) return rows[0].value.trim();
+          if (rows?.[0]?.value) {
+            const wallet = rows[0].value.trim();
+            console.info(`[balance] wallet resuelta desde Supabase (${table}.${keyField}): ${wallet.slice(0, 10)}…`);
+            return wallet;
+          }
         }
       } catch (e) {
-        console.warn(`[balance] Supabase ${table} falló:`, e.message);
+        console.warn(`[balance] Supabase ${table}.${keyField} falló:`, e.message);
       }
     }
   }
 
-  return process.env.POLYMARKET_FUNDER ?? process.env.FUNDER ?? null;
+  const envWallet = process.env.POLYMARKET_FUNDER ?? process.env.FUNDER ?? null;
+  if (envWallet) {
+    console.info(`[balance] wallet resuelta desde env: ${envWallet.slice(0, 10)}…`);
+  } else {
+    console.error("[balance] wallet NO encontrada — configura POLYMARKET_FUNDER en Vercel o añade bot_config.funder_address en Supabase");
+  }
+  return envWallet;
 }
 
 // ── Helper: resolver proxy wallet desde funder ────────────────────────────────
@@ -115,13 +138,8 @@ async function fetchPositions(proxyWallet) {
       curPrice:     parseFloat(p.curPrice      ?? p.cur_price  ?? p.price ?? 0),
     }));
 
-    // ── FIX v3.1: filtrar solo posiciones verdaderamente abiertas ─────────
-    // curPrice entre 0.01 y 0.99 → mercado sin resolver (posición activa)
-    // curPrice ≤ 0.01 → mercado resuelto perdedor (tokens sin valor)
-    // curPrice ≥ 0.99 → mercado resuelto ganador (pendiente de redención)
-    // En ambos casos resueltos NO contamos como posición activa ni sumamos
-    // al total (el USDC de redenciones ganadas llegará al balance on-chain
-    // cuando se ejecute el claim).
+    // Filtrar solo posiciones verdaderamente abiertas (v3.1)
+    // curPrice entre 0.01 y 0.99 → mercado sin resolver
     const positions = allPositions.filter(p =>
       p.size > 0.001 &&
       p.curPrice > 0.01 &&
@@ -156,10 +174,12 @@ export async function GET() {
   // 1. Resolver wallet funder
   const wallet = await resolveWallet();
   if (!wallet || !wallet.startsWith("0x")) {
-    return Response.json(
-      { success: false, error: "Wallet no configurada (funder no encontrado en Supabase ni en env)" },
-      { status: 400 }
-    );
+    return Response.json({
+      success:     false,
+      error:       "Wallet no configurada. Añade POLYMARKET_FUNDER en Vercel o bot_config.funder_address en Supabase.",
+      wallet_hint: wallet ? wallet.slice(0, 10) + "…" : "NULL",
+      rpc_errors:  [],
+    }, { status: 400 });
   }
 
   // 2. Resolver proxy wallet + lanzar fetchPositions en paralelo con on-chain
@@ -175,6 +195,7 @@ export async function GET() {
   let usdcBridged = 0;
   let polBalance  = 0;
   let rpcUsed     = null;
+  const rpcErrors = [];
 
   for (const rpc of POLYGON_RPCS) {
     try {
@@ -207,13 +228,13 @@ export async function GET() {
 
       const results = await res.json();
 
-      const polHex        = results.find(r => r.id === 1)?.result;
-      const usdcNativeHex = results.find(r => r.id === 2)?.result;
+      const polHex         = results.find(r => r.id === 1)?.result;
+      const usdcNativeHex  = results.find(r => r.id === 2)?.result;
       const usdcBridgedHex = results.find(r => r.id === 3)?.result;
 
       if (!polHex) throw new Error("Respuesta RPC incompleta (sin POL)");
 
-      polBalance  = polHex        && polHex        !== "0x" ? Number(BigInt(polHex))        / 1e18 : 0;
+      polBalance  = polHex         && polHex         !== "0x" ? Number(BigInt(polHex))         / 1e18 : 0;
       usdcNative  = usdcNativeHex  && usdcNativeHex  !== "0x" ? Number(BigInt(usdcNativeHex))  / 1e6  : 0;
       usdcBridged = usdcBridgedHex && usdcBridgedHex !== "0x" ? Number(BigInt(usdcBridgedHex)) / 1e6  : 0;
 
@@ -222,15 +243,19 @@ export async function GET() {
 
     } catch (e) {
       lastError = e.message;
+      const rpcShort = rpc.replace("https://", "").split("/")[0];
+      rpcErrors.push(`${rpcShort}: ${e.message.slice(0, 60)}`);
       console.warn(`[balance] RPC ${rpc} falló: ${e.message}`);
     }
   }
 
   if (!rpcUsed) {
-    return Response.json(
-      { success: false, error: `Todos los RPCs de Polygon fallaron. Último: ${lastError}` },
-      { status: 503 }
-    );
+    return Response.json({
+      success:     false,
+      error:       `Todos los RPCs de Polygon fallaron. Último: ${lastError}`,
+      wallet_hint: wallet.slice(0, 10) + "…",
+      rpc_errors:  rpcErrors,
+    }, { status: 503 });
   }
 
   // 4. Esperar proxy wallet y posiciones
@@ -257,7 +282,7 @@ export async function GET() {
     positions_value: posResult.positions_value,
     positions:       posResult.positions,
     positions_error: posResult.positions_error ?? null,
-    // Total = solo USDC líquido + posiciones verdaderamente abiertas
+    // Total = USDC líquido + posiciones verdaderamente abiertas
     total_portfolio: posResult.ok
       ? Math.round((usdc_total + pos_value) * 10000) / 10000
       : null,
