@@ -51,11 +51,13 @@ USDC_POLYGON = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
 GAMMA_API    = "https://gamma-api.polymarket.com/markets"
 
 # Configuración de reintentos
-_MAX_ATTEMPTS    = 6
-# Esperas en segundos entre intentos: 2min, 5min, 10min, 15min, 20min
-_RETRY_WAITS     = [120, 300, 600, 900, 1200]
-# Espera inicial antes del primer intento (el mercado tarda en resolver)
-_FIRST_WAIT_SECS = 120
+# Polymarket tarda entre 30min y 2h en resolver mercados on-chain tras el cierre.
+# "result for condition not received yet" = mercado aún no resuelto, hay que esperar más.
+_MAX_ATTEMPTS    = 8
+# Esperas entre intentos: 10min, 20min, 30min, 45min, 60min, 60min, 60min
+_RETRY_WAITS     = [600, 1200, 1800, 2700, 3600, 3600, 3600]
+# Espera inicial: 30min — Polymarket necesita al menos este tiempo para resolver
+_FIRST_WAIT_SECS = 1800
 
 
 # ── claim_with_retry — punto de entrada desde monitor.py ─────────────────────
@@ -119,6 +121,25 @@ def claim_with_retry(bet: dict, cfg: dict) -> None:
             f"gamma_resolved={gamma_status.get('resolved')}  "
             f"gamma_closed={gamma_status.get('closed')}"
         )
+
+        # Si Gamma confirma que el mercado NO ha resuelto aún, no gastar gas
+        # y esperar directamente al siguiente intento
+        if gamma_status.get("resolved") is False:
+            last_error = "Mercado aún no resuelto según Gamma API (result for condition not received yet)"
+            logger.info(
+                f"[CLAIMER] ⏳ Gamma confirma que el mercado NO ha resuelto aún — "
+                f"saltando intento para no gastar gas"
+            )
+            if attempt >= _MAX_ATTEMPTS:
+                break
+            wait = _RETRY_WAITS[min(attempt - 1, len(_RETRY_WAITS) - 1)]
+            logger.info(f"[CLAIMER] Esperando {wait}s ({wait//60}min) antes del intento {attempt + 1}...")
+            try:
+                notify_claim_retrying(cfg, bet, attempt + 1, _MAX_ATTEMPTS, last_error, wait)
+            except Exception:
+                pass
+            time.sleep(wait)
+            continue
 
         try:
             tx = redimir_posicion(market, direction, cfg)
