@@ -1,35 +1,32 @@
 /**
- * app/api/balance/route.js — v3.3
+ * app/api/balance/route.js — v4.0
  *
- * CAMBIOS v3.3
- * ─────────────────────────────────────────────────────────────────────
- *  BUG FIX CRÍTICO — Vercel cacheaba la respuesta edge
+ * CAMBIOS v4.0 — FIX CRÍTICO: posiciones categorizadas (abiertas vs pending claim)
+ * ─────────────────────────────────────────────────────────────────────────────────
+ *  BUG RAÍZ: el filtro anterior excluía posiciones con curPrice >= 0.99,
+ *  que son exactamente las posiciones GANADORAS pendientes de claim.
+ *  Resultado: positions_value = 0 → total_portfolio = usdc siempre.
  *
- *  Síntoma: el widget actualizaba (fetchBalance cada 60s), las entradas
- *  llegaban a Supabase balance_history, pero el valor nunca cambiaba.
- *  Siempre era el mismo snapshot antiguo.
+ *  Correcciones v4.0:
+ *    1. fetchPositions() ya NO excluye posiciones de alto precio.
+ *    2. Categorización explícita:
+ *         pending_claim : curPrice >= 0.85  → ganadora, esperando redención
+ *         open          : 0.01 < curPrice < 0.85 → abierta e incierta
+ *         (curPrice < 0.01 → perdedora sin valor residual, ignorada)
+ *    3. Valor de pending_claim = size * 1.0 (se cobra completo al reclamar)
+ *    4. API devuelve campos extra:
+ *         open_count, open_value, pending_claim_count, pending_claim_value
+ *         positions_open[], positions_pending[]
+ *    5. total_portfolio = usdc + open_value + pending_claim_value
  *
- *  Causa raíz: el route tenía `export const runtime = "edge"` pero NO
- *  `export const dynamic = "force-dynamic"`. Vercel interpreta las rutas
- *  edge sin ese flag como candidatas a cacheo en la CDN. El primer hit
- *  generaba la respuesta real; todos los siguientes la devolvían cacheada,
- *  ignorando los RPCs de Polygon y la API de Polymarket.
- *
- *  Correcciones:
- *    1. `export const dynamic = "force-dynamic"` — deshabilita el cacheo
- *       de Vercel para esta ruta; cada request ejecuta el handler real.
- *    2. `Cache-Control: no-store, no-cache` en TODAS las respuestas
- *       (éxito, error 400, error 503) — segunda línea de defensa.
- *    3. Migrado de runtime "edge" a "nodejs" para mayor compatibilidad
- *       con AbortSignal.timeout() y BigInt en todos los entornos.
- *
+ * (v3.3 — FIX cacheo Vercel con force-dynamic)
  * (v3.2 — Diagnóstico mejorado wallet_hint + rpc_errors)
  * (v3.1 — Bug FIX posiciones fantasma de mercados resueltos)
  * (v3.0 — RPCs limpios, USDC native + bridged, proxy wallet fix)
  */
 
 export const runtime = "nodejs";
-export const dynamic = "force-dynamic";   // ← FIX: desactiva cacheo Vercel
+export const dynamic = "force-dynamic";
 
 // ── Constantes ────────────────────────────────────────────────────────────────
 
@@ -37,7 +34,7 @@ const USDC_NATIVE   = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359";
 const USDC_BRIDGED  = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
 const DATA_API_BASE = "https://data-api.polymarket.com";
 
-const NO_CACHE = { "Cache-Control": "no-store, no-cache" };   // ← FIX: cabecera en todas las respuestas
+const NO_CACHE = { "Cache-Control": "no-store, no-cache" };
 
 const POLYGON_RPCS = [
   "https://polygon-rpc.com",
@@ -122,6 +119,13 @@ async function resolveProxyWallet(funder) {
 }
 
 // ── Helper: posiciones Polymarket ─────────────────────────────────────────────
+//
+// v4.0: Categorización en dos grupos:
+//   pending_claim : curPrice >= 0.85 → ya ganada, pendiente de redención on-chain
+//   open          : 0.01 < curPrice < 0.85 → abierta, resultado incierto
+//
+// NOTA: el filtro anterior (curPrice < 0.99) excluía silenciosamente
+// todas las posiciones ganadoras, haciendo que total_portfolio = USDC.
 
 async function fetchPositions(proxyWallet) {
   try {
@@ -135,38 +139,72 @@ async function fetchPositions(proxyWallet) {
 
     const list = Array.isArray(data) ? data : (data?.positions ?? data?.data ?? []);
 
-    const allPositions = list.map(p => ({
-      title:        p.title        ?? p.question ?? p.market ?? "—",
-      outcome:      p.outcome      ?? (p.side === "YES" ? "YES" : "NO"),
-      size:         parseFloat(p.size          ?? p.quantity   ?? 0),
-      currentValue: parseFloat(p.currentValue  ?? p.cur_value  ?? p.value ?? 0),
-      avgPrice:     parseFloat(p.avgPrice      ?? p.avg_price  ?? 0),
-      curPrice:     parseFloat(p.curPrice      ?? p.cur_price  ?? p.price ?? 0),
-    }));
+    const allPositions = list
+      .filter(p => p != null)
+      .map(p => {
+        const size     = parseFloat(p.size     ?? p.quantity  ?? 0);
+        const curPrice = parseFloat(p.curPrice ?? p.cur_price ?? p.price ?? 0);
+        const avgPrice = parseFloat(p.avgPrice ?? p.avg_price ?? 0);
+        // Valor actual: de la API si existe, si no estimado
+        const currentValue =
+          parseFloat(p.currentValue ?? p.cur_value ?? p.value ?? 0) ||
+          Math.round(size * curPrice * 10000) / 10000;
 
-    // Filtrar solo posiciones verdaderamente abiertas (v3.1)
-    const positions = allPositions.filter(p =>
-      p.size > 0.001 &&
-      p.curPrice > 0.01 &&
-      p.curPrice < 0.99
-    );
+        return {
+          title:       p.title ?? p.question ?? p.market ?? "—",
+          outcome:     p.outcome ?? p.side ?? "—",
+          side:        p.side ?? p.outcome ?? "—",
+          market_slug: p.market_slug ?? p.conditionId ?? p.condition_id ?? null,
+          size,
+          currentValue,
+          avgPrice,
+          curPrice,
+        };
+      });
 
-    const positions_value = positions.reduce((s, p) => s + (p.currentValue || 0), 0);
+    // Excluir solo tamaño cero (no filtrar por precio)
+    const valid = allPositions.filter(p => p.size > 0.001);
+
+    // Categorizar por precio del token
+    // pending_claim: precio >= 0.85 → ganadora esperando redención
+    // open:          0.01 < precio < 0.85 → incierta
+    // (precio < 0.01 → perdedora, sin valor útil — ignorar)
+    const pending_claim = valid.filter(p => p.curPrice >= 0.85);
+    const open          = valid.filter(p => p.curPrice > 0.01 && p.curPrice < 0.85);
+
+    // Valor de pending_claim = nº de tokens (cobran ~1 USDC/token al reclamar)
+    const pending_value = pending_claim.reduce((s, p) => s + p.size, 0);
+    const open_value    = open.reduce((s, p) => s + (p.currentValue || p.size * p.curPrice || 0), 0);
+
+    const positions_value = Math.round((open_value + pending_value) * 10000) / 10000;
+    const positions_count = open.length + pending_claim.length;
 
     return {
-      ok:              true,
-      positions_count: positions.length,
-      positions_value: Math.round(positions_value * 10000) / 10000,
-      positions,
+      ok:                  true,
+      positions_count,
+      positions_value,
+      open_count:          open.length,
+      open_value:          Math.round(open_value  * 10000) / 10000,
+      pending_claim_count: pending_claim.length,
+      pending_claim_value: Math.round(pending_value * 10000) / 10000,
+      positions:           [...pending_claim, ...open], // pending_claim primero
+      positions_open:      open,
+      positions_pending:   pending_claim,
     };
   } catch (e) {
     console.warn("[balance] fetchPositions falló:", e.message);
     return {
-      ok:              false,
-      positions_count: null,
-      positions_value: null,
-      positions:       [],
-      positions_error: e.message,
+      ok:                  false,
+      positions_count:     null,
+      positions_value:     null,
+      open_count:          null,
+      open_value:          null,
+      pending_claim_count: null,
+      pending_claim_value: null,
+      positions:           [],
+      positions_open:      [],
+      positions_pending:   [],
+      positions_error:     e.message,
     };
   }
 }
@@ -184,7 +222,7 @@ export async function GET() {
       error:       "Wallet no configurada. Añade POLYMARKET_FUNDER en Vercel o bot_config.funder_address en Supabase.",
       wallet_hint: wallet ? wallet.slice(0, 10) + "…" : "NULL",
       rpc_errors:  [],
-    }, { status: 400, headers: NO_CACHE });   // ← FIX: no-store
+    }, { status: 400, headers: NO_CACHE });
   }
 
   // 2. Resolver proxy wallet + lanzar fetchPositions en paralelo con on-chain
@@ -260,7 +298,7 @@ export async function GET() {
       error:       `Todos los RPCs de Polygon fallaron. Último: ${lastError}`,
       wallet_hint: wallet.slice(0, 10) + "…",
       rpc_errors:  rpcErrors,
-    }, { status: 503, headers: NO_CACHE });   // ← FIX: no-store
+    }, { status: 503, headers: NO_CACHE });
   }
 
   // 4. Esperar proxy wallet y posiciones
@@ -283,12 +321,20 @@ export async function GET() {
       native:  Math.round(usdcNative  * 10000) / 10000,
       bridged: Math.round(usdcBridged * 10000) / 10000,
     },
-    positions_count: posResult.positions_count,
-    positions_value: posResult.positions_value,
-    positions:       posResult.positions,
-    positions_error: posResult.positions_error ?? null,
+    // Posiciones
+    positions_count:      posResult.positions_count,
+    positions_value:      posResult.positions_value,
+    open_count:           posResult.open_count,
+    open_value:           posResult.open_value,
+    pending_claim_count:  posResult.pending_claim_count,
+    pending_claim_value:  posResult.pending_claim_value,
+    positions:            posResult.positions,
+    positions_open:       posResult.positions_open,
+    positions_pending:    posResult.positions_pending,
+    positions_error:      posResult.positions_error ?? null,
+    // Portfolio total: USDC líquido + valor posiciones abiertas + valor pending claim
     total_portfolio: posResult.ok
       ? Math.round((usdc_total + pos_value) * 10000) / 10000
-      : null,
-  }, { headers: NO_CACHE });   // ← FIX: no-store en la respuesta de éxito
+      : usdc_total,
+  }, { headers: NO_CACHE });
 }
