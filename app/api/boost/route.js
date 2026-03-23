@@ -1,16 +1,16 @@
 /**
- * app/api/boost/route.js — v1.0
- * Devuelve las lecturas de BoostPower almacenadas por el bot en bot_config.
+ * app/api/boost/route.js — v1.1
  *
- * Claves leídas de Supabase bot_config:
- *   boost_new_market  — lectura al detectar nuevo mercado
- *   boost_midpoint    — lectura a mitad de hora (mins_left ≤ 30)
- *   boost_t_20        — lectura al entrar en T-20
- *   boost_t_15        — lectura al entrar en T-15
- *   boost_t_10        — lectura al entrar en T-10
- *   boost_t_5         — lectura al entrar en T-5
+ * CAMBIOS v1.1:
+ *   - Fetch directo al endpoint de Crypto Detector (BOOST_POWER_URL) desde
+ *     el servidor de Vercel, sin depender de que el bot haya escrito en
+ *     bot_config. Así el panel siempre muestra un valor live.
+ *   - bot_config readings se añaden si existen (lecturas históricas
+ *     del bot en cada ventana T-xx).
  *
- * Cada valor es JSON: { value: 0.38, ts: "2026-...", mins_left?: 28.3, slug?: "..." }
+ * Variables de entorno necesarias en Vercel:
+ *   BOOST_POWER_URL   = https://tu-dominio.com
+ *   BOOST_POWER_MODE  = normal  (opcional, default "normal")
  */
 
 import { NextResponse } from "next/server";
@@ -25,38 +25,61 @@ const BOOST_KEYS = [
   { key: "boost_t_5",        label: "T-5"           },
 ];
 
-export async function GET() {
-  if (!isConfigured()) {
-    return NextResponse.json({ ok: false, error: "Supabase no configurado" }, { status: 503 });
+async function fetchLiveBP() {
+  const baseUrl = process.env.BOOST_POWER_URL?.replace(/\/$/, "");
+  if (!baseUrl) return null;
+  const mode = process.env.BOOST_POWER_MODE || "normal";
+  try {
+    const res = await fetch(
+      `${baseUrl}/api/btc/boost-power?mode=${mode}`,
+      { next: { revalidate: 0 }, signal: AbortSignal.timeout(8000) }
+    );
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (!data?.success) return null;
+    return {
+      value:           data.analysis.boostPower,
+      pct:             data.analysis.boostPowerPercent,
+      classification:  data.analysis.classification,
+      predictedChange: data.analysis.predictedChange,
+      price:           data.asset.price,
+      change24h:       data.asset.change24h,
+      cached:          data.cached,
+      ts:              data.calculatedAt,
+      mode:            data.mode,
+    };
+  } catch {
+    return null;
   }
+}
 
+async function fetchBotReadings() {
+  if (!isConfigured()) return [];
   try {
     const supabase = getSupabase();
     const keys     = BOOST_KEYS.map(b => b.key);
-
     const { data, error } = await supabase
       .from("bot_config")
       .select("key, value")
       .in("key", keys);
-
-    if (error) throw error;
-
+    if (error) return [];
     const map = {};
     for (const row of (data || [])) {
       try { map[row.key] = JSON.parse(row.value); }
       catch { map[row.key] = { value: null }; }
     }
-
-    const readings = BOOST_KEYS.map(({ key, label }) => ({
-      key,
-      label,
-      ...(map[key] ?? { value: null, ts: null }),
+    return BOOST_KEYS.map(({ key, label }) => ({
+      key, label, ...(map[key] ?? { value: null, ts: null }),
     }));
-
-    return NextResponse.json({ ok: true, readings });
-
-  } catch (err) {
-    console.error("[boost/GET]", err);
-    return NextResponse.json({ ok: false, error: String(err) }, { status: 500 });
+  } catch {
+    return [];
   }
+}
+
+export async function GET() {
+  const [live, botReadings] = await Promise.all([
+    fetchLiveBP(),
+    fetchBotReadings(),
+  ]);
+  return NextResponse.json({ ok: true, live, readings: botReadings });
 }
