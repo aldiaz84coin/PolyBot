@@ -86,6 +86,8 @@ _CONFIG_POLL_INTERVAL     = 60   # segundos entre lecturas de bot_config
 # BoostPower: lecturas capturadas por ventana en la hora activa
 _boost_readings:        dict = {}    # {"T-20": 0.38, "T-15": 0.41, ...}
 _boost_fetched_windows: set  = set() # ventanas ya consultadas esta hora
+_boost_market_slug:     str  = ""    # slug del último mercado con boost consultado
+_boost_midpoint_done:   bool = False # lectura de mitad de hora ya realizada
 
 
 # ── Helpers de tiempo ─────────────────────────────────────────────────────────
@@ -477,6 +479,8 @@ def run(cfg: dict):
     hour_utc      = now_utc.hour
     mins_left     = _mins_to_close()
     _t5_hf_active = False
+    _boost_market_slug   = ""
+    _boost_midpoint_done = False
 
     try:
         while True:
@@ -582,6 +586,7 @@ def run(cfg: dict):
                 last_notified_signal_key = None
                 _boost_readings.clear()
                 _boost_fetched_windows.clear()
+                _boost_midpoint_done = False
 
                 notify_new_hour(cfg, cur_hour, slug, target)
 
@@ -591,6 +596,12 @@ def run(cfg: dict):
                 if not market or new_market.get("slug") != slug:
                     notify_market_found(cfg, new_market, mins_left)
                     slug = new_market.get("slug")
+                    # BoostPower: lectura al inicio de cada nuevo mercado
+                    if boost_fetcher.is_enabled() and slug != _boost_market_slug:
+                        _boost_market_slug = slug
+                        _bp = boost_fetcher.fetch("NUEVO MERCADO", fresh=True)
+                        if _bp is not None:
+                            logger.info(f"[BOOST] 🆕 Nuevo mercado {slug} — BP={_bp:.4f}")
                 market = new_market
             elif market:
                 notify_market_lost(cfg)
@@ -885,6 +896,13 @@ def run(cfg: dict):
                 time.sleep(interval)
                 continue
 
+            # ── BoostPower: lectura a mitad de hora (mins_left ≤ 30) ──────
+            if boost_fetcher.is_enabled() and not _boost_midpoint_done and mins_left <= 30:
+                _boost_midpoint_done = True
+                _bp = boost_fetcher.fetch("MITAD HORA")
+                if _bp is not None:
+                    logger.info(f"[BOOST] ⏱ Mitad de hora — BP={_bp:.4f}  mins_left={mins_left:.1f}")
+
             # ── BoostPower: capturar al entrar en cada ventana ────────────
             if boost_fetcher.is_enabled():
                 for _w in WINDOWS:
@@ -892,7 +910,7 @@ def run(cfg: dict):
                         _wkey = _w["key"]
                         if _wkey not in _boost_fetched_windows:
                             _boost_fetched_windows.add(_wkey)
-                            _bp = boost_fetcher.fetch(_wkey)
+                            _bp = boost_fetcher.fetch(_wkey, fresh=True)
                             if _bp is not None:
                                 _boost_readings[_wkey] = _bp
                         break
