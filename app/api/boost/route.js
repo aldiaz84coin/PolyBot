@@ -1,16 +1,6 @@
 /**
- * app/api/boost/route.js — v1.1
- *
- * CAMBIOS v1.1:
- *   - Fetch directo al endpoint de Crypto Detector (BOOST_POWER_URL) desde
- *     el servidor de Vercel, sin depender de que el bot haya escrito en
- *     bot_config. Así el panel siempre muestra un valor live.
- *   - bot_config readings se añaden si existen (lecturas históricas
- *     del bot en cada ventana T-xx).
- *
- * Variables de entorno necesarias en Vercel:
- *   BOOST_POWER_URL   = https://tu-dominio.com
- *   BOOST_POWER_MODE  = normal  (opcional, default "normal")
+ * app/api/boost/route.js — v1.2
+ * Expone error de diagnóstico cuando live falla.
  */
 
 import { NextResponse } from "next/server";
@@ -27,30 +17,47 @@ const BOOST_KEYS = [
 
 async function fetchLiveBP() {
   const baseUrl = process.env.BOOST_POWER_URL?.replace(/\/$/, "");
-  if (!baseUrl) return null;
+  if (!baseUrl) return { data: null, error: "BOOST_POWER_URL no definida en Vercel" };
+
   const mode = process.env.BOOST_POWER_MODE || "normal";
+  const url  = `${baseUrl}/api/btc/boost-power?mode=${mode}`;
+
+  let res;
   try {
-    const res = await fetch(
-      `${baseUrl}/api/btc/boost-power?mode=${mode}`,
-      { next: { revalidate: 0 }, signal: AbortSignal.timeout(8000) }
-    );
-    if (!res.ok) return null;
-    const data = await res.json();
-    if (!data?.success) return null;
-    return {
-      value:           data.analysis.boostPower,
-      pct:             data.analysis.boostPowerPercent,
-      classification:  data.analysis.classification,
-      predictedChange: data.analysis.predictedChange,
-      price:           data.asset.price,
-      change24h:       data.asset.change24h,
-      cached:          data.cached,
-      ts:              data.calculatedAt,
-      mode:            data.mode,
-    };
-  } catch {
-    return null;
+    res = await fetch(url, {
+      next:   { revalidate: 0 },
+      signal: AbortSignal.timeout(8000),
+    });
+  } catch (e) {
+    return { data: null, error: `fetch error: ${e.message}` };
   }
+
+  if (!res.ok) {
+    return { data: null, error: `HTTP ${res.status} desde ${url}` };
+  }
+
+  let json;
+  try { json = await res.json(); }
+  catch (e) { return { data: null, error: `JSON parse error: ${e.message}` }; }
+
+  if (!json?.success) {
+    return { data: null, error: `API error: ${json?.error ?? "success=false"}` };
+  }
+
+  return {
+    data: {
+      value:           json.analysis.boostPower,
+      pct:             json.analysis.boostPowerPercent,
+      classification:  json.analysis.classification,
+      predictedChange: json.analysis.predictedChange,
+      price:           json.asset.price,
+      change24h:       json.asset.change24h,
+      cached:          json.cached,
+      ts:              json.calculatedAt,
+      mode:            json.mode,
+    },
+    error: null,
+  };
 }
 
 async function fetchBotReadings() {
@@ -77,9 +84,19 @@ async function fetchBotReadings() {
 }
 
 export async function GET() {
-  const [live, botReadings] = await Promise.all([
+  const [liveResult, botReadings] = await Promise.all([
     fetchLiveBP(),
     fetchBotReadings(),
   ]);
-  return NextResponse.json({ ok: true, live, readings: botReadings });
+
+  return NextResponse.json({
+    ok:         true,
+    live:       liveResult.data,
+    liveError:  liveResult.error,   // ← visible en Network tab
+    readings:   botReadings,
+    debug: {
+      boostUrlSet: !!process.env.BOOST_POWER_URL,
+      boostUrl:    process.env.BOOST_POWER_URL?.slice(0, 30) + "…",  // parcial por seguridad
+    },
+  });
 }
