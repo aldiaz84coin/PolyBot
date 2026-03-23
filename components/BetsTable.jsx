@@ -289,7 +289,8 @@ function StatCell({ label, value, color = "#888", size = 14 }) {
 
 // ── BetsTable ─────────────────────────────────────────────────────────────
 
-export default function BetsTable({ bets = [] }) {
+export default function BetsTable({ bets: rawBets = [] }) {
+  const bets = Array.isArray(rawBets) ? rawBets : [];
   const [expanded, setExpanded] = useState(null);
   const toggle = (id) => setExpanded(prev => prev === id ? null : id);
 
