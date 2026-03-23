@@ -117,7 +117,7 @@ export default function Dashboard() {
       const res  = await fetch("/api/bets?limit=500");
       if (!res.ok) return;
       const data = await res.json();
-      const list = data.bets ?? data ?? [];
+      const list = data.bets ?? data.data ?? (Array.isArray(data) ? data : []);
       setBets(list);
       if (Array.isArray(list)) {
         try { localStorage.setItem(LS_KEY, JSON.stringify(list.slice(-500))); } catch {}
