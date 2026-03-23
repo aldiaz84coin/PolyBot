@@ -1,6 +1,6 @@
 "use client";
 /**
- * Dashboard.jsx — v5.2
+ * Dashboard.jsx — v5.3
  *
  * CAMBIOS v5.2
  * ─────────────────────────────────────────────────────────────────────
@@ -26,7 +26,7 @@ import BetsTable     from "./BetsTable";
 import ConfigPanel   from "./ConfigPanel";
 import StatsPanel    from "./StatsPanel";
 import ModeSelector  from "./ModeSelector";
-import BalanceWidget from "./BalanceWidget";
+import BoostLive     from "./BoostLive";
 import DataLab from "./DataLab";
 
 const LS_KEY         = "polymarket_bets_v2";
@@ -269,19 +269,11 @@ export default function Dashboard() {
         </div>
       )}
 
-      {/* ── BALANCE WALLET ──────────────────────────────────────────────── */}
-      {/* v5.2: encima del grid principal para máxima visibilidad           */}
-      {tab === "dashboard" && (
-        <div style={{ padding: "20px 24px", borderBottom: "1px solid var(--border)" }}>
-          <BalanceWidget />
-        </div>
-      )}
-
-      {/* ── PANEL PRINCIPAL 3-columnas ──────────────────────────────────── */}
+      {/* ── PANEL PRINCIPAL 4-columnas ──────────────────────────────────── */}
       {tab === "dashboard" && (
         <div style={{
           display: "grid",
-          gridTemplateColumns: "1fr 1fr 1fr",
+          gridTemplateColumns: "1.1fr 1fr 1fr 1fr",
           borderBottom: "1px solid var(--border)",
         }}>
 
@@ -382,7 +374,7 @@ export default function Dashboard() {
           </div>
 
           {/* COLUMNA 3 — MERCADO ACTIVO + TOKENS */}
-          <div>
+          <div style={{ borderRight: "1px solid var(--border)" }}>
             <MarketInfo
               market={market}
               minsLeft={minsLeft}
@@ -390,6 +382,11 @@ export default function Dashboard() {
               error={marketError}
               apiResponse={marketApiResponse}
             />
+          </div>
+
+          {/* COLUMNA 4 — BOOST POWER TENDENCIA BTC */}
+          <div>
+            <BoostLive />
           </div>
         </div>
       )}

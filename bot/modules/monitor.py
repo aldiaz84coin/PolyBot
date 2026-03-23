@@ -42,6 +42,7 @@ v5.0  — FIXES NOTIFICACIONES
 Destino: bot/modules/monitor.py
 """
 import csv
+import json as _json
 import logging
 import os
 import threading
@@ -478,7 +479,7 @@ def run(cfg: dict):
     cycle_n       = 0
     hour_utc      = now_utc.hour
     mins_left     = _mins_to_close()
-    _t5_hf_active = False
+    _t5_hf_active        = False
     _boost_market_slug   = ""
     _boost_midpoint_done = False
 
@@ -602,6 +603,13 @@ def run(cfg: dict):
                         _bp = boost_fetcher.fetch("NUEVO MERCADO", fresh=True)
                         if _bp is not None:
                             logger.info(f"[BOOST] 🆕 Nuevo mercado {slug} — BP={_bp:.4f}")
+                            if db_ok:
+                                try:
+                                    db.set_config("boost_new_market", _json.dumps({
+                                        "value": _bp, "slug": slug,
+                                        "ts": datetime.now(timezone.utc).isoformat(),
+                                    }))
+                                except Exception: pass
                 market = new_market
             elif market:
                 notify_market_lost(cfg)
@@ -902,6 +910,14 @@ def run(cfg: dict):
                 _bp = boost_fetcher.fetch("MITAD HORA")
                 if _bp is not None:
                     logger.info(f"[BOOST] ⏱ Mitad de hora — BP={_bp:.4f}  mins_left={mins_left:.1f}")
+                    if db_ok:
+                        try:
+                            db.set_config("boost_midpoint", _json.dumps({
+                                "value": _bp,
+                                "ts": datetime.now(timezone.utc).isoformat(),
+                                "mins_left": round(mins_left, 1),
+                            }))
+                        except Exception: pass
 
             # ── BoostPower: capturar al entrar en cada ventana ────────────
             if boost_fetcher.is_enabled():
@@ -913,6 +929,15 @@ def run(cfg: dict):
                             _bp = boost_fetcher.fetch(_wkey, fresh=True)
                             if _bp is not None:
                                 _boost_readings[_wkey] = _bp
+                                if db_ok:
+                                    try:
+                                        _cfg_key = "boost_" + _wkey.lower().replace("-", "_")
+                                        db.set_config(_cfg_key, _json.dumps({
+                                            "value": _bp,
+                                            "ts": datetime.now(timezone.utc).isoformat(),
+                                            "mins_left": round(mins_left, 1),
+                                        }))
+                                    except Exception: pass
                         break
 
             # ── Evaluación de señal ────────────────────────────────────────
