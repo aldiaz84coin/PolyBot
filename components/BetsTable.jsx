@@ -1,4 +1,16 @@
 "use client";
+/**
+ * components/BetsTable.jsx — v4.0
+ *
+ * CAMBIOS v4.0 — BoostPower correlation display
+ *   - DetailRow muestra sección "BOOST POWER · Crypto Detector v4" con
+ *     las 4 lecturas capturadas (T-20, T-15, T-10, T-5) como barras
+ *     visuales + valor numérico. Si no hay dato → "—".
+ *   - Los datos vienen del campo boost_t20 / boost_t15 / boost_t10 /
+ *     boost_t5 de cada operación (guardados por el bot en Supabase).
+ *
+ * (v3.x — sin cambios en la lógica de P&L ni de columnas)
+ */
 import { useState } from "react";
 import { fmtUSD, fmtPct } from "../lib/constants";
 
@@ -17,6 +29,24 @@ const COLS = [
 ];
 
 const TOTAL_W = COLS.reduce((s, c) => s + c.width, 0);
+
+// BoostPower: color ramp  0.0 → 0.5 → 1.0  (rojo → amarillo → verde)
+function boostColor(v) {
+  if (v == null) return "#333";
+  if (v >= 0.6)  return "#00ff88";   // fuerte alcista
+  if (v >= 0.4)  return "#88ff44";
+  if (v >= 0.25) return "#ffcc00";   // neutro
+  if (v >= 0.1)  return "#ff8800";
+  return "#ff4466";                   // bajista / débil
+}
+
+// Etiqueta de clasificación implícita por rango
+function boostLabel(v) {
+  if (v == null)  return "—";
+  if (v >= 0.6)   return "INVERTIBLE";
+  if (v >= 0.35)  return "APALANCADO";
+  return "RUIDOSO";
+}
 
 function ResultBadge({ result }) {
   const map = {
@@ -45,11 +75,6 @@ function fmtTime(iso) {
   } catch { return "—"; }
 }
 
-/**
- * Calcula el P&L en USD de una operación cerrada.
- * Usa pnl_usd si está disponible (preferido — valor real).
- * Fallback: calcula desde pnl% o resultado.
- */
 function calcPnlUsd(bet) {
   if (!bet) return null;
   if (bet.pnl_usd != null) return +bet.pnl_usd;
@@ -62,72 +87,196 @@ function calcPnlUsd(bet) {
   return null;
 }
 
-/**
- * Calcula el retorno total de una operación:
- * - PENDING → retorno estimado si WIN: stake / odds_entrada
- * - WIN / LOSS / STOP → retorno REAL = stake + pnl_usd (lo que se recibió)
- *
- * Esto evita mostrar siempre "stake * 2" cuando odds defaulteaba a 0.5.
- */
 function calcRetorno(bet) {
   const stake = bet?.stake ?? 0;
   if (!stake) return null;
-
   const isClosed = bet?.result && bet.result !== "PENDING";
-
   if (isClosed) {
-    // Retorno real: cuánto dinero total se recibió de vuelta
     const pnl = calcPnlUsd(bet);
     return pnl != null ? stake + pnl : null;
   }
-
-  // PENDING: retorno estimado si gana (stake / odds_entrada)
   const odds = bet?.odds ?? 0.5;
   return odds > 0 ? stake / odds : null;
 }
 
-function DetailRow({ bet }) {
-  const pnlUsd        = calcPnlUsd(bet);
-  const odds          = bet?.odds ?? 0.5;
-  const prob          = (odds * 100).toFixed(1);
-  const isClosed      = bet?.result && bet.result !== "PENDING";
-  const retornoEst    = odds > 0 ? bet.stake / odds : null;   // siempre estimado
-  const retornoReal   = isClosed && pnlUsd != null ? bet.stake + pnlUsd : null;
+// ── BoostBar — barra visual de un solo valor ─────────────────────────────
+
+function BoostBar({ windowKey, value, windowColor }) {
+  const pct    = value != null ? Math.min(Math.max(value, 0), 1) * 100 : 0;
+  const color  = boostColor(value);
+  const label  = boostLabel(value);
+  const hasVal = value != null;
 
   return (
-    <div style={{
-      background: "#05050f",
-      borderTop: "1px solid #0a0a1a",
-      padding: "10px 20px",
-      display: "grid",
-      gridTemplateColumns: "repeat(4, 1fr)",
-      gap: "10px 24px",
-      fontSize: 10,
-      minWidth: TOTAL_W,
-    }}>
-      {[
-        ["Mercado slug",      bet.market_slug || "—"],
-        ["Odds de entrada",   `${odds.toFixed(3)}  (${prob}% prob)`],
-        ["Stake invertido",   fmtUSD(bet.stake)],
-        ["Retorno estimado",  retornoEst ? fmtUSD(retornoEst) : "—"],
-        ...(isClosed ? [
-          ["Retorno real",    retornoReal != null ? fmtUSD(retornoReal) : "—"],
-        ] : []),
-        ["Umbral $",          bet.umbral ? `$${bet.umbral}` : "—"],
-        ["Distancia $",       bet.dist ? `$${Math.abs(+bet.dist).toFixed(0)}` : "—"],
-        ["P&L USD",           pnlUsd != null ? fmtUSD(pnlUsd) : "—"],
-        ["P&L %",             bet.pnl != null ? fmtPct(bet.pnl) : "—"],
-        ["Timestamp",         bet.ts ? new Date(bet.ts).toLocaleString("es-ES") : "—"],
-        ["Simulado",          bet.simulated ? "Sí" : "No"],
-      ].map(([k, v]) => (
-        <div key={k}>
-          <span style={{ color: "#333", display: "block", marginBottom: 2, letterSpacing: "0.10em" }}>{k.toUpperCase()}</span>
-          <span style={{ color: "#888" }}>{v}</span>
-        </div>
-      ))}
+    <div style={{ display: "flex", flexDirection: "column", gap: 4, minWidth: 100, flex: 1 }}>
+      {/* Header: ventana + valor */}
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+        <span style={{
+          fontSize: 8, letterSpacing: "0.14em", color: windowColor,
+          fontWeight: 700,
+        }}>
+          {windowKey}
+        </span>
+        <span style={{ fontSize: 11, fontWeight: 700, color: hasVal ? color : "#333" }}>
+          {hasVal ? value.toFixed(3) : "—"}
+        </span>
+      </div>
+      {/* Barra */}
+      <div style={{
+        height: 3, background: "#0a0a18", borderRadius: 2, overflow: "hidden",
+      }}>
+        <div style={{
+          width: `${pct}%`, height: "100%",
+          background: hasVal ? color : "transparent",
+          borderRadius: 2,
+          transition: "width 0.4s ease",
+        }} />
+      </div>
+      {/* Clasificación */}
+      <div style={{ fontSize: 8, color: hasVal ? color : "#2a2a3a", letterSpacing: "0.10em" }}>
+        {hasVal ? label : "SIN DATO"}
+      </div>
     </div>
   );
 }
+
+// ── DetailRow — fila expandida con todos los datos + boost ───────────────
+
+function DetailRow({ bet }) {
+  const pnlUsd      = calcPnlUsd(bet);
+  const odds        = bet?.odds ?? 0.5;
+  const prob        = (odds * 100).toFixed(1);
+  const isClosed    = bet?.result && bet.result !== "PENDING";
+  const retornoEst  = odds > 0 ? bet.stake / odds : null;
+  const retornoReal = isClosed && pnlUsd != null ? bet.stake + pnlUsd : null;
+
+  const WINDOW_COLORS = {
+    "T-20": "#4488ff",
+    "T-15": "#aa44ff",
+    "T-10": "#ff8800",
+    "T-5":  "#ff4466",
+  };
+
+  const boostWindows = [
+    { key: "T-20", val: bet.boost_t20, color: WINDOW_COLORS["T-20"] },
+    { key: "T-15", val: bet.boost_t15, color: WINDOW_COLORS["T-15"] },
+    { key: "T-10", val: bet.boost_t10, color: WINDOW_COLORS["T-10"] },
+    { key: "T-5",  val: bet.boost_t5,  color: WINDOW_COLORS["T-5"]  },
+  ];
+
+  const hasAnyBoost = boostWindows.some(w => w.val != null);
+
+  // Boost en la ventana de entrada (la más relevante para correlación)
+  const entryWindowKey = bet.window;   // "T-20" | "T-15" | "T-10" | "T-5"
+  const entryBoost     = boostWindows.find(w => w.key === entryWindowKey)?.val ?? null;
+
+  return (
+    <div style={{
+      background: "#04040e",
+      borderTop: "1px solid #0a0a1a",
+      borderBottom: "1px solid #0a0a1a",
+      fontSize: 10,
+      minWidth: TOTAL_W,
+    }}>
+
+      {/* ── Datos de la operación ────────────────────────────────────────── */}
+      <div style={{
+        padding: "10px 20px",
+        display: "grid",
+        gridTemplateColumns: "repeat(4, 1fr)",
+        gap: "10px 24px",
+      }}>
+        {[
+          ["Mercado slug",      bet.market_slug || "—"],
+          ["Odds de entrada",   `${odds.toFixed(3)}  (${prob}% prob)`],
+          ["Stake invertido",   fmtUSD(bet.stake)],
+          ["Retorno estimado",  retornoEst ? fmtUSD(retornoEst) : "—"],
+          ...(isClosed ? [
+            ["Retorno real",    retornoReal != null ? fmtUSD(retornoReal) : "—"],
+          ] : []),
+          ["Umbral $",          bet.umbral ? `$${bet.umbral}` : "—"],
+          ["Distancia $",       bet.dist ? `$${Math.abs(+bet.dist).toFixed(0)}` : "—"],
+          ["P&L USD",           pnlUsd != null ? fmtUSD(pnlUsd) : "—"],
+          ["P&L %",             bet.pnl != null ? fmtPct(bet.pnl) : "—"],
+          ["Timestamp",         bet.ts ? new Date(bet.ts).toLocaleString("es-ES") : "—"],
+          ["Simulado",          bet.simulated ? "Sí" : "No"],
+          ...(entryBoost != null ? [
+            ["BP ventana entrada", `${entryBoost.toFixed(3)} · ${boostLabel(entryBoost)}`],
+          ] : []),
+        ].map(([k, v]) => (
+          <div key={k}>
+            <span style={{ color: "#333", display: "block", marginBottom: 2, letterSpacing: "0.10em" }}>
+              {k.toUpperCase()}
+            </span>
+            <span style={{ color: "#888" }}>{v}</span>
+          </div>
+        ))}
+      </div>
+
+      {/* ── Sección BoostPower ────────────────────────────────────────────── */}
+      <div style={{
+        borderTop: "1px solid #08080f",
+        padding: "12px 20px",
+      }}>
+        {/* Header */}
+        <div style={{
+          display: "flex", justifyContent: "space-between", alignItems: "center",
+          marginBottom: 10,
+        }}>
+          <div style={{ fontSize: 8, color: "#333", letterSpacing: "0.16em", fontWeight: 700 }}>
+            BOOST POWER · CRYPTO DETECTOR v4
+          </div>
+          {hasAnyBoost ? (
+            <div style={{
+              fontSize: 8, color: "#2a2a3a", letterSpacing: "0.10em",
+            }}>
+              Algoritmo A · solo datos on-chain y de mercado CoinGecko
+            </div>
+          ) : (
+            <div style={{ fontSize: 8, color: "#222", letterSpacing: "0.10em" }}>
+              Sin datos — BOOST_POWER_URL no configurada o ventanas no capturadas
+            </div>
+          )}
+        </div>
+
+        {/* Barras de las 4 ventanas */}
+        <div style={{
+          display: "flex", gap: 20,
+          padding: "10px 0",
+        }}>
+          {boostWindows.map(w => (
+            <BoostBar
+              key={w.key}
+              windowKey={w.key}
+              value={w.val}
+              windowColor={w.color}
+            />
+          ))}
+        </div>
+
+        {/* Leyenda de rangos */}
+        <div style={{
+          display: "flex", gap: 16, marginTop: 8,
+          fontSize: 8, color: "#2a2a3a", letterSpacing: "0.08em",
+        }}>
+          {[
+            { label: "INVERTIBLE",  range: "≥ 0.60", color: "#00ff88" },
+            { label: "APALANCADO",  range: "0.35 – 0.59", color: "#ffcc00" },
+            { label: "RUIDOSO",     range: "< 0.35", color: "#ff4466" },
+          ].map(({ label, range, color }) => (
+            <div key={label} style={{ display: "flex", alignItems: "center", gap: 4 }}>
+              <div style={{ width: 6, height: 6, borderRadius: "50%", background: color }} />
+              <span style={{ color: "#333" }}>{label}</span>
+              <span style={{ color: "#2a2a3a" }}>· {range}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── StatCell ─────────────────────────────────────────────────────────────
 
 function StatCell({ label, value, color = "#888", size = 14 }) {
   return (
@@ -138,59 +287,68 @@ function StatCell({ label, value, color = "#888", size = 14 }) {
   );
 }
 
+// ── BetsTable ─────────────────────────────────────────────────────────────
+
 export default function BetsTable({ bets = [] }) {
   const [expanded, setExpanded] = useState(null);
   const toggle = (id) => setExpanded(prev => prev === id ? null : id);
 
   const today = new Date().toISOString().slice(0, 10);
 
-  // Stats acumuladas
   const allClosed   = bets.filter(b => b?.result && b.result !== "PENDING");
   const allWins     = allClosed.filter(b => b.result === "WIN").length;
   const allLosses   = allClosed.filter(b => b.result === "LOSS" || b.result === "STOP").length;
   const allWinRate  = (allWins + allLosses) > 0 ? Math.round(allWins / (allWins + allLosses) * 100) : null;
   const allInvested = bets.reduce((s, b) => s + (b?.stake ?? 0), 0);
   const allPnl      = allClosed.reduce((s, b) => { const p = calcPnlUsd(b); return s + (p != null ? p : 0); }, 0);
-  const allPending  = bets.filter(b => b?.result === "PENDING").length;
+  const allPending  = bets.filter(b => !b?.result || b.result === "PENDING").length;
 
-  // Stats del día
   const todayB      = bets.filter(b => b?.ts?.startsWith(today));
-  const todayClosed = todayB.filter(b => b?.result && b.result !== "PENDING");
-  const todayWins   = todayClosed.filter(b => b.result === "WIN").length;
-  const todayLosses = todayClosed.filter(b => b.result === "LOSS" || b.result === "STOP").length;
+  const todayC      = todayB.filter(b => b?.result && b.result !== "PENDING");
+  const todayWins   = todayC.filter(b => b.result === "WIN").length;
+  const todayLosses = todayC.filter(b => b.result === "LOSS" || b.result === "STOP").length;
   const todayWR     = (todayWins + todayLosses) > 0 ? Math.round(todayWins / (todayWins + todayLosses) * 100) : null;
   const todayIn     = todayB.reduce((s, b) => s + (b?.stake ?? 0), 0);
-  const todayPnl    = todayClosed.reduce((s, b) => { const p = calcPnlUsd(b); return s + (p != null ? p : 0); }, 0);
+  const todayPnl    = todayC.reduce((s, b) => { const p = calcPnlUsd(b); return s + (p != null ? p : 0); }, 0);
 
   return (
-    <div style={{ background: "var(--bg)", minHeight: "calc(100vh - 90px)" }}>
+    <div style={{ fontFamily: "inherit" }}>
 
-      {/* Panel ACUMULADO TOTAL */}
-      {bets.length > 0 && (
-        <div style={{ padding: "14px 20px", borderBottom: "1px solid #111", background: "#03030d" }}>
-          <div style={{ fontSize: 8, color: "#333", letterSpacing: "0.18em", marginBottom: 10 }}>
-            ACUMULADO TOTAL — {bets.length} OPERACIONES
-          </div>
-          <div style={{ display: "flex", gap: 32, flexWrap: "wrap", alignItems: "flex-end" }}>
-            <div style={{ minWidth: 110 }}>
-              <div style={{ fontSize: 8, color: "#444", letterSpacing: "0.12em", marginBottom: 4 }}>P&L NETO TOTAL</div>
-              <div style={{ fontSize: 28, fontWeight: 700, lineHeight: 1, color: allPnl >= 0 ? "var(--green)" : "var(--red)" }}>
-                {allPnl >= 0 ? "+" : ""}{fmtUSD(allPnl)}
-              </div>
-            </div>
-            <div style={{ width: 1, background: "#111", alignSelf: "stretch" }} />
-            <StatCell label="INVERTIDO TOTAL" value={fmtUSD(allInvested)} color="#888" size={16} />
-            <StatCell label="RETORNO TOTAL"   value={fmtUSD(allInvested + allPnl)} color={allPnl >= 0 ? "#00cc66" : "#cc3344"} size={16} />
-            <div style={{ width: 1, background: "#111", alignSelf: "stretch" }} />
-            <StatCell label="WINS"     value={allWins}   color="#00ff88" size={16} />
-            <StatCell label="LOSSES"   value={allLosses} color="#ff4466" size={16} />
-            <StatCell label="WIN RATE" value={allWinRate != null ? `${allWinRate}%` : "—"} color={allWinRate == null ? "#555" : allWinRate >= 50 ? "#00ff88" : "#ff4466"} size={16} />
-            {allPending > 0 && <StatCell label="PENDIENTES" value={allPending} color="#ffcc00" size={16} />}
-          </div>
+      {/* ── Stats globales ─────────────────────────────────────────────── */}
+      {allClosed.length > 0 && (
+        <div style={{
+          display: "flex", gap: 28, padding: "12px 20px",
+          borderBottom: "1px solid #0d0d1a", background: "#02020a",
+          fontSize: 10, letterSpacing: "0.12em", alignItems: "center",
+          flexWrap: "wrap",
+        }}>
+          <div style={{ fontSize: 8, color: "#333", letterSpacing: "0.16em", marginRight: 4 }}>TOTAL</div>
+          <StatCell
+            label="INVERTIDO"
+            value={fmtUSD(allInvested)}
+            color="#666" size={16}
+          />
+          <StatCell
+            label="P&L NETO"
+            value={`${allPnl >= 0 ? "+" : ""}${fmtUSD(allPnl)}`}
+            color={allPnl >= 0 ? "#00cc66" : "#cc3344"} size={16}
+          />
+          <div style={{ width: 1, background: "#111", alignSelf: "stretch" }} />
+          <StatCell label="WINS"     value={allWins}   color="#00ff88" size={16} />
+          <StatCell label="LOSSES"   value={allLosses} color="#ff4466" size={16} />
+          <StatCell
+            label="WIN RATE"
+            value={allWinRate != null ? `${allWinRate}%` : "—"}
+            color={allWinRate == null ? "#555" : allWinRate >= 50 ? "#00ff88" : "#ff4466"}
+            size={16}
+          />
+          {allPending > 0 && (
+            <StatCell label="PENDIENTES" value={allPending} color="#ffcc00" size={16} />
+          )}
         </div>
       )}
 
-      {/* Resumen del DÍA */}
+      {/* ── Stats del DÍA ──────────────────────────────────────────────── */}
       {todayB.length > 0 && (
         <div style={{
           display: "flex", gap: 28, padding: "10px 20px",
@@ -213,7 +371,7 @@ export default function BetsTable({ bets = [] }) {
         </div>
       )}
 
-      {/* Cabecera tabla */}
+      {/* ── Cabecera de tabla ──────────────────────────────────────────── */}
       <div style={{
         display: "grid",
         gridTemplateColumns: COLS.map(c => `${c.width}px`).join(" "),
@@ -225,18 +383,26 @@ export default function BetsTable({ bets = [] }) {
         {COLS.map(c => <span key={c.label}>{c.label}</span>)}
       </div>
 
+      {/* ── Filas ─────────────────────────────────────────────────────── */}
       {bets.length === 0 ? (
-        <div style={{ padding: "40px 16px", textAlign: "center", color: "var(--dim)", fontSize: 12 }}>
+        <div style={{
+          padding: "40px 16px", textAlign: "center",
+          color: "var(--dim)", fontSize: 12,
+        }}>
           No hay operaciones registradas. Inicia el bot para comenzar.
         </div>
       ) : (
         <div style={{ overflowX: "auto" }}>
           {bets.map((bet) => {
             if (!bet) return null;
-            const pnlUsd  = calcPnlUsd(bet);
-            const retorno = calcRetorno(bet);
-            const isOpen  = expanded === bet.id;
+            const pnlUsd   = calcPnlUsd(bet);
+            const retorno  = calcRetorno(bet);
+            const isOpen   = expanded === bet.id;
             const isClosed = bet?.result && bet.result !== "PENDING";
+
+            // Boost de la ventana de entrada (para mini-indicator en la fila)
+            const windowBoostKey = `boost_${(bet.window || "").toLowerCase().replace("-", "_")}`;
+            const entryBoost     = bet[windowBoostKey] ?? null;
 
             return (
               <div key={bet.id || Math.random()}>
@@ -254,27 +420,59 @@ export default function BetsTable({ bets = [] }) {
                   }}
                   onClick={() => toggle(bet.id)}
                 >
-                  <span style={{ color: "#444", fontSize: 10 }}>{bet.id}</span>
-                  <span style={{ color: "#555", fontSize: 10 }}>{fmtTime(bet.ts)}</span>
-                  <span style={{ color: bet.dir === "UP" ? "var(--green)" : "var(--red)", fontWeight: 700, fontSize: 10 }}>
+                  {/* ID con mini-dot de boost */}
+                  <span style={{ color: "#444", fontSize: 10, display: "flex", alignItems: "center", gap: 4 }}>
+                    {entryBoost != null && (
+                      <span title={`BoostPower ${bet.window}: ${entryBoost.toFixed(3)}`} style={{
+                        width: 6, height: 6, borderRadius: "50%",
+                        background: boostColor(entryBoost),
+                        flexShrink: 0,
+                        boxShadow: `0 0 4px ${boostColor(entryBoost)}88`,
+                      }} />
+                    )}
+                    {bet.id}
+                  </span>
+
+                  <span style={{ color: "#555", fontSize: 10 }}>
+                    {fmtTime(bet.ts)}
+                  </span>
+                  <span style={{
+                    color: bet.dir === "UP" ? "var(--green)" : "var(--red)",
+                    fontWeight: 700, fontSize: 10,
+                  }}>
                     {bet.dir === "UP" ? "▲ UP" : "▼ DN"}
                   </span>
                   <span style={{ color: "#556", fontSize: 10 }}>{bet.window}</span>
                   <span style={{ fontVariantNumeric: "tabular-nums" }}>
-                    {bet.target ? `$${(+bet.target).toLocaleString("en-US", { maximumFractionDigits: 0 })}` : "—"}
+                    {bet.target
+                      ? `$${(+bet.target).toLocaleString("en-US", { maximumFractionDigits: 0 })}`
+                      : "—"}
                   </span>
                   <span style={{ fontVariantNumeric: "tabular-nums" }}>
-                    {bet.entry ? `$${(+bet.entry).toLocaleString("en-US", { maximumFractionDigits: 0 })}` : "—"}
+                    {bet.entry
+                      ? `$${(+bet.entry).toLocaleString("en-US", { maximumFractionDigits: 0 })}`
+                      : "—"}
                   </span>
-                  <span style={{ color: (bet.dist ?? 0) > 0 ? "#4488ff" : "#ff8800", fontVariantNumeric: "tabular-nums", fontSize: 10 }}>
-                    {bet.dist ? `${(+bet.dist) > 0 ? "+" : ""}$${Math.abs(+bet.dist).toFixed(0)}` : "—"}
+                  <span style={{
+                    color: (bet.dist ?? 0) > 0 ? "#4488ff" : "#ff8800",
+                    fontVariantNumeric: "tabular-nums", fontSize: 10,
+                  }}>
+                    {bet.dist
+                      ? `${(+bet.dist) > 0 ? "+" : ""}$${Math.abs(+bet.dist).toFixed(0)}`
+                      : "—"}
                   </span>
-                  <span style={{ color: "#888", fontVariantNumeric: "tabular-nums" }}>{fmtUSD(bet.stake)}</span>
+                  <span style={{ color: "#888", fontVariantNumeric: "tabular-nums" }}>
+                    {fmtUSD(bet.stake)}
+                  </span>
 
-                  {/* RETORNO: real para cerradas, estimado para pendientes */}
+                  {/* Retorno: real si cerrada, estimado si pendiente */}
                   <span style={{
                     color: isClosed
-                      ? (retorno != null && retorno > bet.stake ? "var(--green)" : retorno != null && retorno < bet.stake ? "var(--red)" : "#556")
+                      ? (retorno != null && retorno > bet.stake
+                          ? "var(--green)"
+                          : retorno != null && retorno < bet.stake
+                          ? "var(--red)"
+                          : "#556")
                       : "#334",
                     fontVariantNumeric: "tabular-nums",
                     fontSize: 10,
@@ -286,11 +484,17 @@ export default function BetsTable({ bets = [] }) {
 
                   <ResultBadge result={bet.result} />
                   <span style={{
-                    color: pnlUsd == null ? "#444" : pnlUsd > 0 ? "var(--green)" : pnlUsd < 0 ? "var(--red)" : "#888",
+                    color: pnlUsd == null
+                      ? "#444"
+                      : pnlUsd > 0 ? "var(--green)"
+                      : pnlUsd < 0 ? "var(--red)"
+                      : "#888",
                     fontWeight: pnlUsd != null ? 700 : 400,
                     fontVariantNumeric: "tabular-nums",
                   }}>
-                    {pnlUsd != null ? `${pnlUsd >= 0 ? "+" : ""}${fmtUSD(pnlUsd)}` : "—"}
+                    {pnlUsd != null
+                      ? `${pnlUsd >= 0 ? "+" : ""}${fmtUSD(pnlUsd)}`
+                      : "—"}
                   </span>
                 </div>
 

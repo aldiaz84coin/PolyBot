@@ -69,6 +69,7 @@ from .notifier        import (
 from .command_handler import process_pending_commands
 from .state_reporter  import report_state, report_offline
 from . import db
+from . import boost_fetcher
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +82,10 @@ _CLOB_MIDPOINT            = "https://clob.polymarket.com/midpoint"
 _SNAPSHOT_EVERY_N_CYCLES  = 10   # ~50s con interval=5s
 _TOKEN_LOG_EVERY_N_CYCLES = 6    # ~30s con interval=5s  ← v11.4
 _CONFIG_POLL_INTERVAL     = 60   # segundos entre lecturas de bot_config
+
+# BoostPower: lecturas capturadas por ventana en la hora activa
+_boost_readings:        dict = {}    # {"T-20": 0.38, "T-15": 0.41, ...}
+_boost_fetched_windows: set  = set() # ventanas ya consultadas esta hora
 
 
 # ── Helpers de tiempo ─────────────────────────────────────────────────────────
@@ -423,6 +428,12 @@ def run(cfg: dict):
 
     last_config_check = time.time()
 
+    # BoostPower (Crypto Detector v4) — opcional, sin bloquear el bot
+    boost_fetcher.init(
+        base_url = cfg.get("boost_power_url") or "",
+        mode     = cfg.get("boost_power_mode", "normal"),
+    )
+
     logger.info(
         f"[MONITOR] 🚀 Iniciando — stake=${stake}  stop={stop_pct}%  "
         f"max_ops={max_ops}  interval={interval}s  "
@@ -569,6 +580,8 @@ def run(cfg: dict):
                 active_bet    = None
                 fired_window  = None
                 last_notified_signal_key = None
+                _boost_readings.clear()
+                _boost_fetched_windows.clear()
 
                 notify_new_hour(cfg, cur_hour, slug, target)
 
@@ -872,6 +885,18 @@ def run(cfg: dict):
                 time.sleep(interval)
                 continue
 
+            # ── BoostPower: capturar al entrar en cada ventana ────────────
+            if boost_fetcher.is_enabled():
+                for _w in WINDOWS:
+                    if _w["min"] <= mins_left < _w["max"]:
+                        _wkey = _w["key"]
+                        if _wkey not in _boost_fetched_windows:
+                            _boost_fetched_windows.add(_wkey)
+                            _bp = boost_fetcher.fetch(_wkey)
+                            if _bp is not None:
+                                _boost_readings[_wkey] = _bp
+                        break
+
             # ── Evaluación de señal ────────────────────────────────────────
             if not target:
                 time.sleep(interval)
@@ -945,6 +970,7 @@ def run(cfg: dict):
                             "market":      market,
                             "market_slug": slug or "",
                             "simulated":   simulate,
+                            "boost_readings": dict(_boost_readings),
                         }
                         ops_hoy      += 1
                         fired_window  = signal.window
@@ -977,6 +1003,10 @@ def run(cfg: dict):
                                 "resultado":            "PENDING",
                                 "market_slug":          slug or "",
                                 "simulado":             active_bet["simulated"],
+                                "boost_t20": active_bet["boost_readings"].get("T-20"),
+                                "boost_t15": active_bet["boost_readings"].get("T-15"),
+                                "boost_t10": active_bet["boost_readings"].get("T-10"),
+                                "boost_t5":  active_bet["boost_readings"].get("T-5"),
                             })
                         except Exception as e:
                             logger.warning(f"[MONITOR] ⚠ upsert_operation: {e}")
