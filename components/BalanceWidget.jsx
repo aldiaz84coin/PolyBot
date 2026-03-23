@@ -1,35 +1,36 @@
 "use client";
 /**
- * components/BalanceWidget.jsx — v3.2
+ * components/BalanceWidget.jsx — v4.0
  *
- * CAMBIOS v3.2
+ * CAMBIOS v4.0 — REDISEÑO COMPLETO DE LAYOUT + FIX TOTAL
  * ─────────────────────────────────────────────────────────────────────
- *  BUG FIX — Historial Supabase congelado en el snapshot de mount
  *
- *  Síntoma: las métricas live (USDC, posiciones, total) se actualizaban
- *  correctamente cada 60s, pero el gráfico "EVOLUCIÓN PORTFOLIO" quedaba
- *  estancado en los datos que Supabase tenía al cargar la página.
- *  Si entre tanto entraban nuevos snapshots en balance_history (desde
- *  esta u otra sesión), el gráfico no los reflejaba.
+ *  BUG FIX (raíz):
+ *    - El API route (v4.0) ya devuelve posiciones correctamente
+ *      categorizadas. Este widget ahora las muestra en detalle.
  *
- *  Causa raíz: loadHistory() sólo se llamaba dentro de un useEffect con
- *  dependencias vacías — es decir, una única vez al montar el componente.
- *  No había ningún mecanismo de refresco posterior.
+ *  Nuevo layout:
+ *    ┌─────────────────────────────────────────────────────────┐
+ *    │ WALLET BALANCE                          LIVE · 14:32:01 │
+ *    ├─────────────────────────────────────────────────────────┤
+ *    │  TOTAL PORTFOLIO                                        │
+ *    │  $1,234.5600   (+$12.34  +1.01%)                       │
+ *    ├──────────────────┬──────────────────┬───────────────────┤
+ *    │  USDC LÍQUIDO    │  POSICIONES      │  PENDING CLAIM    │
+ *    │  $1,200.00       │  $8.00  (2)      │  $26.56  (1)      │
+ *    │  bridged/native  │  abiertas        │  reclamar manual  │
+ *    ├─────────────────────────────────────────────────────────┤
+ *    │  [▼ ver posiciones]                                     │
+ *    │  GANADORA PENDIENTE  UP / YES  26.56 tokens  ≈$26.56   │
+ *    │  ABIERTA             DOWN/NO   16.00 tokens  $8.00      │
+ *    ├─────────────────────────────────────────────────────────┤
+ *    │  EVOLUCIÓN PORTFOLIO · 12 SNAPSHOTS   [↻ BD]           │
+ *    │  [gráfico]                                              │
+ *    └─────────────────────────────────────────────────────────┘
  *
- *  Correcciones:
- *    1. loadHistory() migrada a useCallback para poder reutilizarla.
- *    2. Intervalo HISTORY_POLL_MS (5 min) que recarga el historial
- *       completo desde Supabase en segundo plano.
- *    3. Listener visibilitychange: al volver a la pestaña se fuerza un
- *       loadHistory() inmediato (evita mostrar un gráfico rancio tras
- *       dejar el tab en segundo plano).
- *    4. Merge inteligente: los puntos del historial Supabase se fusionan
- *       con cualquier punto generado en la sesión actual, de forma que
- *       nunca se pierden datos recientes en memoria.
- *
- * (v3.1 — BUG FIX portfolio congelado: error /api/balance invisible)
- * (v3.0 — Migración localStorage → Supabase, historial persistido)
- * (v2.0 — USDC + posiciones activas + tabla expandible + gráfico)
+ * (v3.2 — Historial Supabase con refresco periódico)
+ * (v3.1 — BUG FIX portfolio congelado)
+ * (v3.0 — Migración localStorage → Supabase)
  */
 
 import { useState, useEffect, useCallback, useRef } from "react";
@@ -40,11 +41,11 @@ import {
 // ── Constantes ────────────────────────────────────────────────────────────────
 
 const MAX_HISTORY        = 500;
-const POLL_INTERVAL_MS   = 60_000;       // refresco live balance
-const RETRY_ON_ERROR_MS  = 15_000;       // reintento rápido si /api/balance falla
-const HISTORY_POLL_MS    = 5 * 60_000;   // v3.2: refresco periódico historial Supabase
+const POLL_INTERVAL_MS   = 60_000;
+const RETRY_ON_ERROR_MS  = 15_000;
+const HISTORY_POLL_MS    = 5 * 60_000;
 const SNAPSHOT_MIN_DELTA = 0.001;
-const STALE_THRESHOLD_MS = 90_000;       // >90s sin éxito → "STALE"
+const STALE_THRESHOLD_MS = 90_000;
 
 // ── Utilidades ────────────────────────────────────────────────────────────────
 
@@ -58,8 +59,8 @@ function xLabel(iso) {
   try {
     const d   = new Date(iso);
     const now = new Date();
-    const sameDay = d.getDate()     === now.getDate()
-      && d.getMonth()    === now.getMonth()
+    const sameDay = d.getDate() === now.getDate()
+      && d.getMonth() === now.getMonth()
       && d.getFullYear() === now.getFullYear();
     return sameDay
       ? d.toLocaleTimeString("es-ES", { hour: "2-digit", minute: "2-digit" })
@@ -67,17 +68,27 @@ function xLabel(iso) {
   } catch { return ""; }
 }
 
-// v3.2: merge historial Supabase con puntos en memoria (evita duplicados por ts)
 function mergeHistory(fromDb, inMemory) {
   const map = new Map();
-  for (const p of fromDb)      map.set(p.ts, p);
-  for (const p of inMemory)    map.set(p.ts, p);   // memoria gana en caso de colisión
+  for (const p of fromDb)   map.set(p.ts, p);
+  for (const p of inMemory) map.set(p.ts, p);
   return Array.from(map.values())
     .sort((a, b) => new Date(a.ts) - new Date(b.ts))
     .slice(-MAX_HISTORY);
 }
 
-// ── Tooltip personalizado ─────────────────────────────────────────────────────
+function fmtUSD(v, decimals = 4) {
+  if (v == null) return "—";
+  return `$${Number(v).toFixed(decimals)}`;
+}
+
+function fmtDelta(v) {
+  if (v == null) return null;
+  const sign = v >= 0 ? "+" : "";
+  return `${sign}$${Math.abs(v).toFixed(4)}`;
+}
+
+// ── Tooltip gráfico ───────────────────────────────────────────────────────────
 
 function ChartTooltip({ active, payload, label }) {
   if (!active || !payload?.length) return null;
@@ -88,9 +99,9 @@ function ChartTooltip({ active, payload, label }) {
       padding: "6px 10px", fontSize: 9, fontFamily: "inherit", color: "#ccc",
     }}>
       <div style={{ color: "#444", marginBottom: 3 }}>{label}</div>
-      <div>TOTAL <span style={{ color: "#0066ff" }}>${(d.total ?? 0).toFixed(4)}</span></div>
+      <div>TOTAL <span style={{ color: "#4488ff" }}>{fmtUSD(d.total)}</span></div>
       {d.usdc != null && d.usdc !== d.total && (
-        <div>USDC <span style={{ color: "#888" }}>${d.usdc.toFixed(4)}</span></div>
+        <div>USDC <span style={{ color: "#888" }}>{fmtUSD(d.usdc)}</span></div>
       )}
     </div>
   );
@@ -99,40 +110,47 @@ function ChartTooltip({ active, payload, label }) {
 // ── Componente principal ──────────────────────────────────────────────────────
 
 export default function BalanceWidget() {
+  // Datos de balance
   const [usdc,           setUsdc]           = useState(null);
   const [pol,            setPol]            = useState(null);
-  const [posCount,       setPosCount]       = useState(null);
-  const [posValue,       setPosValue]       = useState(null);
-  const [positions,      setPositions]      = useState([]);
+  const [usdcDetail,     setUsdcDetail]     = useState(null);
   const [totalPortfolio, setTotalPortfolio] = useState(null);
-  const [posError,       setPosError]       = useState(null);
-  const [loading,        setLoading]        = useState(false);
-  const [histLoading,    setHistLoading]    = useState(false);
-  const [error,          setError]          = useState(null);
-  const [apiDiag,        setApiDiag]        = useState(null);
-  const [lastFetch,      setLastFetch]      = useState(null);
-  const [lastAttempt,    setLastAttempt]    = useState(null);
-  const [rpcUsed,        setRpcUsed]        = useState(null);
-  const [history,        setHistory]        = useState([]);
-  const [expanded,       setExpanded]       = useState(false);
+  // Posiciones
+  const [openCount,      setOpenCount]      = useState(null);
+  const [openValue,      setOpenValue]      = useState(null);
+  const [pendingCount,   setPendingCount]   = useState(null);
+  const [pendingValue,   setPendingValue]   = useState(null);
+  const [positionsOpen,   setPosOpen]       = useState([]);
+  const [posPending,      setPosPending]    = useState([]);
+  const [posError,        setPosError]      = useState(null);
+  // UI
+  const [expanded,      setExpanded]        = useState(false);
+  const [loading,       setLoading]         = useState(false);
+  const [histLoading,   setHistLoading]     = useState(false);
+  const [error,         setError]           = useState(null);
+  const [apiDiag,       setApiDiag]         = useState(null);
+  const [lastFetch,     setLastFetch]       = useState(null);
+  const [lastAttempt,   setLastAttempt]     = useState(null);
+  const [rpcUsed,       setRpcUsed]         = useState(null);
+  const [history,       setHistory]         = useState([]);
 
-  const pollTimerRef    = useRef(null);
-  const errorTimerRef   = useRef(null);
-  const histTimerRef    = useRef(null);   // v3.2: timer refresco historial
-  const prevTotal       = useRef(null);
+  const pollTimerRef  = useRef(null);
+  const errorTimerRef = useRef(null);
+  const histTimerRef  = useRef(null);
+  const prevTotal     = useRef(null);
 
   const isStale = !lastFetch
     ? true
     : (Date.now() - new Date(lastFetch).getTime()) > STALE_THRESHOLD_MS;
 
-  // ── v3.2: loadHistory como useCallback para reutilizarla ─────────────────
+  // ── Historial ─────────────────────────────────────────────────────────────
+
   const loadHistory = useCallback(async () => {
     setHistLoading(true);
     try {
       const res  = await fetch(`/api/balance-history?limit=${MAX_HISTORY}`);
       const data = await res.json();
       if (data.ok && Array.isArray(data.data)) {
-        // Merge con lo que ya tenemos en memoria (no perder puntos recientes)
         setHistory(prev => mergeHistory(data.data, prev));
       }
     } catch (e) {
@@ -142,30 +160,23 @@ export default function BalanceWidget() {
     }
   }, []);
 
-  // ── Cargar historial al montar ────────────────────────────────────────────
-  useEffect(() => {
-    loadHistory();
-  }, [loadHistory]);
+  useEffect(() => { loadHistory(); }, [loadHistory]);
 
-  // ── v3.2: Refresco periódico del historial (cada 5 min) ──────────────────
   useEffect(() => {
     histTimerRef.current = setInterval(loadHistory, HISTORY_POLL_MS);
     return () => clearInterval(histTimerRef.current);
   }, [loadHistory]);
 
-  // ── v3.2: Refresco al volver a primer plano (visibilitychange) ───────────
   useEffect(() => {
     function onVisible() {
-      if (document.visibilityState === "visible") {
-        console.log("[BalanceWidget] Tab visible → recargando historial");
-        loadHistory();
-      }
+      if (document.visibilityState === "visible") loadHistory();
     }
     document.addEventListener("visibilitychange", onVisible);
     return () => document.removeEventListener("visibilitychange", onVisible);
   }, [loadHistory]);
 
-  // ── Guardar snapshot en Supabase ──────────────────────────────────────────
+  // ── Snapshot ──────────────────────────────────────────────────────────────
+
   const saveSnapshot = useCallback(async (ts, usdc, total) => {
     try {
       await fetch("/api/balance-history", {
@@ -173,12 +184,11 @@ export default function BalanceWidget() {
         headers: { "Content-Type": "application/json" },
         body:    JSON.stringify({ ts, usdc, total }),
       });
-    } catch (e) {
-      console.warn("[BalanceWidget] Error guardando snapshot:", e.message);
-    }
+    } catch {}
   }, []);
 
   // ── Fetch balance ─────────────────────────────────────────────────────────
+
   const fetchBalance = useCallback(async () => {
     if (errorTimerRef.current) {
       clearTimeout(errorTimerRef.current);
@@ -196,12 +206,8 @@ export default function BalanceWidget() {
 
       if (!data.success) {
         const errMsg = data.error ?? "Error desconocido";
-        console.error("[BalanceWidget] /api/balance →", errMsg, data);
         setError(errMsg);
-        setApiDiag({
-          wallet_hint: data.wallet_hint ?? null,
-          rpc_errors:  data.rpc_errors  ?? [],
-        });
+        setApiDiag({ wallet_hint: data.wallet_hint ?? null, rpc_errors: data.rpc_errors ?? [] });
         errorTimerRef.current = setTimeout(fetchBalance, RETRY_ON_ERROR_MS);
         return;
       }
@@ -210,24 +216,28 @@ export default function BalanceWidget() {
       const newUsdc  = data.usdc;
       const newTotal = data.total_portfolio ?? newUsdc;
 
+      // Balances
       setUsdc(newUsdc);
       setPol(data.pol);
-      setPosCount(data.positions_count ?? null);
-      setPosValue(data.positions_value ?? null);
-      setPositions(data.positions      ?? []);
+      setUsdcDetail(data.usdc_detail ?? null);
       setTotalPortfolio(newTotal);
+      // Posiciones
+      setOpenCount(data.open_count ?? null);
+      setOpenValue(data.open_value ?? null);
+      setPendingCount(data.pending_claim_count ?? null);
+      setPendingValue(data.pending_claim_value ?? null);
+      setPosOpen(data.positions_open   ?? []);
+      setPosPending(data.positions_pending ?? []);
       setPosError(data.positions_error ?? null);
       setLastFetch(now);
       setRpcUsed(data.rpc_used ?? null);
 
-      // ── Snapshot: solo si el total cambió significativamente ─────────────
+      // Snapshot
       setHistory(prev => {
         const last    = prev[prev.length - 1];
         const changed = !last ||
           Math.abs((last.total ?? last.usdc ?? 0) - newTotal) >= SNAPSHOT_MIN_DELTA;
-
         if (!changed) return prev;
-
         const point = { ts: now, usdc: newUsdc, total: newTotal };
         const next  = mergeHistory(prev, [point]);
         saveSnapshot(now, newUsdc, newTotal);
@@ -237,7 +247,6 @@ export default function BalanceWidget() {
       prevTotal.current = newTotal;
 
     } catch (e) {
-      console.error("[BalanceWidget] fetchBalance exception:", e.message);
       setError(e.message);
       errorTimerRef.current = setTimeout(fetchBalance, RETRY_ON_ERROR_MS);
     } finally {
@@ -245,7 +254,6 @@ export default function BalanceWidget() {
     }
   }, [saveSnapshot]);
 
-  // ── Polling normal ────────────────────────────────────────────────────────
   useEffect(() => {
     fetchBalance();
     pollTimerRef.current = setInterval(fetchBalance, POLL_INTERVAL_MS);
@@ -255,7 +263,8 @@ export default function BalanceWidget() {
     };
   }, [fetchBalance]);
 
-  // ── Derived ───────────────────────────────────────────────────────────────
+  // ── Derived chart ─────────────────────────────────────────────────────────
+
   const firstTotal = history.length > 1 ? (history[0].total ?? history[0].usdc) : null;
   const deltaTotal = totalPortfolio != null && firstTotal != null
     ? totalPortfolio - firstTotal : null;
@@ -267,11 +276,7 @@ export default function BalanceWidget() {
     const src = history.length <= 100
       ? history
       : history.filter((_, i) => i % Math.ceil(history.length / 100) === 0 || i === history.length - 1);
-    return src.map(h => ({
-      label: xLabel(h.ts),
-      total: h.total ?? h.usdc,
-      usdc:  h.usdc,
-    }));
+    return src.map(h => ({ label: xLabel(h.ts), total: h.total ?? h.usdc, usdc: h.usdc }));
   })();
 
   const vals       = chartData.map(d => d.total).filter(v => v != null);
@@ -280,35 +285,66 @@ export default function BalanceWidget() {
   const pad        = Math.max((maxV - minV) * 0.1, 0.5);
   const yMin       = Math.max(0, minV - pad);
   const yMax       = maxV + pad;
-  const trendColor = deltaTotal == null ? "#0066ff" : deltaTotal >= 0 ? "#00ff88" : "#ff4466";
+  const trendColor = deltaTotal == null ? "#4488ff" : deltaTotal >= 0 ? "#00ff88" : "#ff4466";
   const firstVal   = chartData.length > 0 ? chartData[0].total : null;
 
+  // ── Helpers de render ─────────────────────────────────────────────────────
+
+  const hasPending   = (pendingCount ?? 0) > 0;
+  const hasOpen      = (openCount    ?? 0) > 0;
+  const hasPositions = hasPending || hasOpen;
+
+  function MetricBlock({ label, main, sub, color = "#ccc", badge, badgeColor }) {
+    return (
+      <div style={{ flex: 1, minWidth: 120, padding: "14px 20px" }}>
+        <div style={{ fontSize: 8, color: "#444", letterSpacing: "0.15em", marginBottom: 5, display: "flex", gap: 8, alignItems: "center" }}>
+          {label}
+          {badge != null && badge > 0 && (
+            <span style={{
+              fontSize: 8, fontWeight: 700,
+              background: `${badgeColor ?? "#4488ff"}22`,
+              border: `1px solid ${badgeColor ?? "#4488ff"}44`,
+              color: badgeColor ?? "#4488ff",
+              padding: "1px 5px", borderRadius: 2,
+            }}>
+              ×{badge}
+            </span>
+          )}
+        </div>
+        <div style={{ fontSize: 24, fontWeight: 700, color, lineHeight: 1 }}>
+          {main ?? (loading ? "…" : "—")}
+        </div>
+        {sub && <div style={{ fontSize: 9, color: "#444", marginTop: 4 }}>{sub}</div>}
+      </div>
+    );
+  }
+
   // ── Render ────────────────────────────────────────────────────────────────
+
   return (
     <div style={S.root}>
 
       {/* ── HEADER ────────────────────────────────────────────────────── */}
       <div style={S.header}>
         <span style={S.headerTitle}>WALLET BALANCE</span>
-        <span style={{ display: "flex", alignItems: "center", gap: 10 }}>
+        <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
           {lastFetch && (
             <span style={{ fontSize: 8, color: isStale ? "#ff4466" : "#444" }}>
               {isStale ? "STALE" : "LIVE"} · {fmtTime(lastFetch)}
-              {rpcUsed && <span style={{ color: "#222", marginLeft: 6 }}>{rpcUsed}</span>}
+              {rpcUsed && (
+                <span style={{ color: "#222", marginLeft: 6 }}>
+                  {rpcUsed.replace("https://", "").split("/")[0]}
+                </span>
+              )}
             </span>
           )}
-          <button
-            onClick={fetchBalance}
-            disabled={loading}
-            style={S.refreshBtn}
-            title="Actualizar balance"
-          >
+          <button onClick={fetchBalance} disabled={loading} style={S.btn} title="Actualizar">
             {loading ? "…" : "↻"}
           </button>
-        </span>
+        </div>
       </div>
 
-      {/* ── ERROR BANNER ──────────────────────────────────────────────── */}
+      {/* ── ERROR ─────────────────────────────────────────────────────── */}
       {error && (
         <div style={S.errorBanner}>
           <div style={{ fontWeight: 700, marginBottom: 4 }}>
@@ -316,128 +352,234 @@ export default function BalanceWidget() {
           </div>
           <div style={{ color: "#ff446688", fontSize: 9 }}>{error}</div>
           {apiDiag?.wallet_hint && (
-            <div style={{ color: "#ff446655", fontSize: 9, marginTop: 2 }}>
-              wallet: {apiDiag.wallet_hint}
-            </div>
+            <div style={{ color: "#ff446655", fontSize: 9 }}>wallet: {apiDiag.wallet_hint}</div>
           )}
           {apiDiag?.rpc_errors?.length > 0 && (
-            <div style={{ color: "#ff446644", fontSize: 8, marginTop: 2 }}>
-              RPCs fallidos: {apiDiag.rpc_errors.join(", ")}
-            </div>
-          )}
-          {lastAttempt && (
-            <div style={{ color: "#333", fontSize: 8, marginTop: 4 }}>
-              último intento: {fmtTime(lastAttempt)}
+            <div style={{ color: "#ff446644", fontSize: 8 }}>
+              RPCs: {apiDiag.rpc_errors.join(", ")}
             </div>
           )}
         </div>
       )}
 
-      {/* ── MÉTRICAS ──────────────────────────────────────────────────── */}
-      <div style={S.metricsRow}>
-
-        {/* TOTAL */}
-        <div style={S.metricBlock}>
-          <div style={S.label}>TOTAL PORTFOLIO</div>
-          <div style={S.bigValue(deltaTotal)}>
-            {totalPortfolio != null ? `$${totalPortfolio.toFixed(4)}` : (loading ? "…" : "—")}
+      {/* ── TOTAL PORTFOLIO ───────────────────────────────────────────── */}
+      <div style={{ padding: "16px 20px 12px", borderBottom: "1px solid #0d0d1a" }}>
+        <div style={{ fontSize: 8, color: "#444", letterSpacing: "0.15em", marginBottom: 6 }}>
+          TOTAL PORTFOLIO
+        </div>
+        <div style={{ display: "flex", alignItems: "baseline", gap: 12 }}>
+          <div style={{
+            fontSize: 34, fontWeight: 700, lineHeight: 1,
+            color: deltaTotal == null ? "#ccc" : deltaTotal >= 0 ? "#00ff88" : "#ff4466",
+          }}>
+            {totalPortfolio != null ? fmtUSD(totalPortfolio) : (loading ? "…" : "—")}
           </div>
-          {deltaPct != null && (
-            <div style={{ fontSize: 10, color: deltaTotal >= 0 ? "#00ff88" : "#ff4466", marginTop: 4 }}>
-              {deltaTotal >= 0 ? "+" : ""}{deltaTotal.toFixed(4)} ({deltaPct.toFixed(2)}%)
+          {deltaTotal != null && (
+            <div style={{
+              fontSize: 11,
+              color: deltaTotal >= 0 ? "#00ff8899" : "#ff446699",
+            }}>
+              {fmtDelta(deltaTotal)}
+              {deltaPct != null && (
+                <span style={{ marginLeft: 6 }}>
+                  ({deltaTotal >= 0 ? "+" : ""}{deltaPct.toFixed(2)}%)
+                </span>
+              )}
             </div>
           )}
         </div>
-
-        <div style={S.divider} />
-
-        {/* USDC LÍQUIDO */}
-        <div style={S.metricBlock}>
-          <div style={S.label}>USDC LÍQUIDO</div>
-          <div style={S.bigValue(null)}>
-            {usdc != null ? `$${usdc.toFixed(4)}` : (loading ? "…" : "—")}
-          </div>
-          {pol != null && (
-            <div style={{ fontSize: 9, color: "#444", marginTop: 4 }}>
-              POL {pol.toFixed(4)}
-            </div>
-          )}
-        </div>
-
-        <div style={S.divider} />
-
-        {/* POSICIONES */}
-        <div style={{ flex: 1 }}>
-          <div style={S.label}>
-            POSICIONES
-            {posCount != null && posCount > 0 && (
-              <button
-                onClick={() => setExpanded(e => !e)}
-                style={S.expandBtn}
-              >
-                {expanded ? "▲ ocultar" : "▼ ver"}
-              </button>
+        {/* Desglose en una línea */}
+        {(usdc != null || hasPositions) && (
+          <div style={{ marginTop: 6, fontSize: 9, color: "#333", display: "flex", gap: 12, flexWrap: "wrap" }}>
+            {usdc != null && (
+              <span>
+                USDC <span style={{ color: "#888" }}>{fmtUSD(usdc)}</span>
+              </span>
+            )}
+            {hasOpen && (
+              <span>
+                +{" "}
+                <span style={{ color: "#4488ff" }}>
+                  posiciones abiertas {fmtUSD(openValue)}
+                </span>
+              </span>
+            )}
+            {hasPending && (
+              <span>
+                +{" "}
+                <span style={{ color: "#ffcc00" }}>
+                  pending claim {fmtUSD(pendingValue)}
+                </span>
+              </span>
             )}
           </div>
-          <div style={S.bigValue(posValue > 0 ? true : null)}>
-            {posValue != null ? `$${posValue.toFixed(4)}` : (loading ? "…" : "—")}
-          </div>
-          {posCount != null && (
-            <div style={{ fontSize: 9, color: "#444", marginTop: 4 }}>
-              {posCount} posición{posCount !== 1 ? "es" : ""}
-              {posError && <span style={{ color: "#ff446688", marginLeft: 8 }}>⚠ parcial</span>}
-            </div>
-          )}
-        </div>
-
+        )}
       </div>
 
-      {/* ── TABLA POSICIONES EXPANDIBLE ───────────────────────────────── */}
-      {expanded && positions.length > 0 && (
-        <div style={S.posTable}>
-          <div style={S.posRow(true)}>
-            <span>MERCADO</span>
-            <span>LADO</span>
-            <span>TOKENS</span>
-            <span>PRECIO</span>
-            <span>VALOR</span>
+      {/* ── TRES COLUMNAS: USDC / POSICIONES ABIERTAS / PENDING CLAIM ─── */}
+      <div style={{ display: "flex", borderBottom: "1px solid #0d0d1a" }}>
+
+        {/* USDC */}
+        <MetricBlock
+          label="USDC LÍQUIDO"
+          main={usdc != null ? fmtUSD(usdc) : null}
+          sub={
+            usdcDetail
+              ? `native ${fmtUSD(usdcDetail.native, 2)} · bridged ${fmtUSD(usdcDetail.bridged, 2)}`
+              : pol != null ? `POL ${pol.toFixed(4)}` : undefined
+          }
+          color="#ccc"
+        />
+
+        <div style={{ width: 1, background: "#0d0d1a", alignSelf: "stretch" }} />
+
+        {/* POSICIONES ABIERTAS */}
+        <MetricBlock
+          label="POSICIONES ABIERTAS"
+          badge={openCount}
+          badgeColor="#4488ff"
+          main={
+            openCount == null
+              ? null
+              : openCount === 0
+                ? <span style={{ fontSize: 16, color: "#333" }}>ninguna</span>
+                : fmtUSD(openValue)
+          }
+          sub={
+            openCount === 0
+              ? "sin posiciones activas"
+              : openCount > 0
+                ? `${openCount} posición${openCount !== 1 ? "es" : ""} en curso`
+                : posError
+                  ? "⚠ error al cargar"
+                  : undefined
+          }
+          color={openCount > 0 ? "#4488ff" : "#333"}
+        />
+
+        <div style={{ width: 1, background: "#0d0d1a", alignSelf: "stretch" }} />
+
+        {/* PENDING CLAIM */}
+        <div style={{ flex: 1, minWidth: 120, padding: "14px 20px", position: "relative" }}>
+          <div style={{ fontSize: 8, color: "#444", letterSpacing: "0.15em", marginBottom: 5, display: "flex", gap: 8, alignItems: "center" }}>
+            PENDING CLAIM
+            {hasPending && (
+              <span style={{
+                fontSize: 8, fontWeight: 700,
+                background: "#ffcc0022", border: "1px solid #ffcc0044",
+                color: "#ffcc00", padding: "1px 5px", borderRadius: 2,
+                animation: "pulse 2s infinite",
+              }}>
+                ×{pendingCount}
+              </span>
+            )}
           </div>
-          {positions.map((p, i) => (
-            <div key={i} style={S.posRow(false)}>
-              <span style={{ color: "#888", maxWidth: 200, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                {p.market_slug ?? p.condition_id?.slice(0, 12) ?? "—"}
-              </span>
-              <span style={{ color: p.side === "YES" ? "#00ff88" : "#ff4466" }}>
-                {p.side ?? "—"}
-              </span>
-              <span>{p.size != null ? p.size.toFixed(4) : "—"}</span>
-              <span>{p.price != null ? p.price.toFixed(4) : "—"}</span>
-              <span style={{ color: "#0066ff" }}>
-                {p.value != null ? `$${p.value.toFixed(4)}` : "—"}
-              </span>
-            </div>
-          ))}
+          <div style={{ fontSize: 24, fontWeight: 700, lineHeight: 1, color: hasPending ? "#ffcc00" : "#333" }}>
+            {pendingCount == null
+              ? (loading ? "…" : "—")
+              : pendingCount === 0
+                ? <span style={{ fontSize: 16 }}>ninguno</span>
+                : fmtUSD(pendingValue)
+            }
+          </div>
+          <div style={{ fontSize: 9, color: "#555", marginTop: 4 }}>
+            {hasPending
+              ? "⚠ reclamar en Polymarket"
+              : pendingCount === 0
+                ? "sin ganancias pendientes"
+                : undefined
+            }
+          </div>
+          {hasPending && (
+            <a
+              href="https://polymarket.com/portfolio"
+              target="_blank"
+              rel="noopener noreferrer"
+              style={{
+                display: "inline-block", marginTop: 6,
+                fontSize: 8, color: "#ffcc0088",
+                textDecoration: "none", letterSpacing: "0.1em",
+                border: "1px solid #ffcc0033", padding: "2px 7px", borderRadius: 2,
+              }}
+            >
+              IR A PORTFOLIO ↗
+            </a>
+          )}
         </div>
+      </div>
+
+      {/* ── TABLA DE POSICIONES EXPANDIBLE ───────────────────────────── */}
+      {hasPositions && (
+        <>
+          <div style={{
+            padding: "8px 20px",
+            borderBottom: "1px solid #0d0d1a",
+            display: "flex", alignItems: "center", gap: 12,
+          }}>
+            <button
+              onClick={() => setExpanded(e => !e)}
+              style={S.btn}
+            >
+              {expanded ? "▲ ocultar posiciones" : "▼ ver posiciones"}
+            </button>
+            {posError && (
+              <span style={{ fontSize: 9, color: "#ff446688" }}>⚠ {posError.slice(0, 60)}</span>
+            )}
+          </div>
+
+          {expanded && (
+            <div style={{ borderBottom: "1px solid #0d0d1a" }}>
+
+              {/* PENDING CLAIM */}
+              {posPending.length > 0 && (
+                <div>
+                  <div style={{
+                    padding: "8px 20px 4px",
+                    fontSize: 8, color: "#ffcc00",
+                    letterSpacing: "0.15em",
+                    background: "#0a0800",
+                  }}>
+                    GANADORAS PENDIENTES DE CLAIM — reclamar manualmente en Polymarket
+                  </div>
+                  {posPending.map((p, i) => (
+                    <PositionRow key={i} pos={p} type="pending" />
+                  ))}
+                </div>
+              )}
+
+              {/* OPEN */}
+              {positionsOpen.length > 0 && (
+                <div>
+                  <div style={{
+                    padding: "8px 20px 4px",
+                    fontSize: 8, color: "#4488ff",
+                    letterSpacing: "0.15em",
+                    background: "#000a14",
+                  }}>
+                    POSICIONES ABIERTAS — resultado pendiente
+                  </div>
+                  {positionsOpen.map((p, i) => (
+                    <PositionRow key={i} pos={p} type="open" />
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+        </>
       )}
 
       {/* ── GRÁFICO EVOLUCIÓN ─────────────────────────────────────────── */}
       <div style={S.chartWrap}>
         <div style={S.chartLabel}>
-          EVOLUCIÓN PORTFOLIO · {histLoading ? "cargando…" : `${history.length} SNAPSHOTS`}
-          {posCount != null && posCount > 0 && (
-            <span style={{ color: "#333", marginLeft: 8 }}>(USDC + posiciones)</span>
+          EVOLUCIÓN PORTFOLIO · {histLoading ? "cargando…" : `${history.length} snapshots`}
+          {hasPending && (
+            <span style={{ color: "#ffcc0066", marginLeft: 8 }}>incl. pending claim</span>
           )}
-          {error && history.length > 0 && (
-            <span style={{ color: "#ff446688", marginLeft: 8 }}>
-              ⚠ mostrando último snapshot — datos live no disponibles
-            </span>
-          )}
-          {/* v3.2: botón de recarga manual del historial */}
           <button
             onClick={loadHistory}
             disabled={histLoading}
-            style={{ ...S.refreshBtn, marginLeft: 10, fontSize: 8 }}
-            title="Recargar historial desde Supabase"
+            style={{ ...S.btn, marginLeft: 10, fontSize: 8 }}
+            title="Recargar historial"
           >
             {histLoading ? "…" : "↻ BD"}
           </button>
@@ -496,6 +638,59 @@ export default function BalanceWidget() {
   );
 }
 
+// ── Fila de posición ──────────────────────────────────────────────────────────
+
+function PositionRow({ pos, type }) {
+  const isPending    = type === "pending";
+  const accentColor  = isPending ? "#ffcc00" : "#4488ff";
+  const isUp         = (pos.side ?? pos.outcome ?? "").toUpperCase() === "YES" ||
+                       (pos.side ?? pos.outcome ?? "").toUpperCase() === "UP";
+  const sideColor    = isUp ? "#00ff88" : "#ff4466";
+  const sideLabel    = isUp ? "▲ UP / YES" : "▼ DOWN / NO";
+  const valueEst     = isPending
+    ? pos.size        // ganadora: vale ~1 USDC/token
+    : pos.currentValue ?? (pos.size * pos.curPrice);
+
+  return (
+    <div style={{
+      display: "grid",
+      gridTemplateColumns: "1fr 90px 90px 80px 80px",
+      padding: "7px 20px",
+      borderBottom: "1px solid #06060e",
+      fontSize: 10,
+      alignItems: "center",
+      background: isPending ? "#0d0a00" : "transparent",
+    }}>
+      {/* Mercado */}
+      <div style={{ color: "#555", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 9 }}>
+        {pos.market_slug
+          ? <span>{pos.market_slug.slice(0, 40)}{pos.market_slug.length > 40 ? "…" : ""}</span>
+          : <span style={{ color: "#333" }}>{pos.title?.slice(0, 40) ?? "—"}</span>
+        }
+      </div>
+      {/* Lado */}
+      <div style={{ color: sideColor, fontWeight: 700, fontSize: 9 }}>
+        {sideLabel}
+      </div>
+      {/* Tokens */}
+      <div style={{ color: "#888", fontVariantNumeric: "tabular-nums" }}>
+        {pos.size?.toFixed(4) ?? "—"} tok
+      </div>
+      {/* Precio CLOB */}
+      <div style={{ color: accentColor, fontVariantNumeric: "tabular-nums" }}>
+        {pos.curPrice != null ? `${(pos.curPrice * 100).toFixed(1)}¢` : "—"}
+      </div>
+      {/* Valor estimado */}
+      <div style={{ color: isPending ? "#ffcc00" : "#888", fontWeight: isPending ? 700 : 400, textAlign: "right" }}>
+        {valueEst != null ? `≈$${Number(valueEst).toFixed(4)}` : "—"}
+        {isPending && (
+          <div style={{ fontSize: 7, color: "#ffcc0066", marginTop: 1 }}>CLAIM</div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ── Estilos ───────────────────────────────────────────────────────────────────
 
 const S = {
@@ -513,21 +708,19 @@ const S = {
     alignItems: "center",
     padding: "10px 20px",
     borderBottom: "1px solid #0d0d1a",
+    background: "#010108",
   },
-  headerTitle: {
-    fontSize: 9,
-    letterSpacing: "0.15em",
-    color: "#333",
-  },
-  refreshBtn: {
+  headerTitle: { fontSize: 9, letterSpacing: "0.15em", color: "#333" },
+  btn: {
     background: "none",
     border: "1px solid #1a1a2e",
-    color: "#444",
+    color: "#555",
     cursor: "pointer",
-    fontSize: 10,
-    padding: "2px 6px",
+    fontSize: 9,
+    padding: "3px 8px",
     borderRadius: 2,
     fontFamily: "inherit",
+    letterSpacing: "0.08em",
   },
   errorBanner: {
     background: "#1a0008",
@@ -538,58 +731,6 @@ const S = {
     fontSize: 10,
     color: "#ff4466",
   },
-  metricsRow: {
-    display: "flex",
-    alignItems: "flex-start",
-    gap: 0,
-    padding: "16px 20px",
-  },
-  metricBlock: {
-    flex: 1,
-    paddingRight: 20,
-  },
-  divider: {
-    width: 1,
-    alignSelf: "stretch",
-    background: "#0d0d1a",
-    marginRight: 20,
-    flexShrink: 0,
-  },
-  label: {
-    fontSize: 8, letterSpacing: "0.15em", color: "#444", marginBottom: 5,
-  },
-  bigValue: (positive) => ({
-    fontSize: 28, fontWeight: 700, lineHeight: 1,
-    color: positive == null ? "#ccc" : positive ? "#00ff88" : "#ff4466",
-  }),
-  expandBtn: {
-    background: "none",
-    border: "none",
-    color: "#333",
-    cursor: "pointer",
-    fontSize: 8,
-    marginLeft: 8,
-    fontFamily: "inherit",
-    padding: 0,
-  },
-  posTable: {
-    margin: "0 20px 12px",
-    border: "1px solid #0d0d1a",
-    borderRadius: 3,
-    overflow: "hidden",
-    fontSize: 9,
-  },
-  posRow: (header) => ({
-    display: "grid",
-    gridTemplateColumns: "2fr 0.5fr 1fr 1fr 1fr",
-    gap: 8,
-    padding: "5px 10px",
-    background: header ? "#050510" : "transparent",
-    borderBottom: "1px solid #0d0d1a",
-    color: header ? "#333" : "#888",
-    letterSpacing: header ? "0.1em" : 0,
-    fontSize: header ? 7 : 9,
-  }),
   chartWrap: {
     borderTop: "1px solid #0d0d1a",
     padding: "10px 20px 14px",
