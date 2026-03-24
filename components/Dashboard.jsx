@@ -28,6 +28,7 @@ import StatsPanel    from "./StatsPanel";
 import ModeSelector  from "./ModeSelector";
 import BoostLive     from "./BoostLive";
 import DataLab from "./DataLab";
+import ClaimPanel from "./ClaimPanel";
 
 const LS_KEY         = "polymarket_bets_v2";
 const BETS_POLL_MS   = 10_000;
@@ -498,7 +499,12 @@ export default function Dashboard() {
 
       {tab === "stats"  && <StatsPanel />}
       {tab === "datalab" && <DataLab />}
-      {tab === "config" && <ConfigPanel config={config} onChange={setConfig} />}
+      {tab === "config" && (
+        <>
+          <ClaimPanel />
+          <ConfigPanel config={config} onChange={setConfig} />
+        </>
+      )}
     </div>
   );
 }
