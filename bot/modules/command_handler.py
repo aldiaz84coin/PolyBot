@@ -228,12 +228,12 @@ def _handle_manual_claim(cfg: dict, params: dict) -> tuple[bool, dict]:
       op_id         (str)   — id de la operación en Supabase (informativo)
 
     Flujo:
-      1. Intenta _redimir_once() (con estimate_gas).
-      2. Si falla Y Gamma confirma resolución → intenta _redimir_once_no_estimate()
-         (gas fijo 150k) como workaround.
+      1. Intenta execute_claim_once() (con estimate_gas).
+      2. Si falla Y Gamma confirma resolución (resolved=True O closed+outcome) →
+         intenta execute_claim_no_estimate() (gas fijo 150k) como workaround.
       3. Devuelve {tx_hash, usdc_est, note} o {error, gamma_resolved}.
     """
-    from .claimer import _redimir_once, _redimir_once_no_estimate, _check_gamma_resolved
+    from .claimer import execute_claim_once, execute_claim_no_estimate, _check_gamma_resolved
 
     condition_id = params.get("condition_id", "")
     direction    = params.get("direction", "UP")
@@ -260,7 +260,7 @@ def _handle_manual_claim(cfg: dict, params: dict) -> tuple[bool, dict]:
 
     # ── Intento 1: con estimate_gas ──────────────────────────────────────────
     try:
-        tx_hash = _redimir_once(condition_id, direction, private_key)
+        tx_hash = execute_claim_once(condition_id, direction, private_key)
         logger.info(f"[CMD] ✅ manual_claim OK (estimate_gas) — tx={tx_hash[:16]}…")
         return True, {
             "tx_hash":  tx_hash,
@@ -277,37 +277,55 @@ def _handle_manual_claim(cfg: dict, params: dict) -> tuple[bool, dict]:
         gamma = _check_gamma_resolved(condition_id)
         logger.info(
             f"[CMD] 📡 Gamma — resolved={gamma.get('resolved')}  "
-            f"outcome={gamma.get('outcome')!r}  err={gamma.get('error')!r}"
+            f"closed={gamma.get('closed')}  outcome={gamma.get('outcome')!r}  "
+            f"err={gamma.get('error')!r}"
         )
     except Exception as eg:
         logger.warning(f"[CMD] ⚠ _check_gamma_resolved falló: {eg}")
 
     gamma_resolved = gamma.get("resolved", False)
+    gamma_closed   = gamma.get("closed", False)
+    gamma_outcome  = gamma.get("outcome", "") or ""
 
-    # ── Intento 2: gas fijo (solo si Gamma dice resuelto) ────────────────────
-    if gamma_resolved:
+    # Considerar reclamable si: resolved=True  O  (closed=True + outcome conocido)
+    # Gamma a veces tarda en marcar resolved aunque el mercado ya esté cerrado
+    effectively_resolved = gamma_resolved or (gamma_closed and bool(gamma_outcome.strip()))
+
+    # ── Intento 2: gas fijo ──────────────────────────────────────────────────
+    if effectively_resolved:
+        note_why = "resuelto según Gamma" if gamma_resolved else f"cerrado + outcome='{gamma_outcome}'"
+        logger.info(
+            f"[CMD] 🔁 Gamma confirma ({note_why}) — "
+            "intentando redención con gas fijo (sin estimate_gas)…"
+        )
         try:
-            tx_hash = _redimir_once_no_estimate(condition_id, direction, private_key)
+            tx_hash = execute_claim_no_estimate(condition_id, direction, private_key)
             logger.info(f"[CMD] ✅ manual_claim OK (gas fijo) — tx={tx_hash[:16]}…")
             return True, {
                 "tx_hash":  tx_hash,
                 "usdc_est": usdc_est,
-                "note":     "Claim ejecutado (workaround: gas fijo sin estimate_gas)",
+                "note":     f"Claim ejecutado — workaround gas fijo ({note_why})",
             }
         except Exception as e2:
             err_fixed = str(e2)
             logger.warning(f"[CMD] ⚠ manual_claim gas fijo también falló: {err_fixed}")
             return False, {
-                "error":          f"Ambos intentos fallaron. std={err_std[:120]} | gas_fijo={err_fixed[:120]}",
+                "error":          f"Ambos intentos fallaron. std: {err_std[:120]} | gas_fijo: {err_fixed[:120]}",
                 "gamma_resolved": gamma_resolved,
-                "gamma_outcome":  gamma.get("outcome"),
+                "gamma_closed":   gamma_closed,
+                "gamma_outcome":  gamma_outcome,
             }
     else:
-        logger.info("[CMD] ℹ Gamma NO confirma resolución — workaround gas fijo omitido")
+        logger.info(
+            f"[CMD] ℹ Gamma no confirma resolución "
+            f"(resolved={gamma_resolved}, closed={gamma_closed}, outcome={gamma_outcome!r}) "
+            "— workaround gas fijo omitido"
+        )
         return False, {
             "error":          f"estimate_gas falló y Gamma no confirma resolución: {err_std[:200]}",
             "gamma_resolved": gamma_resolved,
-            "gamma_outcome":  gamma.get("outcome"),
+            "gamma_closed":   gamma_closed,
+            "gamma_outcome":  gamma_outcome,
             "gamma_error":    gamma.get("error"),
         }
 
