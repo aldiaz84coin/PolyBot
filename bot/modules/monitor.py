@@ -674,30 +674,42 @@ def run(cfg: dict):
 
             # ── Stop loss de posición activa ───────────────────────────────
             if active_bet:
-                entry_price = active_bet.get("entry", price)
-                direction_  = active_bet.get("direction", "")
-                pnl_pct_btc = (
-                    ((price - entry_price) / entry_price) * 100
-                    if direction_ == "UP"
-                    else ((entry_price - price) / entry_price) * 100
+                # v11.5: SL basado en precio del TOKEN vs odds de entrada
+                # (antes medía movimiento de BTC, que es incorrecto)
+                odds_sl     = active_bet.get("odds", 0.5)
+                dir_sl      = active_bet.get("direction", "")
+                mkt_sl      = active_bet.get("market", {})
+                tokens_sl   = _tokens_to_dict(mkt_sl.get("tokens", []) if mkt_sl else [])
+                token_id_sl = (
+                    tokens_sl.get("yes", {}).get("token_id")
+                    if dir_sl == "UP"
+                    else tokens_sl.get("no", {}).get("token_id")
+                )
+                cur_token_px = _fetch_exit_token_price(token_id_sl) if token_id_sl else 0.0
+
+                pnl_pct_token = (
+                    ((cur_token_px - odds_sl) / odds_sl) * 100
+                    if odds_sl > 0 and cur_token_px > 0
+                    else 0.0
+                )
+                logger.debug(
+                    f"[MONITOR] SL check — odds_entrada={odds_sl:.4f}  "
+                    f"token_actual={cur_token_px:.4f}  pnl={pnl_pct_token:+.2f}%  "
+                    f"umbral=-{stop_pct}%"
                 )
 
-                if pnl_pct_btc <= -stop_pct:
+                if pnl_pct_token <= -stop_pct:
                     stake_      = active_bet.get("stake", 0)
-                    odds_       = active_bet.get("odds", 0.5)
+                    odds_       = odds_sl
                     sim_        = active_bet.get("simulated", False)
                     tokens_held = round(stake_ / max(odds_, 0.001), 4)
 
-                    mkt_       = active_bet.get("market", {})
-                    tokens_mkt = _tokens_to_dict(mkt_.get("tokens", []) if mkt_ else [])
-                    dir_       = active_bet.get("direction", "")
-                    token_id   = (
-                        tokens_mkt.get("yes", {}).get("token_id")
-                        if dir_ == "UP"
-                        else tokens_mkt.get("no", {}).get("token_id")
-                    )
+                    mkt_       = mkt_sl
+                    tokens_mkt = tokens_sl
+                    dir_       = dir_sl
+                    token_id   = token_id_sl
 
-                    exit_token_price = _fetch_exit_token_price(token_id) if token_id else 0.0
+                    exit_token_price = cur_token_px  # ya consultado arriba, no re-fetch
 
                     # v11.3: ejecutar SELL en CLOB si modo LIVE
                     if not sim_ and token_id and exit_token_price > 0:
