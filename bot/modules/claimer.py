@@ -329,7 +329,9 @@ def _send_redeem_tx(w3, fn, account, private_key: str, gas: int) -> str:
 
     logger.info("[CLAIMER] 📤 Firmando y enviando transacción...")
     signed  = w3.eth.account.sign_transaction(tx, private_key)
-    tx_hash = w3.eth.send_raw_transaction(signed.rawTransaction)
+    # web3.py v6+: raw_transaction  |  v5: rawTransaction
+    raw_tx  = getattr(signed, "raw_transaction", None) or getattr(signed, "rawTransaction", None)
+    tx_hash = w3.eth.send_raw_transaction(raw_tx)
     tx_hex  = tx_hash.hex()
 
     logger.info(
