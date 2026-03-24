@@ -4,10 +4,10 @@
 # ──────────────────────────────────────────────────────────────
 
 strategy:
-  t20_umbral_usd: 500     # umbral ventana T-20min
-  t15_umbral_usd: 300     # umbral ventana T-15min
-  t10_umbral_usd: 200     # umbral ventana T-10min
-  t5_umbral_usd:  150     # umbral ventana T-5min
+  t20_umbral_usd: 400     # umbral ventana T-20min (500)
+  t15_umbral_usd: 250     # umbral ventana T-15min (300)
+  t10_umbral_usd: 180     # umbral ventana T-10min (250)
+  t5_umbral_usd:  150     # umbral ventana T-5min  (150)
   stop_loss_pct:  0.50    # stop loss: salir si el movimiento BTC supera este %
   monitor_intervalo_s: 5  # frecuencia del loop fuera de ventana T-5 (segundos)
   t5_sl_intervalo_s:   1  # v8.0: frecuencia en T-5 con posición abierta (segundos)
