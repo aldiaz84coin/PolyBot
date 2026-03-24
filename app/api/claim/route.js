@@ -134,7 +134,14 @@ export async function GET() {
       winning_token_id,
       gamma_error:      gamma.error     ?? null,
       // Estado para la UI
-      claimable: Boolean(condId && gamma.resolved),
+      // Reclamable si: resolved=True  O  (closed=True + outcome conocido)
+      // Gamma tarda en marcar resolved aunque el mercado ya esté cerrado con outcome
+      claimable: Boolean(
+        condId && (
+          gamma.resolved ||
+          (gamma.closed && Boolean((gamma.outcome || "").trim()))
+        )
+      ),
     };
   });
 
