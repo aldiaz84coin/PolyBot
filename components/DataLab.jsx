@@ -1,9 +1,9 @@
 // components/DataLab.jsx
 // DataLab — Pestaña de análisis histórico de precios de tokens y velas BTC
-// v1.0 — Series temporales, heatmap de volumen, odds por ventana
+// v2.0 — Módulo AI Diagnóstico integrado (AIAnalysis inline, sin import externo)
 
 "use client";
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend,
   BarChart, Bar, ResponsiveContainer, ReferenceLine, Cell,
@@ -375,6 +375,457 @@ function CandleTable({ data, loading }) {
   );
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// ◈ AI ANÁLISIS — Módulo 1: Diagnóstico Inteligente
+// Llama a /api/ai-analysis, carga vistas de Supabase y genera diagnóstico con IA
+// ─────────────────────────────────────────────────────────────────────────────
+
+const LS_AI_KEY    = "polybot_ai_analysis_v1";
+const AI_CACHE_TTL = 5 * 60 * 1000; // 5 min
+
+const ESTADO_META = {
+  ÓPTIMO:     { color: "#00ff88", emoji: "◆" },
+  BUENO:      { color: "#00ff88", emoji: "●" },
+  NEUTRO:     { color: "#ffcc00", emoji: "◐" },
+  PRECAUCIÓN: { color: "#ff8800", emoji: "▲" },
+  CRÍTICO:    { color: "#ff3355", emoji: "✕" },
+};
+
+const TENDENCIA_META = {
+  MEJORANDO:    { color: "#00ff88", icon: "↑" },
+  ESTABLE:      { color: "#ffcc00", icon: "→" },
+  DETERIORANDO: { color: "#ff3355", icon: "↓" },
+};
+
+const ALERTA_COLOR = { ALTA: "#ff3355", MEDIA: "#ff8800", BAJA: "#ffcc00" };
+const OPO_COLOR    = { ALTO: "#00ff88", MEDIO: "#4488ff", BAJO: "#666" };
+
+function saveAICache(data, key) {
+  try {
+    const store = JSON.parse(localStorage.getItem(LS_AI_KEY) || "{}");
+    store[key] = { data, ts: Date.now() };
+    localStorage.setItem(LS_AI_KEY, JSON.stringify(store));
+  } catch { /* ignore */ }
+}
+
+function loadAICache(key) {
+  try {
+    const store = JSON.parse(localStorage.getItem(LS_AI_KEY) || "{}");
+    const entry = store[key];
+    if (entry && (Date.now() - entry.ts) < AI_CACHE_TTL) return entry.data;
+  } catch { /* ignore */ }
+  return null;
+}
+
+function AIBadge({ text, color, small }) {
+  return (
+    <span style={{
+      display: "inline-block",
+      background: `${color}18`, border: `1px solid ${color}44`,
+      color, fontSize: small ? 8 : 9, padding: small ? "1px 5px" : "2px 7px",
+      borderRadius: 3, letterSpacing: "0.1em", fontWeight: 700,
+    }}>{text}</span>
+  );
+}
+
+function AIScoreDial({ score }) {
+  if (score == null) return null;
+  const color = score >= 75 ? "#00ff88" : score >= 50 ? "#ffcc00" : score >= 30 ? "#ff8800" : "#ff3355";
+  return (
+    <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 2 }}>
+      <div style={{
+        width: 52, height: 52, borderRadius: "50%",
+        border: `3px solid ${color}`, boxShadow: `0 0 12px ${color}44`,
+        display: "flex", alignItems: "center", justifyContent: "center",
+        background: `${color}08`,
+      }}>
+        <span style={{ fontSize: 16, fontWeight: 900, color, lineHeight: 1 }}>{score}</span>
+      </div>
+      <span style={{ fontSize: 7, color: "#555", letterSpacing: "0.15em" }}>SCORE</span>
+    </div>
+  );
+}
+
+function AIMiniCard({ label, value, sub, color = "#ccc" }) {
+  return (
+    <div style={{
+      background: "#02020e", border: "1px solid #0d0d1a",
+      padding: "9px 13px", borderRadius: 4, flex: 1, minWidth: 85,
+    }}>
+      <div style={{ fontSize: 8, color: "#555", letterSpacing: "0.15em", marginBottom: 3 }}>{label}</div>
+      <div style={{ fontSize: 15, fontWeight: 700, color, lineHeight: 1 }}>{value}</div>
+      {sub && <div style={{ fontSize: 8, color: "#333", marginTop: 3 }}>{sub}</div>}
+    </div>
+  );
+}
+
+function AIVentanaTag({ v }) {
+  const colors = { T20: "#4488ff", T15: "#ffcc00", T10: "#ff8800", T5: "#ff3355" };
+  const c = colors[v] ?? "#aaa";
+  return (
+    <span style={{
+      display: "inline-block",
+      background: `${c}20`, border: `1px solid ${c}55`,
+      color: c, fontSize: 9, padding: "2px 6px",
+      borderRadius: 3, fontWeight: 700, letterSpacing: "0.1em",
+    }}>{v}</span>
+  );
+}
+
+function AIHorasGrid({ optimas = [], evitar = [] }) {
+  return (
+    <div style={{ display: "grid", gridTemplateColumns: "repeat(12, 1fr)", gap: 3 }}>
+      {Array.from({ length: 24 }, (_, h) => {
+        const isOpt = optimas.includes(h);
+        const isEv  = evitar.includes(h);
+        return (
+          <div key={h} style={{
+            background: isOpt ? "#00ff8818" : isEv ? "#ff335518" : "#02020e",
+            border: `1px solid ${isOpt ? "#00ff8844" : isEv ? "#ff335530" : "#0d0d1a"}`,
+            borderRadius: 3, padding: "4px 2px", textAlign: "center",
+          }}>
+            <div style={{ fontSize: 8, color: isOpt ? "#00ff88" : isEv ? "#ff3355" : "#333", fontWeight: isOpt || isEv ? 700 : 400 }}>
+              {String(h).padStart(2, "0")}h
+            </div>
+            {isOpt && <div style={{ fontSize: 6, color: "#00ff88" }}>▲</div>}
+            {isEv  && <div style={{ fontSize: 6, color: "#ff3355" }}>▼</div>}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function AIAnalysis() {
+  const [simFilter, setSimFilter] = useState(null);
+  const [loading,   setLoading]   = useState(false);
+  const [error,     setError]     = useState(null);
+  const [result,    setResult]    = useState(null);
+  const [activeTab, setActiveTab] = useState("diagnostico");
+
+  // Cargar caché al montar o cambiar filtro
+  useEffect(() => {
+    const cached = loadAICache(simFilter ?? "all");
+    if (cached) setResult(cached);
+    else setResult(null);
+  }, [simFilter]);
+
+  const runAnalysis = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const url = simFilter != null
+        ? `/api/ai-analysis?simulated=${simFilter}`
+        : `/api/ai-analysis`;
+      const res  = await fetch(url);
+      const data = await res.json();
+      if (!res.ok || data.error) throw new Error(data.error ?? `HTTP ${res.status}`);
+      setResult(data);
+      saveAICache(data, simFilter ?? "all");
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setLoading(false);
+    }
+  }, [simFilter]);
+
+  const { analysis, meta } = result ?? {};
+  const estadoMeta = ESTADO_META[analysis?.estado] ?? ESTADO_META.NEUTRO;
+  const tendMeta   = TENDENCIA_META[analysis?.tendencia?.direccion] ?? TENDENCIA_META.ESTABLE;
+
+  const AI_TABS = [
+    { key: "diagnostico",     label: "DIAGNÓSTICO"    },
+    { key: "recomendaciones", label: "ACCIONES"       },
+    { key: "horas",           label: "MAPA DE HORAS"  },
+  ];
+
+  return (
+    <div style={{ background: "#010108", borderBottom: "1px solid #0d0d1a" }}>
+
+      {/* ── Cabecera ── */}
+      <div style={{
+        display: "flex", justifyContent: "space-between", alignItems: "center",
+        padding: "12px 24px", borderBottom: "1px solid #0d0d1a", background: "#00050d",
+      }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+          <span style={{ fontSize: 9, letterSpacing: "0.25em", color: "#aa66ff", fontWeight: 700 }}>
+            ◈ AI DIAGNÓSTICO
+          </span>
+          {analysis && !loading && (
+            <span style={{
+              fontSize: 8, color: estadoMeta.color, letterSpacing: "0.12em",
+              background: `${estadoMeta.color}15`, border: `1px solid ${estadoMeta.color}44`,
+              padding: "2px 7px", borderRadius: 3, fontWeight: 700,
+            }}>
+              {estadoMeta.emoji} {analysis.estado}
+            </span>
+          )}
+          {meta && (
+            <span style={{ fontSize: 8, color: "#2a2a3a" }}>
+              {new Date(meta.generated_at).toLocaleString("es-ES", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" })}
+            </span>
+          )}
+        </div>
+
+        <div style={{ display: "flex", gap: 7, alignItems: "center" }}>
+          {[
+            { val: null,    label: "TODOS" },
+            { val: "true",  label: "SIM"   },
+            { val: "false", label: "REAL"  },
+          ].map(({ val, label }) => (
+            <button key={label} onClick={() => setSimFilter(val)} style={{
+              background: simFilter === val ? "#aa66ff22" : "none",
+              border: `1px solid ${simFilter === val ? "#aa66ff" : "#1a1a2e"}`,
+              color: simFilter === val ? "#aa66ff" : "#444",
+              fontSize: 8, padding: "3px 8px", cursor: "pointer",
+              fontFamily: "inherit", letterSpacing: "0.1em", borderRadius: 3,
+            }}>{label}</button>
+          ))}
+          <button
+            onClick={runAnalysis}
+            disabled={loading}
+            style={{
+              background: loading ? "#0d0d1a" : "#aa66ff22",
+              border: `1px solid ${loading ? "#222" : "#aa66ff"}`,
+              color: loading ? "#444" : "#aa66ff",
+              fontSize: 9, padding: "4px 14px",
+              cursor: loading ? "default" : "pointer",
+              fontFamily: "inherit", letterSpacing: "0.15em", fontWeight: 700,
+              borderRadius: 3,
+            }}
+          >
+            {loading ? "ANALIZANDO…" : analysis ? "↻ REANALIZAR" : "◈ ANALIZAR AHORA"}
+          </button>
+        </div>
+      </div>
+
+      {/* Error */}
+      {error && (
+        <div style={{ padding: "8px 24px", background: "#ff335508", borderBottom: "1px solid #ff335522" }}>
+          <span style={{ fontSize: 9, color: "#ff3355" }}>✕ {error}</span>
+        </div>
+      )}
+
+      {/* Loading */}
+      {loading && (
+        <div style={{ padding: "28px 24px", textAlign: "center", borderBottom: "1px solid #0d0d1a" }}>
+          <style>{`@keyframes ai-spin { to { transform: rotate(360deg); } }`}</style>
+          <div style={{
+            display: "inline-block", width: 22, height: 22, borderRadius: "50%",
+            border: "2px solid #aa66ff33", borderTop: "2px solid #aa66ff",
+            animation: "ai-spin 0.8s linear infinite", marginBottom: 10,
+          }} />
+          <div style={{ fontSize: 9, color: "#333", letterSpacing: "0.15em" }}>Consultando datos y generando diagnóstico…</div>
+        </div>
+      )}
+
+      {/* Placeholder */}
+      {!loading && !analysis && !error && (
+        <div style={{ padding: "22px 24px", textAlign: "center", borderBottom: "1px solid #0d0d1a" }}>
+          <div style={{ fontSize: 9, color: "#2a2a3a", letterSpacing: "0.15em", marginBottom: 6 }}>SIN ANÁLISIS GENERADO</div>
+          <div style={{ fontSize: 9, color: "#1a1a2a" }}>Pulsa "ANALIZAR AHORA" para que la IA diagnostique el rendimiento de tu estrategia</div>
+        </div>
+      )}
+
+      {/* Contenido */}
+      {!loading && analysis && (
+        <>
+          {/* Métricas globales */}
+          <div style={{
+            display: "flex", gap: 10, padding: "12px 24px", flexWrap: "wrap",
+            borderBottom: "1px solid #0d0d1a", alignItems: "center",
+          }}>
+            <AIScoreDial score={analysis.score} />
+            <AIMiniCard label="OPS"       value={meta?.totalOps ?? "—"}           color="#ccc" sub={meta?.mode} />
+            <AIMiniCard label="P&L"       value={meta?.totalPnl != null ? `$${meta.totalPnl.toFixed(2)}` : "—"}
+                        color={meta?.totalPnl >= 0 ? "#00ff88" : "#ff3355"} />
+            <AIMiniCard label="WIN RATE"  value={meta?.globalWR != null ? `${meta.globalWR}%` : "—"}
+                        sub={`${meta?.totalWins ?? 0}W / ${meta?.totalLoss ?? 0}L`}
+                        color={parseFloat(meta?.globalWR) >= 55 ? "#00ff88" : parseFloat(meta?.globalWR) >= 45 ? "#ffcc00" : "#ff3355"} />
+            <AIMiniCard label="TENDENCIA" value={`${tendMeta.icon} ${analysis.tendencia?.direccion ?? "—"}`}
+                        color={tendMeta.color} sub={analysis.tendencia?.analisis?.slice(0, 40) + "…"} />
+            {analysis.edge && (
+              <AIMiniCard label="EDGE" value={analysis.edge.tiene_edge ? "✓ SÍ" : "✕ NO"}
+                          color={analysis.edge.tiene_edge ? "#00ff88" : "#ff3355"}
+                          sub={analysis.edge.explicacion?.slice(0, 45) + "…"} />
+            )}
+          </div>
+
+          {/* Resumen ejecutivo */}
+          <div style={{
+            padding: "12px 24px", borderBottom: "1px solid #0d0d1a",
+            background: `${estadoMeta.color}06`,
+          }}>
+            <div style={{ fontSize: 9, color: "#444", letterSpacing: "0.15em", marginBottom: 6 }}>DIAGNÓSTICO EJECUTIVO</div>
+            <p style={{
+              fontSize: 11, color: "#bbb", lineHeight: 1.7, margin: 0,
+              borderLeft: `3px solid ${estadoMeta.color}`, paddingLeft: 12,
+            }}>
+              {analysis.resumen}
+            </p>
+            {analysis.proximos_pasos && (
+              <div style={{
+                marginTop: 10, padding: "6px 12px",
+                background: "#aa66ff10", border: "1px solid #aa66ff33",
+                borderRadius: 3, display: "inline-flex", gap: 8, alignItems: "center",
+              }}>
+                <span style={{ fontSize: 8, color: "#aa66ff", letterSpacing: "0.12em" }}>PRÓXIMO PASO</span>
+                <span style={{ fontSize: 10, color: "#888" }}>{analysis.proximos_pasos}</span>
+              </div>
+            )}
+          </div>
+
+          {/* Sub-tabs */}
+          <div style={{ display: "flex", borderBottom: "1px solid #0d0d1a", background: "#00040c", paddingLeft: 24 }}>
+            {AI_TABS.map(({ key, label }) => (
+              <button key={key} onClick={() => setActiveTab(key)} style={{
+                background: "none", border: "none", cursor: "pointer",
+                padding: "7px 16px", fontSize: 8, letterSpacing: "0.15em",
+                color: activeTab === key ? "#aa66ff" : "#333",
+                borderBottom: activeTab === key ? "2px solid #aa66ff" : "2px solid transparent",
+                fontFamily: "inherit",
+              }}>{label}</button>
+            ))}
+          </div>
+
+          {/* Tab: DIAGNÓSTICO */}
+          {activeTab === "diagnostico" && (
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", borderBottom: "1px solid #0d0d1a" }}>
+              <div style={{ padding: "16px 24px", borderRight: "1px solid #0d0d1a" }}>
+                <SectionTitle>RENDIMIENTO POR VENTANA</SectionTitle>
+                {analysis.ventanas && (
+                  <>
+                    <div style={{ display: "flex", gap: 16, marginBottom: 10, flexWrap: "wrap" }}>
+                      <div>
+                        <div style={{ fontSize: 8, color: "#444", marginBottom: 4 }}>MEJOR</div>
+                        <AIVentanaTag v={analysis.ventanas.mejor} />
+                      </div>
+                      <div>
+                        <div style={{ fontSize: 8, color: "#444", marginBottom: 4 }}>PEOR</div>
+                        <AIVentanaTag v={analysis.ventanas.peor} />
+                      </div>
+                      {analysis.ventanas.ranking?.length > 0 && (
+                        <div>
+                          <div style={{ fontSize: 8, color: "#444", marginBottom: 4 }}>RANKING</div>
+                          <div style={{ display: "flex", gap: 3, alignItems: "center" }}>
+                            {analysis.ventanas.ranking.map((v, i) => (
+                              <span key={v} style={{ display: "flex", alignItems: "center", gap: 3 }}>
+                                {i > 0 && <span style={{ color: "#333", fontSize: 8 }}>›</span>}
+                                <AIVentanaTag v={v} />
+                              </span>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                    <p style={{ fontSize: 10, color: "#555", lineHeight: 1.6, margin: 0 }}>
+                      {analysis.ventanas.analisis}
+                    </p>
+                  </>
+                )}
+              </div>
+              <div style={{ padding: "16px 24px" }}>
+                <SectionTitle>SESGO DIRECCIONAL</SectionTitle>
+                {analysis.direccion && (
+                  <div style={{ marginBottom: 14 }}>
+                    <div style={{ display: "flex", gap: 8, marginBottom: 8, alignItems: "center" }}>
+                      <AIBadge
+                        text={analysis.direccion.sesgo}
+                        color={analysis.direccion.sesgo === "UP" ? "#00ff88" : analysis.direccion.sesgo === "DOWN" ? "#ff3355" : "#ffcc00"}
+                      />
+                      {analysis.direccion.confianza && (
+                        <AIBadge text={`CONFIANZA ${analysis.direccion.confianza}`} color="#555" small />
+                      )}
+                    </div>
+                    <p style={{ fontSize: 10, color: "#555", lineHeight: 1.6, margin: 0 }}>
+                      {analysis.direccion.analisis}
+                    </p>
+                  </div>
+                )}
+                <SectionTitle>ALERTAS ACTIVAS</SectionTitle>
+                {!analysis.alertas?.length
+                  ? <span style={{ fontSize: 9, color: "#2a2a3a" }}>Sin alertas activas</span>
+                  : analysis.alertas.map((a, i) => (
+                    <div key={i} style={{
+                      display: "flex", alignItems: "flex-start", gap: 8,
+                      padding: "6px 10px", marginBottom: 5,
+                      background: `${ALERTA_COLOR[a.nivel] ?? "#666"}08`,
+                      border: `1px solid ${ALERTA_COLOR[a.nivel] ?? "#666"}22`,
+                      borderRadius: 3,
+                    }}>
+                      <AIBadge text={a.nivel} color={ALERTA_COLOR[a.nivel] ?? "#666"} small />
+                      <span style={{ fontSize: 10, color: "#666", lineHeight: 1.5 }}>{a.mensaje}</span>
+                    </div>
+                  ))
+                }
+              </div>
+            </div>
+          )}
+
+          {/* Tab: ACCIONES */}
+          {activeTab === "recomendaciones" && (
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", borderBottom: "1px solid #0d0d1a" }}>
+              <div style={{ padding: "16px 24px", borderRight: "1px solid #0d0d1a" }}>
+                <SectionTitle>RECOMENDACIONES PRIORITARIAS</SectionTitle>
+                {analysis.recomendaciones?.sort((a, b) => (a.prioridad ?? 99) - (b.prioridad ?? 99)).map((r, i) => (
+                  <div key={i} style={{
+                    padding: "10px 14px", marginBottom: 8,
+                    background: "#030316", border: "1px solid #0d0d1a",
+                    borderLeft: `3px solid ${i === 0 ? "#00ff88" : i === 1 ? "#ffcc00" : "#333"}`,
+                    borderRadius: "0 4px 4px 0",
+                  }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
+                      <span style={{ fontSize: 8, color: "#444" }}>#{r.prioridad ?? i + 1}</span>
+                      <span style={{ fontSize: 10, fontWeight: 700, color: "#ccc", letterSpacing: "0.05em" }}>{r.accion}</span>
+                    </div>
+                    <div style={{ fontSize: 10, color: "#555", lineHeight: 1.6 }}>{r.detalle}</div>
+                  </div>
+                ))}
+              </div>
+              <div style={{ padding: "16px 24px" }}>
+                <SectionTitle>OPORTUNIDADES DETECTADAS</SectionTitle>
+                {!analysis.oportunidades?.length
+                  ? <span style={{ fontSize: 9, color: "#2a2a3a" }}>Sin oportunidades destacadas</span>
+                  : analysis.oportunidades.map((o, i) => (
+                    <div key={i} style={{
+                      display: "flex", alignItems: "flex-start", gap: 8,
+                      padding: "6px 10px", marginBottom: 5,
+                      background: `${OPO_COLOR[o.impacto] ?? "#666"}08`,
+                      border: `1px solid ${OPO_COLOR[o.impacto] ?? "#666"}22`,
+                      borderRadius: 3,
+                    }}>
+                      <AIBadge text={o.impacto} color={OPO_COLOR[o.impacto] ?? "#666"} small />
+                      <span style={{ fontSize: 10, color: "#666", lineHeight: 1.5 }}>{o.mensaje}</span>
+                    </div>
+                  ))
+                }
+              </div>
+            </div>
+          )}
+
+          {/* Tab: MAPA DE HORAS */}
+          {activeTab === "horas" && (
+            <div style={{ padding: "16px 24px", borderBottom: "1px solid #0d0d1a" }}>
+              <SectionTitle>MAPA DE RENDIMIENTO POR HORA UTC</SectionTitle>
+              <div style={{ marginBottom: 10, display: "flex", gap: 16 }}>
+                <span style={{ fontSize: 9, color: "#444" }}>
+                  ▲ <span style={{ color: "#00ff88" }}>Horas óptimas</span>
+                  {analysis.horas_optimas?.length ? ` · ${analysis.horas_optimas.join(", ")}h UTC` : ""}
+                </span>
+                <span style={{ fontSize: 9, color: "#444" }}>
+                  ▼ <span style={{ color: "#ff3355" }}>Horas a evitar</span>
+                  {analysis.horas_evitar?.length ? ` · ${analysis.horas_evitar.join(", ")}h UTC` : ""}
+                </span>
+              </div>
+              <AIHorasGrid optimas={analysis.horas_optimas ?? []} evitar={analysis.horas_evitar ?? []} />
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
 // ── Componente principal DataLab ──────────────────────────────────────────────
 
 export default function DataLab() {
@@ -469,6 +920,9 @@ export default function DataLab() {
   // ── Render ─────────────────────────────────────────────────────────────────
   return (
     <div style={{ fontFamily: "monospace", color: "#ccc", minHeight: "100vh" }}>
+
+      {/* ── AI DIAGNÓSTICO ──────────────────────────────────────────────── */}
+      <AIAnalysis />
 
       {/* ── HEADER ────────────────────────────────────────────────────────── */}
       <div style={{
