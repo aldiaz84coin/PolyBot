@@ -105,8 +105,11 @@ function GammaStatus({ claim }) {
   if (claim.resolved) {
     return <span style={S.tag("#00ff88")}>✅ RESUELTO</span>;
   }
+  if (claim.closed && claim.outcome) {
+    return <span style={S.tag("#00cc66")}>🔒 CERRADO · outcome: {claim.outcome}</span>;
+  }
   if (claim.closed) {
-    return <span style={S.tag("#4488ff")}>🔒 CERRADO</span>;
+    return <span style={S.tag("#4488ff")}>🔒 CERRADO (resolución pendiente)</span>;
   }
   return <span style={S.tag("#888")}>⏳ PENDIENTE</span>;
 }
@@ -335,9 +338,14 @@ export default function ClaimPanel() {
                       condition_id no disponible en Gamma — reclamar manualmente
                     </span>
                   )}
-                  {claim.condition_id && !claim.resolved && (
+                  {claim.condition_id && !claim.resolved && !claim.closed && (
                     <span style={{ fontSize: 8, color: "#ff8800" }}>
-                      Gamma no confirma resolución aún — el claim puede fallar
+                      Gamma no confirma resolución — el claim puede fallar
+                    </span>
+                  )}
+                  {claim.condition_id && !claim.resolved && claim.closed && claim.outcome && (
+                    <span style={{ fontSize: 8, color: "#aaffcc" }}>
+                      Mercado cerrado con outcome conocido — se intentará con gas fijo si estimate_gas falla
                     </span>
                   )}
                 </div>
