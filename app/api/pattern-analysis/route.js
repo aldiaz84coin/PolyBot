@@ -206,7 +206,7 @@ async function getPriceMatrix(simFilter, minSessions) {
 
 async function getEntryBands(simFilter, minSessions) {
   // Datos: operaciones con odds de entrada y resultado
-  let params = "?select=ventana,direccion,odds_entrada,real_exit_odds,odds_salida,resultado,pnl_usd,pnl_pct,simulado&neq.resultado=PENDING&limit=2000";
+  let params = "?select=ventana,direccion,odds_entrada,real_exit_odds,odds_salida,resultado,pnl_usd,pnl_pct,simulado&resultado=neq.PENDING&limit=2000";
   if (simFilter === "true")  params += "&simulado=eq.true";
   if (simFilter === "false") params += "&simulado=eq.false";
 
