@@ -1,12 +1,12 @@
 // components/DataLab.jsx
 // DataLab — Pestaña de análisis histórico de precios de tokens y velas BTC
-// v2.0 — Módulo AI Diagnóstico integrado (AIAnalysis inline, sin import externo)
+// v2.1 — FIX ventanas horarias en gráfico de tokens (ReferenceArea geométrico)
 
 "use client";
 import { useState, useEffect, useCallback, useRef } from "react";
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend,
-  BarChart, Bar, ResponsiveContainer, ReferenceLine, Cell,
+  BarChart, Bar, ResponsiveContainer, ReferenceLine, ReferenceArea, Cell,
 } from "recharts";
 
 // ── Colores y estilos ──────────────────────────────────────────────────────────
@@ -31,12 +31,59 @@ const VENTANA_COLORS = {
 
 const VENTANA_ORDER = ["T20", "T15", "T10", "T5"];
 
+// Definición de ventanas: minutos antes del CIERRE de la vela
+const WINDOWS_DEF = [
+  { key: "T-20", min: 17, max: 22, color: "#4488ff" },
+  { key: "T-15", min: 12, max: 17, color: "#ffcc00" },
+  { key: "T-10", min: 7,  max: 12, color: "#ff8800" },
+  { key: "T-5",  min: 2,  max: 7,  color: "#ff3355" },
+];
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 const fmtTime  = (ts) => ts ? new Date(ts).toLocaleTimeString("es-ES", { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "—";
 const fmtDate  = (ts) => ts ? new Date(ts).toLocaleDateString("es-ES") : "—";
 const fmtOdds  = (v)  => v != null ? `${(v * 100).toFixed(1)}%` : "—";
 const fmtUSD   = (v)  => v != null ? `$${Number(v).toLocaleString("en-US", { minimumFractionDigits: 0, maximumFractionDigits: 0 })}` : "—";
 const fmtBTC   = (v)  => v != null ? `${Number(v).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })} BTC` : "—";
+
+/**
+ * Dado cualquier ts_ms dentro de una hora, calcula los x1/x2 (ms)
+ * de cada ventana de esa hora.
+ * La vela cierra al inicio de la hora siguiente (HH+1:00:00 UTC).
+ */
+function getWindowBandsForHour(ts_ms) {
+  const d = new Date(ts_ms);
+  const closeMs = new Date(
+    Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), d.getUTCHours() + 1, 0, 0, 0)
+  ).getTime();
+
+  return WINDOWS_DEF.map((w) => ({
+    ...w,
+    x1: closeMs - w.max * 60_000,
+    x2: closeMs - w.min * 60_000,
+  }));
+}
+
+/**
+ * Devuelve bandas para todas las horas presentes en chartData.
+ */
+function getAllWindowBands(chartData) {
+  if (!chartData.length) return [];
+  const seenHours = new Set();
+  chartData.forEach(({ ts_ms }) => {
+    const d = new Date(ts_ms);
+    seenHours.add(
+      `${d.getUTCFullYear()}-${d.getUTCMonth()}-${d.getUTCDate()}-${d.getUTCHours()}`
+    );
+  });
+  const bands = [];
+  seenHours.forEach((key) => {
+    const [year, month, day, hour] = key.split("-").map(Number);
+    const sampleTs = new Date(Date.UTC(year, month, day, hour, 30, 0)).getTime();
+    bands.push(...getWindowBandsForHour(sampleTs));
+  });
+  return bands;
+}
 
 // ── Sub-componentes ───────────────────────────────────────────────────────────
 
@@ -126,79 +173,98 @@ function HourSelector({ selected, onChange }) {
 }
 
 // ── Gráfico: evolución de precio de tokens en el tiempo ──────────────────────
-// v1.1 — FIX: XAxis numérico (ts_ms) para que ReferenceLine se posicione correctamente.
-//         Con XAxis categórico (strings) Recharts no puede interpolar la posición
-//         exacta de x={time} y las líneas no se renderizan o aparecen fuera de lugar.
+// v2.1 — Ventanas calculadas geométricamente con ReferenceArea + ReferenceLine
 
 function TokenPriceChart({ data, loading }) {
   if (loading) return <div style={{ color: C.dim, fontSize: 10, padding: 20 }}>Cargando datos…</div>;
   if (!data.length) return <div style={{ color: "#333", fontSize: 10, padding: 20 }}>Sin datos para el filtro seleccionado.</div>;
 
-  // Usar timestamp numérico como dataKey del eje X
   const chartData = data.map(row => ({
     ...row,
-    ts_ms:     new Date(row.ts).getTime(),   // número para XAxis — garantiza posicionamiento exacto
-    yes_price: row.yes_price ? parseFloat(row.yes_price) : null,
-    no_price:  row.no_price  ? parseFloat(row.no_price)  : null,
-    btc_price: row.btc_price ? parseFloat(row.btc_price) : null,
+    ts_ms:     new Date(row.ts).getTime(),
+    yes_price: row.yes_price != null ? parseFloat(row.yes_price) : null,
+    no_price:  row.no_price  != null ? parseFloat(row.no_price)  : null,
+    btc_price: row.btc_price != null ? parseFloat(row.btc_price) : null,
   }));
 
-  // Detectar cambios de ventana usando ts_ms
-  const windowChanges = [];
-  let prevVentana = null;
-  chartData.forEach((row) => {
-    if (row.ventana && row.ventana !== prevVentana) {
-      windowChanges.push({ ts_ms: row.ts_ms, ventana: row.ventana });
-      prevVentana = row.ventana;
-    }
-  });
+  const domain = [chartData[0].ts_ms, chartData[chartData.length - 1].ts_ms];
+  const windowBands = getAllWindowBands(chartData);
 
   return (
-    <ResponsiveContainer width="100%" height={280}>
-      <LineChart data={chartData} margin={{ top: 5, right: 10, left: 0, bottom: 5 }}>
+    <ResponsiveContainer width="100%" height={300}>
+      <LineChart data={chartData} margin={{ top: 8, right: 12, left: 0, bottom: 5 }}>
         <CartesianGrid strokeDasharray="3 3" stroke="#0a0a18" />
+
         <XAxis
           dataKey="ts_ms"
           type="number"
           scale="time"
-          domain={["dataMin", "dataMax"]}
-          tickFormatter={v => fmtTime(new Date(v).toISOString())}
+          domain={domain}
+          tickFormatter={(v) => {
+            const d = new Date(v);
+            return `${String(d.getUTCHours()).padStart(2,"0")}:${String(d.getUTCMinutes()).padStart(2,"0")}`;
+          }}
           tick={{ fontSize: 8, fill: "#444" }}
-          tickCount={6}
+          tickCount={8}
           tickLine={false}
         />
+
         <YAxis
           domain={[0, 1]}
-          tickFormatter={v => `${(v * 100).toFixed(0)}%`}
+          tickFormatter={(v) => `${(v * 100).toFixed(0)}%`}
           tick={{ fontSize: 8, fill: "#444" }}
           width={36}
           tickLine={false}
         />
+
         <Tooltip
           content={<TokenTooltip />}
-          labelFormatter={v => fmtTime(new Date(v).toISOString())}
+          labelFormatter={(v) => {
+            const d = new Date(v);
+            return `${String(d.getUTCHours()).padStart(2,"0")}:${String(d.getUTCMinutes()).padStart(2,"0")}:${String(d.getUTCSeconds()).padStart(2,"0")} UTC`;
+          }}
         />
+
         <Legend
           wrapperStyle={{ fontSize: 9, color: C.dim }}
           iconType="circle"
           iconSize={6}
         />
-        {/* Líneas de referencia por cambio de ventana — ahora con eje numérico funcionan */}
-        {windowChanges.map(({ ts_ms, ventana }) => (
+
+        {/* Bandas semitransparentes por ventana */}
+        {windowBands.map(({ key, x1, x2, color }, i) => (
+          <ReferenceArea
+            key={`band-${i}-${key}`}
+            x1={x1}
+            x2={x2}
+            fill={color}
+            fillOpacity={0.07}
+            stroke={color}
+            strokeOpacity={0.25}
+            strokeWidth={1}
+            ifOverflow="visible"
+          />
+        ))}
+
+        {/* Línea de inicio de ventana con label */}
+        {windowBands.map(({ key, x1, color }, i) => (
           <ReferenceLine
-            key={`${ts_ms}-${ventana}`}
-            x={ts_ms}
-            stroke={VENTANA_COLORS[ventana] || "#555"}
-            strokeDasharray="4 4"
+            key={`line-${i}-${key}`}
+            x={x1}
+            stroke={color}
+            strokeDasharray="5 3"
             strokeWidth={1.5}
+            strokeOpacity={0.9}
             label={{
-              value: ventana,
+              value: key,
               position: "insideTopRight",
-              fontSize: 9,
-              fill: VENTANA_COLORS[ventana] || "#555",
+              fontSize: 8,
+              fill: color,
+              fontWeight: 700,
             }}
           />
         ))}
+
         <Line
           type="monotone"
           dataKey="yes_price"
@@ -302,7 +368,7 @@ function WindowOddsTable({ data, loading }) {
         </thead>
         <tbody>
           {data
-            .filter(r => !r.simulado) // mostrar solo real por defecto
+            .filter(r => !r.simulado)
             .sort((a, b) => VENTANA_ORDER.indexOf(a.ventana) - VENTANA_ORDER.indexOf(b.ventana))
             .map((row, i) => (
               <tr key={i} style={{ borderBottom: `1px solid #05050f` }}>
@@ -377,11 +443,10 @@ function CandleTable({ data, loading }) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ◈ AI ANÁLISIS — Módulo 1: Diagnóstico Inteligente
-// Llama a /api/ai-analysis, carga vistas de Supabase y genera diagnóstico con IA
 // ─────────────────────────────────────────────────────────────────────────────
 
 const LS_AI_KEY    = "polybot_ai_analysis_v1";
-const AI_CACHE_TTL = 5 * 60 * 1000; // 5 min
+const AI_CACHE_TTL = 5 * 60 * 1000;
 
 const ESTADO_META = {
   ÓPTIMO:     { color: "#00ff88", emoji: "◆" },
@@ -503,7 +568,6 @@ function AIAnalysis() {
   const [result,    setResult]    = useState(null);
   const [activeTab, setActiveTab] = useState("diagnostico");
 
-  // Cargar caché al montar o cambiar filtro
   useEffect(() => {
     const cached = loadAICache(simFilter ?? "all");
     if (cached) setResult(cached);
@@ -542,7 +606,6 @@ function AIAnalysis() {
   return (
     <div style={{ background: "#010108", borderBottom: "1px solid #0d0d1a" }}>
 
-      {/* ── Cabecera ── */}
       <div style={{
         display: "flex", justifyContent: "space-between", alignItems: "center",
         padding: "12px 24px", borderBottom: "1px solid #0d0d1a", background: "#00050d",
@@ -599,14 +662,12 @@ function AIAnalysis() {
         </div>
       </div>
 
-      {/* Error */}
       {error && (
         <div style={{ padding: "8px 24px", background: "#ff335508", borderBottom: "1px solid #ff335522" }}>
           <span style={{ fontSize: 9, color: "#ff3355" }}>✕ {error}</span>
         </div>
       )}
 
-      {/* Loading */}
       {loading && (
         <div style={{ padding: "28px 24px", textAlign: "center", borderBottom: "1px solid #0d0d1a" }}>
           <style>{`@keyframes ai-spin { to { transform: rotate(360deg); } }`}</style>
@@ -619,7 +680,6 @@ function AIAnalysis() {
         </div>
       )}
 
-      {/* Placeholder */}
       {!loading && !analysis && !error && (
         <div style={{ padding: "22px 24px", textAlign: "center", borderBottom: "1px solid #0d0d1a" }}>
           <div style={{ fontSize: 9, color: "#2a2a3a", letterSpacing: "0.15em", marginBottom: 6 }}>SIN ANÁLISIS GENERADO</div>
@@ -627,10 +687,8 @@ function AIAnalysis() {
         </div>
       )}
 
-      {/* Contenido */}
       {!loading && analysis && (
         <>
-          {/* Métricas globales */}
           <div style={{
             display: "flex", gap: 10, padding: "12px 24px", flexWrap: "wrap",
             borderBottom: "1px solid #0d0d1a", alignItems: "center",
@@ -651,7 +709,6 @@ function AIAnalysis() {
             )}
           </div>
 
-          {/* Resumen ejecutivo */}
           <div style={{
             padding: "12px 24px", borderBottom: "1px solid #0d0d1a",
             background: `${estadoMeta.color}06`,
@@ -675,7 +732,6 @@ function AIAnalysis() {
             )}
           </div>
 
-          {/* Sub-tabs */}
           <div style={{ display: "flex", borderBottom: "1px solid #0d0d1a", background: "#00040c", paddingLeft: 24 }}>
             {AI_TABS.map(({ key, label }) => (
               <button key={key} onClick={() => setActiveTab(key)} style={{
@@ -688,7 +744,6 @@ function AIAnalysis() {
             ))}
           </div>
 
-          {/* Tab: DIAGNÓSTICO */}
           {activeTab === "diagnostico" && (
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", borderBottom: "1px solid #0d0d1a" }}>
               <div style={{ padding: "16px 24px", borderRight: "1px solid #0d0d1a" }}>
@@ -762,7 +817,6 @@ function AIAnalysis() {
             </div>
           )}
 
-          {/* Tab: ACCIONES */}
           {activeTab === "recomendaciones" && (
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", borderBottom: "1px solid #0d0d1a" }}>
               <div style={{ padding: "16px 24px", borderRight: "1px solid #0d0d1a" }}>
@@ -803,7 +857,6 @@ function AIAnalysis() {
             </div>
           )}
 
-          {/* Tab: MAPA DE HORAS */}
           {activeTab === "horas" && (
             <div style={{ padding: "16px 24px", borderBottom: "1px solid #0d0d1a" }}>
               <SectionTitle>MAPA DE RENDIMIENTO POR HORA UTC</SectionTitle>
@@ -829,37 +882,32 @@ function AIAnalysis() {
 // ── Componente principal DataLab ──────────────────────────────────────────────
 
 export default function DataLab() {
-  // Estado de filtros
-  const [selectedDate, setSelectedDate]   = useState("");
-  const [selectedHour, setSelectedHour]   = useState("");
+  const [selectedDate, setSelectedDate]     = useState("");
+  const [selectedHour, setSelectedHour]     = useState("");
   const [availableDates, setAvailableDates] = useState([]);
 
-  // Datos
   const [tokenPrices,  setTokenPrices]  = useState([]);
   const [candleData,   setCandleData]   = useState([]);
   const [windowStats,  setWindowStats]  = useState([]);
   const [hoursHeatmap, setHoursHeatmap] = useState([]);
 
-  // Loading
   const [loadingTokens,  setLoadingTokens]  = useState(false);
   const [loadingCandles, setLoadingCandles] = useState(false);
   const [loadingWindow,  setLoadingWindow]  = useState(false);
   const [loadingHeatmap, setLoadingHeatmap] = useState(false);
 
-  // ── Cargar fechas disponibles ──────────────────────────────────────────────
   useEffect(() => {
     fetch("/api/datalab?type=available_dates")
       .then(r => r.json())
       .then(({ dates }) => {
         if (dates?.length) {
           setAvailableDates(dates);
-          setSelectedDate(dates[0]); // fecha más reciente por defecto
+          setSelectedDate(dates[0]);
         }
       })
       .catch(console.error);
   }, []);
 
-  // ── Cargar stats de ventanas y heatmap (una sola vez) ─────────────────────
   useEffect(() => {
     setLoadingWindow(true);
     fetch("/api/datalab?type=window_stats")
@@ -883,7 +931,6 @@ export default function DataLab() {
       .finally(() => setLoadingCandles(false));
   }, []);
 
-  // ── Cargar precios de tokens al cambiar filtros ────────────────────────────
   const loadTokenPrices = useCallback(() => {
     if (!selectedDate) return;
     setLoadingTokens(true);
@@ -900,7 +947,6 @@ export default function DataLab() {
 
   useEffect(() => { loadTokenPrices(); }, [loadTokenPrices]);
 
-  // ── Estadísticas rápidas del día seleccionado ──────────────────────────────
   const dayStats = (() => {
     if (!tokenPrices.length) return null;
     const yes = tokenPrices.filter(r => r.yes_price != null).map(r => parseFloat(r.yes_price));
@@ -917,14 +963,11 @@ export default function DataLab() {
     };
   })();
 
-  // ── Render ─────────────────────────────────────────────────────────────────
   return (
     <div style={{ fontFamily: "monospace", color: "#ccc", minHeight: "100vh" }}>
 
-      {/* ── AI DIAGNÓSTICO ──────────────────────────────────────────────── */}
       <AIAnalysis />
 
-      {/* ── HEADER ────────────────────────────────────────────────────────── */}
       <div style={{
         padding: "16px 24px",
         borderBottom: `1px solid ${C.border}`,
@@ -956,7 +999,6 @@ export default function DataLab() {
         </div>
       </div>
 
-      {/* ── STAT CARDS ────────────────────────────────────────────────────── */}
       {dayStats && (
         <div style={{
           display: "flex", gap: 12, padding: "16px 24px", flexWrap: "wrap",
@@ -972,27 +1014,38 @@ export default function DataLab() {
         </div>
       )}
 
-      {/* ── GRID PRINCIPAL ────────────────────────────────────────────────── */}
       <div style={{ display: "grid", gridTemplateColumns: "1fr", gap: 0 }}>
 
-        {/* Gráfico: evolución de precio de tokens */}
         <div style={{ padding: "20px 24px", borderBottom: `1px solid ${C.border}` }}>
           <SectionTitle>EVOLUCIÓN PRECIO TOKENS YES / NO · {selectedDate}{selectedHour !== "" ? ` · ${String(selectedHour).padStart(2, "0")}:00 UTC` : ""}</SectionTitle>
           <div style={{ fontSize: 9, color: "#333", marginBottom: 12 }}>
-            Las líneas verticales marcadas indican el inicio de cada ventana de entrada.
+            Las bandas coloreadas y líneas verticales indican inicio/fin de cada ventana de entrada (T-20, T-15, T-10, T-5).
             {tokenPrices.length > 0 && (
               <span style={{ color: "#555", marginLeft: 8 }}>
                 {tokenPrices.length} puntos · throttle 30s
               </span>
             )}
           </div>
+          {/* Leyenda de ventanas */}
+          <div style={{ display: "flex", gap: 16, marginBottom: 10, flexWrap: "wrap" }}>
+            {WINDOWS_DEF.map(w => (
+              <div key={w.key} style={{ display: "flex", alignItems: "center", gap: 5 }}>
+                <div style={{
+                  width: 12, height: 12, borderRadius: 2,
+                  background: `${w.color}20`, border: `1px solid ${w.color}66`,
+                }} />
+                <span style={{ fontSize: 8, color: w.color, fontWeight: 700 }}>{w.key}</span>
+                <span style={{ fontSize: 8, color: "#333" }}>
+                  ({w.min}–{w.max} min antes del cierre)
+                </span>
+              </div>
+            ))}
+          </div>
           <TokenPriceChart data={tokenPrices} loading={loadingTokens} />
         </div>
 
-        {/* Fila de 2 columnas: odds por ventana + heatmap */}
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", borderBottom: `1px solid ${C.border}` }}>
 
-          {/* Odds por ventana */}
           <div style={{ padding: "20px 24px", borderRight: `1px solid ${C.border}` }}>
             <SectionTitle>ODDS MEDIAS POR VENTANA DE ENTRADA</SectionTitle>
             <div style={{ fontSize: 9, color: "#333", marginBottom: 12 }}>
@@ -1001,7 +1054,6 @@ export default function DataLab() {
             <WindowOddsTable data={windowStats} loading={loadingWindow} />
           </div>
 
-          {/* Heatmap de volumen por hora */}
           <div style={{ padding: "20px 24px" }}>
             <SectionTitle>VOLUMEN MEDIO BTC POR HORA UTC</SectionTitle>
             <div style={{ fontSize: 9, color: "#333", marginBottom: 12 }}>
@@ -1009,7 +1061,6 @@ export default function DataLab() {
             </div>
             <VolumeHeatmap data={hoursHeatmap} loading={loadingHeatmap} />
 
-            {/* Tabla de rango y volumen */}
             {!loadingHeatmap && hoursHeatmap.length > 0 && (
               <div style={{ marginTop: 16, overflowX: "auto", maxHeight: 200, overflowY: "auto" }}>
                 <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 9 }}>
@@ -1039,7 +1090,6 @@ export default function DataLab() {
           </div>
         </div>
 
-        {/* Historial de velas */}
         <div style={{ padding: "20px 24px" }}>
           <SectionTitle>HISTORIAL VELAS 1H BTC · ÚLTIMAS 7 DÍAS</SectionTitle>
           <div style={{ fontSize: 9, color: "#333", marginBottom: 12 }}>
