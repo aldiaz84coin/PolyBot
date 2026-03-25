@@ -441,11 +441,11 @@ async function getAiInsight(simFilter, minSessions) {
   ]);
 
   // Solo los patrones más informativos para el prompt (limitar tokens)
-  const topPairs    = matrix.pairs.filter(p => p.sessions >= minSessions).slice(0, 30);
-  const topBuckets  = matrix.bucket_stats.filter(b => b.sessions >= minSessions).slice(0, 20);
-  const topScenarios = bands.scenarios.filter(s => s.is_high_confidence).slice(0, 15);
-  const safeBands   = bands.windows.flatMap(w =>
-    w.bands.filter(b => b.is_safe_band || b.is_optimal_band).map(b => ({ ...b, window: w.window }))
+  const topPairs     = (matrix?.pairs         ?? []).filter(p => p.sessions >= minSessions).slice(0, 30);
+  const topBuckets   = (matrix?.bucket_stats  ?? []).filter(b => b.sessions >= minSessions).slice(0, 20);
+  const topScenarios = (bands?.scenarios      ?? []).filter(s => s.is_high_confidence).slice(0, 15);
+  const safeBands    = (bands?.windows        ?? []).flatMap(w =>
+    (w.bands ?? []).filter(b => b.is_safe_band || b.is_optimal_band).map(b => ({ ...b, window: w.window }))
   ).slice(0, 20);
 
   const prompt = `
