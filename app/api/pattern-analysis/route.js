@@ -366,7 +366,7 @@ async function getSlPatterns(simFilter, minSessions) {
   } catch (_) { /* vista puede no existir aún */ }
 
   // Operaciones detalladas con resultado STOP o LOSS
-  let opsParams = "?select=ventana,direccion,odds_entrada,odds_salida,real_exit_odds,pnl_usd,pnl_pct,distancia,umbral,simulado&in.resultado=(STOP,LOSS)&limit=500";
+  let opsParams = "?select=ventana,direccion,odds_entrada,odds_salida,real_exit_odds,pnl_usd,pnl_pct,distancia,umbral,simulado&resultado=in.(STOP,LOSS)&limit=500";
   if (simFilter === "true")  opsParams += "&simulado=eq.true";
   if (simFilter === "false") opsParams += "&simulado=eq.false";
 
