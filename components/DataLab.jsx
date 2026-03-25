@@ -1,8 +1,9 @@
 // components/DataLab.jsx
 // DataLab — Pestaña de análisis histórico de precios de tokens y velas BTC
-// v2.1 — FIX ventanas horarias en gráfico de tokens (ReferenceArea geométrico)
+// v2.2 — Integración PatternAnalysis (pares condicionales, escenarios, SL/TP)
 
 "use client";
+import PatternAnalysis from "./PatternAnalysis";
 import { useState, useEffect, useCallback, useRef } from "react";
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend,
@@ -967,6 +968,9 @@ export default function DataLab() {
     <div style={{ fontFamily: "monospace", color: "#ccc", minHeight: "100vh" }}>
 
       <AIAnalysis />
+
+      {/* ── ANÁLISIS DE PATRONES ────────────────────────────────────────── */}
+      <PatternAnalysis />
 
       <div style={{
         padding: "16px 24px",
