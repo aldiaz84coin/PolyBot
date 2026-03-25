@@ -659,7 +659,7 @@ export default function PatternAnalysis() {
                         </tr>
                       </thead>
                       <tbody>
-                        {raw.matrix.bucket_stats.map((b, i) => (
+                        {(raw?.matrix?.bucket_stats ?? []).map((b, i) => (
                           <tr key={i} style={{ borderBottom: "1px solid #05050f" }}>
                             <td style={{ padding: "5px 9px", color: C.yellow, fontWeight: 700 }}>{b.entry_bucket}</td>
                             <td style={{ padding: "5px 9px" }}><WindowTag v={b.entry_window} /></td>
