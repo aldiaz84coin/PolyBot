@@ -717,7 +717,7 @@ def run(cfg: dict):
                             sell_price = max(0.01, round(exit_token_price - 0.005, 3))
                             sell_result = sell_position(
                                 token_id    = token_id,
-                                size        = tokens_held,
+                                tokens      = tokens_held,
                                 price       = sell_price,
                                 cfg         = cfg,
                                 market      = mkt_,
