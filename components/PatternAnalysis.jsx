@@ -453,6 +453,7 @@ function CorrelationSuggestions({ suggestions }) {
 // ── Componente principal ──────────────────────────────────────────────────────
 
 export default function PatternAnalysis() {
+  const [mounted,     setMounted]     = useState(false);
   const [simFilter,   setSimFilter]   = useState(null);
   const [minSessions, setMinSessions] = useState(3);
   const [loading,     setLoading]     = useState(false);
@@ -460,13 +461,16 @@ export default function PatternAnalysis() {
   const [result,      setResult]      = useState(null);
   const [activeTab,   setActiveTab]   = useState("patrones");
 
+  useEffect(() => { setMounted(true); }, []);
+
   const cacheKey = `${simFilter ?? "all"}_${minSessions}`;
 
   useEffect(() => {
+    if (!mounted) return;
     const cached = loadCache(cacheKey);
     if (cached) { setResult(cached); }
     else        { setResult(null);   }
-  }, [cacheKey]);
+  }, [cacheKey, mounted]);
 
   const runAnalysis = useCallback(async () => {
     setLoading(true);
