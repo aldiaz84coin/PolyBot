@@ -1,6 +1,6 @@
 // components/DataLab.jsx
 // DataLab — Pestaña de análisis histórico de precios de tokens y velas BTC
-// v2.2 — Integración PatternAnalysis (pares condicionales, escenarios, SL/TP)
+// v2.3 — FIX hydration: guard mounted en AIAnalysis y PatternAnalysis
 
 "use client";
 import PatternAnalysis from "./PatternAnalysis";
@@ -563,17 +563,21 @@ function AIHorasGrid({ optimas = [], evitar = [] }) {
 }
 
 function AIAnalysis() {
+  const [mounted,   setMounted]   = useState(false);
   const [simFilter, setSimFilter] = useState(null);
   const [loading,   setLoading]   = useState(false);
   const [error,     setError]     = useState(null);
   const [result,    setResult]    = useState(null);
   const [activeTab, setActiveTab] = useState("diagnostico");
 
+  useEffect(() => { setMounted(true); }, []);
+
   useEffect(() => {
+    if (!mounted) return;
     const cached = loadAICache(simFilter ?? "all");
     if (cached) setResult(cached);
     else setResult(null);
-  }, [simFilter]);
+  }, [simFilter, mounted]);
 
   const runAnalysis = useCallback(async () => {
     setLoading(true);
