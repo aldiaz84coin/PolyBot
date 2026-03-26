@@ -189,15 +189,21 @@ def execute_order(signal: Signal, market: dict, cfg: dict) -> dict | None:
     stake            = float(cfg["strategy"].get("stake_usdc", 1.0))
     direction_val    = signal.direction.value
 
-    # Token ID según dirección
-    clob_token_ids = market.get("clobTokenIds", [])
-    if not clob_token_ids:
-        logger.error("[ORDER] ❌ Market sin clobTokenIds")
+    # Token ID según dirección — usa market["tokens"] (formato estándar del bot)
+    tokens_list    = market.get("tokens", [])
+    target_outcome = "Yes" if signal.direction == Direction.UP else "No"
+    token_obj      = next((t for t in tokens_list if t.get("outcome") == target_outcome), None)
+
+    if not token_obj or not token_obj.get("token_id"):
+        logger.error(
+            f"[ORDER] ❌ Token {target_outcome} no encontrado en market.tokens\n"
+            f"         Tokens disponibles: {[t.get('outcome') for t in tokens_list]}"
+        )
         return None
 
-    token_id = clob_token_ids[0] if signal.direction == Direction.UP else clob_token_ids[1]
+    token_id = token_obj["token_id"]
 
-    # Precio de entrada: midpoint CLOB
+    # Precio de entrada: midpoint CLOB live
     from .market_scanner import get_clob_price
     entry_odds = get_clob_price(token_id)
     if entry_odds is None or entry_odds <= 0:
