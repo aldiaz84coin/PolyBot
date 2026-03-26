@@ -15,8 +15,11 @@ const C = {
   card:   "#02020e", cardAlt:"#030316",
 };
 
-const WINDOW_COLORS  = { "T-20": C.blue, "T-15": C.yellow, "T-10": C.orange, "T-5": C.red };
-const WINDOW_ORDER   = ["T-20", "T-15", "T-10", "T-5"];
+const WINDOW_COLORS  = {
+  "T-50": "#6633cc", "T-40": "#3355cc", "T-30": "#0088cc", "T-25": "#00aaaa",
+  "T-20": "#4488ff", "T-15": "#ffcc00", "T-10": "#ff8800", "T-5":  "#ff3355",
+};
+const WINDOW_ORDER   = ["T-50", "T-40", "T-30", "T-25", "T-20", "T-15", "T-10", "T-5"];
 const LS_KEY         = "polybot_pattern_analysis_v1";
 const CACHE_TTL      = 10 * 60 * 1000; // 10 min
 
