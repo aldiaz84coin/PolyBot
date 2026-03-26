@@ -1,6 +1,11 @@
 """
 monitor.py — Loop principal del bot: ventana horaria, stop loss, resolución
 
+v11.5 — FIX BUG: ventana_actual en log_token_price siempre era None
+  - w.get("label") y w.get("name") no existen en el dict WINDOWS.
+  - Corregido a w["key"] → ahora token_price_log registra T-20/T-15/T-10/T-5
+    correctamente, lo que alimenta v_session_price_matrix para PatternAnalysis.
+
 v11.4 — DATALAB: inserción en token_price_log y btc_candle_data
   - Importa get_full_1h_candle() desde .market_scanner.
   - Nueva constante _TOKEN_LOG_EVERY_N_CYCLES = 6 (~30s con interval=5s).
@@ -654,7 +659,7 @@ def run(cfg: dict):
                         ventana_actual = None
                         for w in WINDOWS:
                             if w["min"] <= mins_left < w["max"]:
-                                ventana_actual = w.get("label") or w.get("name")
+                                ventana_actual = w["key"]  # fix: era w.get("label")||w.get("name") — no existen
                                 break
                         db.log_token_price(
                             hour_utc     = int(hour_utc),
