@@ -1,5 +1,5 @@
 """
-db.py — v3.1  Capa de persistencia Supabase para PolyBot
+db.py — v3.0  Capa de persistencia Supabase para PolyBot
 ────────────────────────────────────────────────────────────────────────────
 Tablas:
   operations      — Historial completo de trades
@@ -11,8 +11,6 @@ Tablas:
   token_price_log — Precio CLOB YES/NO cada ~30s (v3.0)
   btc_candle_data — Vela 1H completa de Binance (v3.0)
 
-v3.1 — FIX BUG: log_signal() ahora acepta kwargs explícitos en vez de
-       signal_dict: dict — compatible con todas las llamadas existentes en monitor.py.
 v3.0 — DataLab: log_token_price(), log_btc_candle(), fetch_token_prices(),
        fetch_candle_data(). Base de datos histórica para backtesting.
 v2.0 — get_config / set_config para sistema de modo simulado/real.
@@ -119,38 +117,12 @@ def close_operation(
 
 # ── Señales ────────────────────────────────────────────────────────────────
 
-def log_signal(
-    btc_price:    float,
-    target_price: float | None = None,
-    distancia:    float | None = None,
-    umbral:       float | None = None,
-    ventana:      str   | None = None,
-    direccion:    str   | None = None,
-    accionable:   bool  = False,
-    market_slug:  str   | None = None,
-    hour_utc:     int   | None = None,
-    mins_left:    float | None = None,
-    simulado:     bool  = False,
-) -> bool:
+def log_signal(signal_dict: dict) -> bool:
     """Registra una señal accionable para calibración de umbrales."""
     if not is_enabled():
         return False
     try:
-        _client.table("signal_log").insert({
-            "ts":           _now(),
-            "btc_price":    _r2(btc_price),
-            "target_price": _r2(target_price) if target_price is not None else None,
-            "distancia":    _r2(distancia)    if distancia    is not None else None,
-            "umbral":       _r2(umbral)        if umbral       is not None else None,
-            "ventana":      ventana,
-            "direccion":    direccion,
-            "accionable":   accionable,
-            "market_slug":  market_slug,
-            "hour_utc":     hour_utc,
-            "mins_left":    round(mins_left, 2) if mins_left is not None else None,
-            "simulado":     simulado,
-        }).execute()
-        logger.debug(f"[DB] log_signal OK — {direccion} {ventana} accionable={accionable}")
+        _client.table("signal_log").insert({**signal_dict, "ts": _now()}).execute()
         return True
     except Exception as e:
         logger.warning(f"[DB] ⚠ log_signal: {e}")

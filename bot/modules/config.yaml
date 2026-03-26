@@ -4,10 +4,6 @@
 # ──────────────────────────────────────────────────────────────
 
 strategy:
-  t50_umbral_usd: 1200
-  t40_umbral_usd: 1000
-  t30_umbral_usd: 800
-  t25_umbral_usd: 650
   t20_umbral_usd: 400     # umbral ventana T-20min (500)
   t15_umbral_usd: 250     # umbral ventana T-15min (300)
   t10_umbral_usd: 180     # umbral ventana T-10min (250)

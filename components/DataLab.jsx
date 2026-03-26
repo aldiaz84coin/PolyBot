@@ -1,9 +1,8 @@
 // components/DataLab.jsx
 // DataLab — Pestaña de análisis histórico de precios de tokens y velas BTC
-// v2.3 — FIX hydration: guard mounted en AIAnalysis y PatternAnalysis
+// v2.1 — FIX ventanas horarias en gráfico de tokens (ReferenceArea geométrico)
 
 "use client";
-import PatternAnalysis from "./PatternAnalysis";
 import { useState, useEffect, useCallback, useRef } from "react";
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend,
@@ -563,21 +562,17 @@ function AIHorasGrid({ optimas = [], evitar = [] }) {
 }
 
 function AIAnalysis() {
-  const [mounted,   setMounted]   = useState(false);
   const [simFilter, setSimFilter] = useState(null);
   const [loading,   setLoading]   = useState(false);
   const [error,     setError]     = useState(null);
   const [result,    setResult]    = useState(null);
   const [activeTab, setActiveTab] = useState("diagnostico");
 
-  useEffect(() => { setMounted(true); }, []);
-
   useEffect(() => {
-    if (!mounted) return;
     const cached = loadAICache(simFilter ?? "all");
     if (cached) setResult(cached);
     else setResult(null);
-  }, [simFilter, mounted]);
+  }, [simFilter]);
 
   const runAnalysis = useCallback(async () => {
     setLoading(true);
@@ -972,9 +967,6 @@ export default function DataLab() {
     <div style={{ fontFamily: "monospace", color: "#ccc", minHeight: "100vh" }}>
 
       <AIAnalysis />
-
-      {/* ── ANÁLISIS DE PATRONES ────────────────────────────────────────── */}
-      <PatternAnalysis />
 
       <div style={{
         padding: "16px 24px",
