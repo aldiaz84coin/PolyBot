@@ -31,11 +31,22 @@ def load_config(path: str = "config.yaml") -> dict:
         "TELEGRAM_CHAT_ID":       ("telegram",    "chat_id"),
         # Capital / strategy
         "STAKE_USDC":             ("capital",     "stake_usdc"),
+        "T50_UMBRAL_USD":         ("strategy",    "t50_umbral_usd"),
+        "T40_UMBRAL_USD":         ("strategy",    "t40_umbral_usd"),
+        "T30_UMBRAL_USD":         ("strategy",    "t30_umbral_usd"),
+        "T25_UMBRAL_USD":         ("strategy",    "t25_umbral_usd"),
         "T20_UMBRAL_USD":         ("strategy",    "t20_umbral_usd"),
         "T15_UMBRAL_USD":         ("strategy",    "t15_umbral_usd"),
         "T10_UMBRAL_USD":         ("strategy",    "t10_umbral_usd"),
         "T5_UMBRAL_USD":          ("strategy",    "t5_umbral_usd"),
         "STOP_LOSS_PCT":          ("strategy",    "stop_loss_pct"),
+        
+        #"STAKE_USDC":             ("capital",     "stake_usdc"),
+        #"T20_UMBRAL_USD":         ("strategy",    "t20_umbral_usd"),
+        #"T15_UMBRAL_USD":         ("strategy",    "t15_umbral_usd"),
+        #"T10_UMBRAL_USD":         ("strategy",    "t10_umbral_usd"),
+        #"T5_UMBRAL_USD":          ("strategy",    "t5_umbral_usd"),
+        #"STOP_LOSS_PCT":          ("strategy",    "stop_loss_pct"),
         # ── Supabase (persistencia compartida bot ↔ dashboard) ──────────────
         "SUPABASE_URL":           ("supabase",    "url"),
         "SUPABASE_SERVICE_KEY":   ("supabase",    "service_key"),
