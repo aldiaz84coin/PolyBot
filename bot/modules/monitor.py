@@ -1058,11 +1058,15 @@ def run(cfg: dict):
                                 "resultado":            "PENDING",
                                 "market_slug":          slug or "",
                                 "simulado":             active_bet["simulated"],
+                                "boost_t50": active_bet["boost_readings"].get("T-50"),
+                                "boost_t40": active_bet["boost_readings"].get("T-40"),
+                                "boost_t30": active_bet["boost_readings"].get("T-30"),
+                                "boost_t25": active_bet["boost_readings"].get("T-25"),
                                 "boost_t20": active_bet["boost_readings"].get("T-20"),
                                 "boost_t15": active_bet["boost_readings"].get("T-15"),
                                 "boost_t10": active_bet["boost_readings"].get("T-10"),
                                 "boost_t5":  active_bet["boost_readings"].get("T-5"),
-                            })
+                                })
                         except Exception as e:
                             logger.warning(f"[MONITOR] ⚠ upsert_operation: {e}")
                 else:
