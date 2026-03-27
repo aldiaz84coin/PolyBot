@@ -70,6 +70,12 @@ function dbRowToDashboard(row) {
     simulated:     row.simulado,
     source:        row.source,
     // ── v3.2: BoostPower por ventana (Crypto Detector v4) ───────────
+    
+    // ── v3.3: BoostPower — 8 ventanas (T-50 → T-5) ──────────────────
+    boost_t50:     row.boost_t50 ?? null,
+    boost_t40:     row.boost_t40 ?? null,
+    boost_t30:     row.boost_t30 ?? null,
+    boost_t25:     row.boost_t25 ?? null,
     boost_t20:     row.boost_t20 ?? null,
     boost_t15:     row.boost_t15 ?? null,
     boost_t10:     row.boost_t10 ?? null,
