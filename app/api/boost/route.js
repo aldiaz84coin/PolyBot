@@ -9,6 +9,10 @@ import { getSupabase, isConfigured } from "../../../lib/supabase";
 const BOOST_KEYS = [
   { key: "boost_new_market", label: "NUEVO MERCADO" },
   { key: "boost_midpoint",   label: "MITAD HORA"   },
+  { key: "boost_t_50",       label: "T-50"          },
+  { key: "boost_t_40",       label: "T-40"          },
+  { key: "boost_t_30",       label: "T-30"          },
+  { key: "boost_t_25",       label: "T-25"          },
   { key: "boost_t_20",       label: "T-20"          },
   { key: "boost_t_15",       label: "T-15"          },
   { key: "boost_t_10",       label: "T-10"          },
