@@ -14,6 +14,10 @@ import { useState, useEffect, useCallback } from "react";
 const POLL_MS = 30_000;
 
 const WINDOW_COLORS = {
+  "T-50":          "#6633cc",
+  "T-40":          "#3355cc",
+  "T-30":          "#0088cc",
+  "T-25":          "#00aaaa",
   "T-20":          "#4488ff",
   "T-15":          "#aa44ff",
   "T-10":          "#ff8800",
