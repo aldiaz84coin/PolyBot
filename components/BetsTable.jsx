@@ -151,6 +151,10 @@ function DetailRow({ bet }) {
   const retornoReal = isClosed && pnlUsd != null ? bet.stake + pnlUsd : null;
 
   const WINDOW_COLORS = {
+    "T-50": "#6633cc",
+    "T-40": "#3355cc",
+    "T-30": "#0088cc",
+    "T-25": "#00aaaa",
     "T-20": "#4488ff",
     "T-15": "#aa44ff",
     "T-10": "#ff8800",
@@ -158,6 +162,10 @@ function DetailRow({ bet }) {
   };
 
   const boostWindows = [
+    { key: "T-50", val: bet.boost_t50, color: WINDOW_COLORS["T-50"] },
+    { key: "T-40", val: bet.boost_t40, color: WINDOW_COLORS["T-40"] },
+    { key: "T-30", val: bet.boost_t30, color: WINDOW_COLORS["T-30"] },
+    { key: "T-25", val: bet.boost_t25, color: WINDOW_COLORS["T-25"] },
     { key: "T-20", val: bet.boost_t20, color: WINDOW_COLORS["T-20"] },
     { key: "T-15", val: bet.boost_t15, color: WINDOW_COLORS["T-15"] },
     { key: "T-10", val: bet.boost_t10, color: WINDOW_COLORS["T-10"] },
