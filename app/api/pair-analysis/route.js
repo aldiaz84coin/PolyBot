@@ -109,11 +109,20 @@ function joinWithOps(sessions, ops) {
       resultado:   s.resultado,
       direccion:   s.direccion,
       pnl_usd:     parseFloat(s.pnl_usd)      || 0,
-      // YES prices por ventana (precio del token al entrar en esa ventana)
+      // YES prices por ventana — las 8 ventanas disponibles
+      yes_t50: s.yes_t50 != null ? parseFloat(s.yes_t50) : null,
+      yes_t40: s.yes_t40 != null ? parseFloat(s.yes_t40) : null,
+      yes_t30: s.yes_t30 != null ? parseFloat(s.yes_t30) : null,
+      yes_t25: s.yes_t25 != null ? parseFloat(s.yes_t25) : null,
       yes_t20: s.yes_t20 != null ? parseFloat(s.yes_t20) : null,
       yes_t15: s.yes_t15 != null ? parseFloat(s.yes_t15) : null,
       yes_t10: s.yes_t10 != null ? parseFloat(s.yes_t10) : null,
       yes_t5:  s.yes_t5  != null ? parseFloat(s.yes_t5)  : null,
+      // Boost solo existe para T20–T5 (Crypto Detector); null para ventanas anteriores
+      boost_t50: null,
+      boost_t40: null,
+      boost_t30: null,
+      boost_t25: null,
       // Boost (del motor Crypto Detector) de la operación en ese ciclo
       boost_t20: op?.boost_t20 ?? null,
       boost_t15: op?.boost_t15 ?? null,
@@ -132,7 +141,7 @@ function joinWithOps(sessions, ops) {
 // ── Análisis multivariable: todas las combinaciones de variables ───────────────
 
 function buildCombos(enriched) {
-  const WINDOWS = ["T20", "T15", "T10", "T5"];
+  const WINDOWS = ["T50", "T40", "T30", "T25", "T20", "T15", "T10", "T5"];
   const store   = {}; // key → { wins, losses, total, pnl }
 
   function record(key, isWin, pnl) {
@@ -222,6 +231,18 @@ function buildCombos(enriched) {
 function computePairScenarios(sessions) {
   // Pares de ventanas posibles (entrada → salida)
   const PAIRS = [
+    ["yes_t50", "yes_t25", "T-50→T-25"],
+    ["yes_t50", "yes_t20", "T-50→T-20"],
+    ["yes_t50", "yes_t10", "T-50→T-10"],
+    ["yes_t50", "yes_t5",  "T-50→T-5"],
+    ["yes_t40", "yes_t20", "T-40→T-20"],
+    ["yes_t40", "yes_t10", "T-40→T-10"],
+    ["yes_t40", "yes_t5",  "T-40→T-5"],
+    ["yes_t30", "yes_t15", "T-30→T-15"],
+    ["yes_t30", "yes_t10", "T-30→T-10"],
+    ["yes_t30", "yes_t5",  "T-30→T-5"],
+    ["yes_t25", "yes_t10", "T-25→T-10"],
+    ["yes_t25", "yes_t5",  "T-25→T-5"],
     ["yes_t20", "yes_t10", "T-20→T-10"],
     ["yes_t20", "yes_t5",  "T-20→T-5"],
     ["yes_t15", "yes_t5",  "T-15→T-5"],
@@ -404,7 +425,7 @@ export async function GET(req) {
     // ── 1. Cargar datos en paralelo ────────────────────────────────────────────
     let sessionParams =
       "?select=market_slug,fecha,hour_utc,simulado,resultado,direccion,pnl_usd,odds_entrada,real_exit_odds," +
-      "yes_t20,yes_t15,yes_t10,yes_t5" +
+      "yes_t50,yes_t40,yes_t30,yes_t25,yes_t20,yes_t15,yes_t10,yes_t5" +
       "&limit=1500&resultado=neq.PENDING";
     if (simFilter === "true")  sessionParams += "&simulado=eq.true";
     if (simFilter === "false") sessionParams += "&simulado=eq.false";
@@ -437,7 +458,7 @@ export async function GET(req) {
     const pairScenarios = computePairScenarios(rawSessions);
 
     // ── 5. Resumen por ventana ─────────────────────────────────────────────────
-    const windowSummary = ["T20", "T15", "T10", "T5"].map(w => {
+    const windowSummary = ["T50", "T40", "T30", "T25", "T20", "T15", "T10", "T5"].map(w => {
       const wCombos = allCombos.filter(c => c.ventana === w);
       return {
         ventana:          w,
