@@ -3,6 +3,7 @@
 // v2.1 — FIX ventanas horarias en gráfico de tokens (ReferenceArea geométrico)
 
 "use client";
+import PairEngine from "./PairEngine";
 import { useState, useEffect, useCallback, useRef } from "react";
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend,
@@ -967,6 +968,7 @@ export default function DataLab() {
     <div style={{ fontFamily: "monospace", color: "#ccc", minHeight: "100vh" }}>
 
       <AIAnalysis />
+      <PairEngine /> 
 
       <div style={{
         padding: "16px 24px",
