@@ -1,28 +1,25 @@
 "use client";
 /**
- * StatsPanel.jsx — v2.1
+ * StatsPanel.jsx — v3.1
  *
- * CAMBIOS v2.1:
- *  - FIX CRÍTICO useBets: la API /api/bets devuelve { ok, data: [...] }
- *    pero el hook leía json.bets (siempre undefined → []).
- *    Corregido a: json.data || json.bets || []
- *  - FIX total histórico: antes leía json.count / j2.count (inexistente).
- *    Ahora se cuenta desde los arrays devueltos filtrando PENDING.
+ * CAMBIOS v3.1:
+ *  - Fusión completa con v2.1 (no pierde ningún fix).
+ *  - Sección 8 nueva: COMPARATIVA ESTÁNDAR vs OPTIMIZADO.
+ *    · Fuente: /api/stats-algorithm (endpoint dedicado).
+ *    · Cards lado a lado con métricas completas de cada versión.
+ *    · Diferencial global ΔP&L / ΔWin Rate / ΔROI.
+ *    · Tabla por ventana con Δ P&L coloreado.
+ *    · Columna "ALGO" añadida a la tabla de historial de operaciones.
+ *    · Cuando Optimizado tiene 0 ops muestra aviso informativo.
+ *  - Sección 7 (Señales) se mantiene intacta.
  *
- * CAMBIOS v2.0:
- *  0. HISTORIAL DE OPERACIONES (nueva sección):
- *     - Contador histórico independiente con badge total/wins/losses
- *     - Tabla per-operación: fecha, dir, ventana, BTC entrada,
- *       odds compra, odds venta, resultado, P&L
- *     - Color de P&L basado en resultado (WIN/LOSS), no en signo numérico
- *       (workaround para datos simulados con pnl_usd incorrecto)
- *     - Paginación de 20 en 20 filas
+ * CAMBIOS v2.1 (mantenidos):
+ *  - FIX CRÍTICO useBets: API devuelve json.data → json.data || json.bets || []
+ *  - FIX total histórico desde arrays reales.
  *
- *  2. RENDIMIENTO POR VENTANA (sección corregida):
- *     - Reemplaza "ODDS MEDIA" por dos columnas: "COMPRA MEDIA" y "VENTA MEDIA"
- *       (avg_odds_entrada y avg_odds_salida desde el API actualizado)
- *     - Indicador ⚠ cuando win_rate > 50% pero P&L total es negativo
- *       (señal de inconsistencia de datos pnl_usd en modo simulado)
+ * CAMBIOS v2.0 (mantenidos):
+ *  - Historial de operaciones paginado con odds compra/venta.
+ *  - Rendimiento por ventana con COMPRA MEDIA + VENTA MEDIA.
  */
 
 import { useState, useEffect, useCallback } from "react";
@@ -45,10 +42,9 @@ function resultColor(r) {
 function fmtTs(iso) {
   if (!iso) return "—";
   try {
-    const d = new Date(iso);
-    return d.toLocaleString("es-ES", {
-      month:  "2-digit", day:    "2-digit",
-      hour:   "2-digit", minute: "2-digit",
+    return new Date(iso).toLocaleString("es-ES", {
+      month: "2-digit", day: "2-digit",
+      hour: "2-digit", minute: "2-digit",
     }).replace(",", "");
   } catch { return iso.slice(0, 16).replace("T", " "); }
 }
@@ -106,7 +102,7 @@ function TableRow({ cells, header = false, highlight = false }) {
   );
 }
 
-function BarChart({ rows, valueKey, labelKey, color = "#0066ff" }) {
+function BarChart({ rows, valueKey, labelKey }) {
   if (!rows || rows.length === 0) return <Empty />;
   const max = Math.max(...rows.map(r => Math.abs(r[valueKey] ?? 0)), 1);
   return (
@@ -168,8 +164,7 @@ function useStats(type, params = {}) {
       const qs  = new URLSearchParams({ type, ...params }).toString();
       const res = await fetch(`/api/stats?${qs}`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const json = await res.json();
-      setData(json);
+      setData(await res.json());
     } catch (e) {
       setError(e.message);
     } finally {
@@ -181,40 +176,62 @@ function useStats(type, params = {}) {
   return { data, loading, error, reload: load };
 }
 
-// ── Hook historial de operaciones ─────────────────────────────────────────
+// ── Hook comparativa de algoritmos ───────────────────────────────────────
+
+function useAlgoComparison(params = {}) {
+  const [data,    setData]    = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error,   setError]   = useState(null);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const qs  = new URLSearchParams(params).toString();
+      const res = await fetch(`/api/stats-algorithm?${qs}`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      setData(await res.json());
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setLoading(false);
+    }
+  }, [JSON.stringify(params)]);
+
+  useEffect(() => { load(); }, [load]);
+  return { data, loading, error, reload: load };
+}
+
+// ── Hook historial de operaciones — v2.1 FIX ─────────────────────────────
 
 function useBets(simOnly) {
   const [bets,    setBets]    = useState([]);
-  const [total,   setTotal]   = useState(null); // total histórico sin filtro
+  const [total,   setTotal]   = useState(null);
   const [loading, setLoading] = useState(true);
 
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      // Carga filtrada (para la tabla)
       const qs = new URLSearchParams({
         limit: "500",
         ...(simOnly !== "all" ? { simulated: simOnly === "sim" ? "true" : "false" } : {}),
       }).toString();
-      const res = await fetch(`/api/bets?${qs}`);
+      const res  = await fetch(`/api/bets?${qs}`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const json = await res.json();
 
-      // ✅ FIX v2.1: API devuelve json.data, no json.bets
+      // v2.1 FIX: API devuelve json.data, no json.bets
       const list = json.data || json.bets || [];
       setBets(list);
 
-      // Contador total sin filtro (para el badge "HISTORIAL TOTAL")
       if (simOnly !== "all") {
-        // Fetch sin filtro para contar el total real
-        const r2 = await fetch("/api/bets?limit=500");
+        const r2  = await fetch("/api/bets?limit=500");
         if (r2.ok) {
           const j2  = await r2.json();
           const all = j2.data || j2.bets || [];
           setTotal(all.filter(b => b.result !== "PENDING").length);
         }
       } else {
-        // Sin filtro: el total es lo que ya tenemos
         setTotal(list.filter(b => b.result !== "PENDING").length);
       }
     } catch {
@@ -226,6 +243,62 @@ function useBets(simOnly) {
 
   useEffect(() => { load(); }, [load]);
   return { bets, total, loading, reload: load };
+}
+
+// ── AlgoCard: tarjeta resumen de una versión ─────────────────────────────
+
+function AlgoCard({ label, data, color, icon, isNew = false }) {
+  const noData = !data || data.total_ops === 0;
+  return (
+    <div style={{
+      flex: 1, minWidth: 260,
+      background: noData ? "#02020a" : `${color}08`,
+      border: `1px solid ${noData ? "#1a1a2e" : `${color}33`}`,
+      borderRadius: 4, padding: "16px 20px",
+    }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 14 }}>
+        <span style={{ color, fontSize: 16 }}>{icon}</span>
+        <span style={{ fontSize: 11, color, letterSpacing: "0.12em", fontWeight: 700 }}>{label}</span>
+        {isNew && (
+          <span style={{
+            fontSize: 8, padding: "1px 6px", borderRadius: 2,
+            background: `${color}18`, border: `1px solid ${color}44`,
+            color, marginLeft: "auto", letterSpacing: "0.1em",
+          }}>
+            SIN OPS AÚN
+          </span>
+        )}
+      </div>
+      {noData ? (
+        <div style={{ fontSize: 10, color: "#2a2a3a", lineHeight: 1.8 }}>
+          Sin operaciones registradas con esta versión.
+          {isNew && (
+            <span style={{ color: "#334433", display: "block", marginTop: 4 }}>
+              Actívalo en Config → Versión de Algoritmo.
+            </span>
+          )}
+        </div>
+      ) : (
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "8px 16px" }}>
+          {[
+            ["OPS",       data.total_ops,                                                          "#888"],
+            ["WINS",      data.wins,                                                               "var(--green)"],
+            ["LOSSES",    (data.losses ?? 0) + (data.stops ?? 0),                                 "var(--red)"],
+            ["WIN RATE",  data.win_rate_pct != null ? `${data.win_rate_pct}%` : "—",              wrColor(data.win_rate_pct)],
+            ["P&L TOTAL", fmtUSD(data.pnl_usd),                                                   pnlColor(data.pnl_usd)],
+            ["P&L/OP",    data.pnl_medio != null ? fmtUSD(data.pnl_medio) : "—",                  pnlColor(data.pnl_medio)],
+            ["ROI",       data.roi_pct != null ? fmtPct(data.roi_pct) : "—",                      pnlColor(data.roi_pct)],
+            ["ODDS MED.", data.avg_odds != null ? data.avg_odds.toFixed(4) : "—",                  "#4488ff"],
+          ].map(([lbl, val, col]) => (
+            <div key={lbl}>
+              <div style={{ fontSize: 8, color: "#333", letterSpacing: "0.12em", marginBottom: 2 }}>{lbl}</div>
+              <div style={{ fontSize: 14, fontWeight: 700, color: col }}>{val}</div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
 }
 
 // ── Panel principal ───────────────────────────────────────────────────────
@@ -241,23 +314,24 @@ export default function StatsPanel() {
   const daysParam  = { days: String(days) };
   const baseParams = { ...simParam, ...daysParam };
 
-  const overview = useStats("overview",     baseParams);
-  const byWindow = useStats("by_window",    simParam);
-  const byDir    = useStats("by_direction", simParam);
-  const byDay    = useStats("by_day",       baseParams);
-  const byHour   = useStats("by_hour",      simParam);
-  const signals  = useStats("signals",      { ...simParam, ...daysParam });
+  const overview  = useStats("overview",     baseParams);
+  const byWindow  = useStats("by_window",    simParam);
+  const byDir     = useStats("by_direction", simParam);
+  const byDay     = useStats("by_day",       baseParams);
+  const byHour    = useStats("by_hour",      simParam);
+  const signals   = useStats("signals",      { ...simParam, ...daysParam });
+  const algoComp  = useAlgoComparison({ ...simParam, days: "90" });
   const { bets, total: betsTotal, loading: betsLoading, reload: reloadBets } = useBets(simFilter);
 
   const dbOk = overview.data?.available !== false;
 
   const reloadAll = () => {
     overview.reload(); byWindow.reload(); byDir.reload();
-    byDay.reload(); byHour.reload(); signals.reload(); reloadBets();
+    byDay.reload(); byHour.reload(); signals.reload();
+    algoComp.reload(); reloadBets();
     setBetsPage(0);
   };
 
-  // ── Paginación de la tabla de operaciones ─────────────────────────────
   const closedBets = bets.filter(b => b.result !== "PENDING");
   const totalPages = Math.ceil(closedBets.length / BETS_PER_PAGE);
   const pageBets   = closedBets.slice(betsPage * BETS_PER_PAGE, (betsPage + 1) * BETS_PER_PAGE);
@@ -269,7 +343,7 @@ export default function StatsPanel() {
   return (
     <div style={{ padding: "20px 24px", fontFamily: "var(--font-mono)", color: "var(--text)" }}>
 
-      {/* ── Header de controles ─────────────────────────────────────────── */}
+      {/* ── Header de controles ──────────────────────────────────────────── */}
       <div style={{
         display: "flex", justifyContent: "space-between", alignItems: "center",
         marginBottom: 8, flexWrap: "wrap", gap: 12,
@@ -282,13 +356,12 @@ export default function StatsPanel() {
         <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
           {["all", "real", "sim"].map(f => (
             <button key={f} onClick={() => { setSimFilter(f); setBetsPage(0); }} style={{
-              background:   simFilter === f ? "var(--border)" : "transparent",
-              border:       "1px solid",
-              borderColor:  simFilter === f ? "#1a1a2a" : "#0d0d1a",
-              color:        simFilter === f ? "var(--text)" : "#333",
-              padding:      "3px 10px", borderRadius: 3,
-              fontSize:     9, letterSpacing: "0.12em",
-              cursor:       "pointer",
+              background:  simFilter === f ? "var(--border)" : "transparent",
+              border:      "1px solid",
+              borderColor: simFilter === f ? "#1a1a2a" : "#0d0d1a",
+              color:       simFilter === f ? "var(--text)" : "#333",
+              padding: "3px 10px", borderRadius: 3, fontSize: 9,
+              letterSpacing: "0.12em", cursor: "pointer", fontFamily: "inherit",
             }}>
               {f === "all" ? "TODOS" : f === "real" ? "REAL" : "SIM"}
             </button>
@@ -302,9 +375,8 @@ export default function StatsPanel() {
               border:      "1px solid",
               borderColor: days === d ? "#1a1a2a" : "#0d0d1a",
               color:       days === d ? "var(--text)" : "#333",
-              padding:     "3px 10px", borderRadius: 3,
-              fontSize:    9, letterSpacing: "0.12em",
-              cursor:      "pointer",
+              padding: "3px 10px", borderRadius: 3, fontSize: 9,
+              letterSpacing: "0.12em", cursor: "pointer", fontFamily: "inherit",
             }}>
               {d}D
             </button>
@@ -315,405 +387,455 @@ export default function StatsPanel() {
           <button onClick={reloadAll} style={{
             background: "transparent", border: "1px solid #0d0d1a",
             color: "#333", padding: "3px 10px", borderRadius: 3,
-            fontSize: 9, cursor: "pointer",
-          }}>
-            ↺
-          </button>
+            fontSize: 9, cursor: "pointer", fontFamily: "inherit",
+          }}>↺</button>
         </div>
       </div>
 
       {/* ══════════════════════════════════════════════════════════════════ */}
-      {/* 1. OVERVIEW                                                       */}
+      {/* 1. OVERVIEW                                                        */}
       {/* ══════════════════════════════════════════════════════════════════ */}
       <SectionTitle>1 · OVERVIEW — ÚLTIMOS {days} DÍAS</SectionTitle>
 
-      {overview.loading
-        ? <Spinner />
-        : overview.error || !overview.data?.available
-        ? <Empty msg={overview.error || "Supabase no disponible"} />
-        : (
-          <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
-            <KpiCard
-              label="OPERACIONES"
-              value={overview.data.total_ops ?? 0}
-              sub={`${overview.data.wins ?? 0}W / ${overview.data.losses ?? 0}L / ${overview.data.stops ?? 0}STOP`}
-            />
-            <KpiCard
-              label="WIN RATE"
-              value={overview.data.win_rate != null ? `${overview.data.win_rate}%` : "—"}
-              color={wrColor(overview.data.win_rate)}
-            />
-            <KpiCard
-              label="P&L NETO"
-              value={overview.data.pnl_usd != null
-                ? `${overview.data.pnl_usd >= 0 ? "+" : ""}$${Math.abs(overview.data.pnl_usd).toFixed(2)}`
-                : "—"}
-              color={pnlColor(overview.data.pnl_usd)}
-              sub={`Invertido $${(overview.data.invested_usd ?? 0).toFixed(2)}`}
-            />
-            <KpiCard
-              label="ROI"
-              value={overview.data.roi_pct != null
-                ? `${overview.data.roi_pct >= 0 ? "+" : ""}${overview.data.roi_pct.toFixed(1)}%`
-                : "—"}
-              color={pnlColor(overview.data.roi_pct)}
-            />
-          </div>
-        )
-      }
+      {overview.loading ? <Spinner /> : (overview.error || !overview.data?.available) ? (
+        <Empty msg={overview.data?.reason ?? overview.error ?? "Error cargando datos"} />
+      ) : (
+        <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+          <KpiCard label="TOTAL OPS"    value={overview.data.total_ops} sub={`${days} días`} />
+          <KpiCard
+            label="WIN RATE"
+            value={overview.data.win_rate != null ? `${overview.data.win_rate}%` : "—"}
+            color={wrColor(overview.data.win_rate)}
+          />
+          <KpiCard
+            label="WINS / LOSSES"
+            value={`${overview.data.wins}W`}
+            color="var(--green)"
+            sub={`${overview.data.losses}L / ${overview.data.stops ?? 0}STOP`}
+          />
+          <KpiCard
+            label="P&L NETO"
+            value={overview.data.pnl_usd != null
+              ? `${overview.data.pnl_usd >= 0 ? "+" : ""}$${Math.abs(overview.data.pnl_usd).toFixed(2)}`
+              : "—"}
+            color={pnlColor(overview.data.pnl_usd)}
+            sub={`Invertido $${(overview.data.invested_usd ?? 0).toFixed(2)}`}
+          />
+          <KpiCard
+            label="ROI"
+            value={overview.data.roi_pct != null
+              ? `${overview.data.roi_pct >= 0 ? "+" : ""}${overview.data.roi_pct.toFixed(1)}%`
+              : "—"}
+            color={pnlColor(overview.data.roi_pct)}
+          />
+        </div>
+      )}
 
       {/* ══════════════════════════════════════════════════════════════════ */}
-      {/* 2. HISTORIAL DE OPERACIONES                                       */}
+      {/* 2. HISTORIAL DE OPERACIONES                                        */}
       {/* ══════════════════════════════════════════════════════════════════ */}
       <SectionTitle>2 · HISTORIAL DE OPERACIONES</SectionTitle>
 
-      {/* Counter badges independientes */}
       <div style={{ display: "flex", gap: 12, marginBottom: 14, flexWrap: "wrap", alignItems: "center" }}>
         <div style={{
-          background: "#02020c", border: "1px solid #0d0d1a",
-          borderRadius: 3, padding: "8px 14px", display: "flex", gap: 16, alignItems: "center",
+          background: "#02020c", border: "1px solid #0d0d1a", borderRadius: 3,
+          padding: "8px 14px", display: "flex", gap: 16, alignItems: "center",
         }}>
-          <div>
-            <div style={{ fontSize: 8, color: "#333", letterSpacing: "0.15em", marginBottom: 4 }}>
-              HISTORIAL TOTAL{betsTotal != null && simFilter !== "all" ? " (sin filtro)" : ""}
+          {[
+            ["HISTORIAL TOTAL", betsLoading ? "…" : (betsTotal ?? closedBets.length), "var(--text)"],
+            ["WINS",            betsWins,                                              "var(--green)"],
+            ["LOSSES",          betsLosses,                                            "var(--red)"],
+            ["P&L ACUM.",       `${betsPnl >= 0 ? "+" : ""}${betsPnl.toFixed(2)}$`,   pnlColor(betsPnl)],
+          ].map(([lbl, val, col], i, arr) => (
+            <div key={lbl} style={{ display: "flex", gap: 16, alignItems: "center" }}>
+              <div>
+                <div style={{ fontSize: 8, color: "#333", letterSpacing: "0.15em", marginBottom: 4 }}>{lbl}</div>
+                <div style={{ fontSize: 20, fontWeight: 700, color: col }}>{val}</div>
+              </div>
+              {i < arr.length - 1 && <div style={{ width: 1, height: 32, background: "#0d0d1a" }} />}
             </div>
-            <div style={{ fontSize: 20, fontWeight: 700, color: "var(--text)" }}>
-              {betsLoading ? "…" : (betsTotal ?? closedBets.length)}
-            </div>
-          </div>
-          <div style={{ width: 1, height: 32, background: "#0d0d1a" }} />
-          <div>
-            <div style={{ fontSize: 8, color: "#333", letterSpacing: "0.15em", marginBottom: 4 }}>WINS</div>
-            <div style={{ fontSize: 20, fontWeight: 700, color: "var(--green)" }}>{betsWins}</div>
-          </div>
-          <div style={{ width: 1, height: 32, background: "#0d0d1a" }} />
-          <div>
-            <div style={{ fontSize: 8, color: "#333", letterSpacing: "0.15em", marginBottom: 4 }}>LOSSES</div>
-            <div style={{ fontSize: 20, fontWeight: 700, color: "var(--red)" }}>{betsLosses}</div>
-          </div>
-          <div style={{ width: 1, height: 32, background: "#0d0d1a" }} />
-          <div>
-            <div style={{ fontSize: 8, color: "#333", letterSpacing: "0.15em", marginBottom: 4 }}>P&L ACUM.</div>
-            <div style={{ fontSize: 20, fontWeight: 700, color: pnlColor(betsPnl) }}>
-              {betsPnl >= 0 ? "+" : ""}{betsPnl.toFixed(2)}$
-            </div>
-          </div>
+          ))}
         </div>
         {simFilter !== "all" && (
           <div style={{ fontSize: 9, color: "#2a2a3a" }}>
-            Mostrando {closedBets.length} ops. · filtro: {simFilter === "sim" ? "SIMULADO" : "REAL"}
+            Filtro: {simFilter === "sim" ? "SIMULADO" : "REAL"} · {closedBets.length} ops.
           </div>
         )}
       </div>
 
-      {betsLoading
-        ? <Spinner />
-        : closedBets.length === 0
-        ? <Empty msg="Sin operaciones cerradas aún" />
-        : (
-          <>
-            <div style={{ border: "1px solid #0d0d1a", borderRadius: 3, overflow: "hidden" }}>
-              <TableRow header cells={[
-                { value: "FECHA",       width: "118px" },
-                { value: "DIR",         width: "52px" },
-                { value: "VENTANA",     width: "58px", align: "center" },
-                { value: "BTC ENTRADA", width: "100px", align: "right" },
-                { value: "ODDS COMPRA", width: "90px", align: "right" },
-                { value: "ODDS VENTA",  width: "90px", align: "right" },
-                { value: "RESULTADO",   width: "80px", align: "center" },
-                { value: "P&L",         width: "80px", align: "right" },
-              ]} />
-              {pageBets.map((bet, i) => {
-                const isWin  = bet.result === "WIN";
-                const isLoss = ["LOSS", "STOP"].includes(bet.result);
-                // Color de P&L por resultado (no por signo numérico — workaround datos sim)
-                const pnlC = isWin ? "var(--green)" : isLoss ? "var(--red)" : "#555";
-                // Precio de salida: real_exit_odds > odds_salida > "—"
-                const exitOdds = bet.real_exit_odds ?? bet.odds_salida ?? null;
-
-                return (
-                  <TableRow key={bet.id || i} highlight={i % 2 === 0} cells={[
-                    { value: fmtTs(bet.ts),                   width: "118px", color: "#444" },
-                    {
-                      value: bet.dir === "UP" ? "▲ UP" : "▼ DOWN",
-                      width: "52px",
-                      color: bet.dir === "UP" ? "var(--green)" : "var(--red)",
-                      bold: true,
-                    },
-                    { value: bet.window || "—",               width: "58px",  align: "center", color: "#4488ff" },
-                    {
-                      value: bet.entry
-                        ? `$${Number(bet.entry).toLocaleString("en-US", { minimumFractionDigits: 0, maximumFractionDigits: 0 })}`
-                        : "—",
-                      width: "100px", align: "right", color: "#888",
-                    },
-                    { value: fmtOdds(bet.odds),               width: "90px",  align: "right", color: "#4488ff" },
-                    {
-                      value: fmtOdds(exitOdds),
-                      width: "90px",  align: "right",
-                      color: exitOdds != null
-                        ? (exitOdds > (bet.odds ?? 0) ? "var(--green)" : "var(--red)")
-                        : "#333",
-                    },
-                    {
-                      value: bet.result || "—",
-                      width: "80px", align: "center",
-                      color: resultColor(bet.result), bold: true,
-                    },
-                    {
-                      value: bet.pnl_usd != null
-                        ? `${bet.pnl_usd >= 0 ? "+" : ""}$${Math.abs(bet.pnl_usd).toFixed(2)}`
-                        : "—",
-                      width: "80px", align: "right",
-                      color: pnlC,
-                      bold: true,
-                    },
-                  ]} />
-                );
-              })}
-            </div>
-
-            {/* Paginación */}
-            {totalPages > 1 && (
-              <div style={{
-                display: "flex", gap: 8, alignItems: "center",
-                marginTop: 10, justifyContent: "flex-end",
-              }}>
-                <span style={{ fontSize: 9, color: "#333" }}>
-                  Página {betsPage + 1} / {totalPages} · {closedBets.length} ops.
-                </span>
-                <button
-                  disabled={betsPage === 0}
-                  onClick={() => setBetsPage(p => p - 1)}
-                  style={{
-                    background: "transparent", border: "1px solid #1a1a2a",
-                    color: betsPage === 0 ? "#222" : "#555",
-                    padding: "3px 10px", borderRadius: 3, fontSize: 9,
-                    cursor: betsPage === 0 ? "default" : "pointer",
-                  }}
-                >
-                  ← ANT
-                </button>
-                <button
-                  disabled={betsPage >= totalPages - 1}
-                  onClick={() => setBetsPage(p => p + 1)}
-                  style={{
-                    background: "transparent", border: "1px solid #1a1a2a",
-                    color: betsPage >= totalPages - 1 ? "#222" : "#555",
-                    padding: "3px 10px", borderRadius: 3, fontSize: 9,
-                    cursor: betsPage >= totalPages - 1 ? "default" : "pointer",
-                  }}
-                >
-                  SIG →
-                </button>
-              </div>
-            )}
-          </>
-        )
-      }
-
-      {/* ══════════════════════════════════════════════════════════════════ */}
-      {/* 3. RENDIMIENTO POR VENTANA DE ENTRADA (v2.0: compra+venta media)  */}
-      {/* ══════════════════════════════════════════════════════════════════ */}
-      <SectionTitle>3 · RENDIMIENTO POR VENTANA DE ENTRADA</SectionTitle>
-
-      {byWindow.loading
-        ? <Spinner />
-        : !byWindow.data?.rows?.length
-        ? <Empty />
-        : (
+      {betsLoading ? <Spinner /> : closedBets.length === 0 ? (
+        <Empty msg="Sin operaciones cerradas aún" />
+      ) : (
+        <>
           <div style={{ border: "1px solid #0d0d1a", borderRadius: 3, overflow: "hidden" }}>
             <TableRow header cells={[
-              { value: "VENTANA",      width: "70px" },
-              { value: "OPS",          width: "45px", align: "center" },
-              { value: "WINS",         width: "45px", align: "center" },
-              { value: "LOSSES",       width: "55px", align: "center" },
-              { value: "WIN RATE",     width: "78px", align: "right" },
-              { value: "P&L TOTAL",    width: "95px", align: "right" },
-              { value: "P&L MEDIO",    width: "90px", align: "right" },
-              { value: "COMPRA MEDIA", width: "95px", align: "right" },
-              { value: "VENTA MEDIA",  width: "90px", align: "right" },
+              { value: "FECHA",       width: "110px" },
+              { value: "DIR",         width: "50px" },
+              { value: "VENTANA",     width: "55px",  align: "center" },
+              { value: "ALGO",        width: "65px",  align: "center" },
+              { value: "BTC ENTRADA", width: "100px", align: "right" },
+              { value: "ODDS C.",     width: "80px",  align: "right" },
+              { value: "ODDS V.",     width: "80px",  align: "right" },
+              { value: "RESULTADO",   width: "78px",  align: "center" },
+              { value: "P&L",         width: "78px",  align: "right" },
             ]} />
-            {byWindow.data.rows.map((row, i) => {
-              // ⚠ Detecta inconsistencia: win_rate > 50% pero P&L negativo
-              const pnlInconsistent = row.win_rate_pct != null && row.win_rate_pct > 50
-                && row.pnl_total_usd != null && row.pnl_total_usd < 0;
+            {pageBets.map((bet, i) => {
+              const isWin    = bet.result === "WIN";
+              const isLoss   = ["LOSS", "STOP"].includes(bet.result);
+              const pnlC     = isWin ? "var(--green)" : isLoss ? "var(--red)" : "#555";
+              const exitOdds = bet.real_exit_odds ?? bet.odds_salida ?? null;
+              const algo     = bet.algorithm_version ?? "standard";
+              const algoCol  = algo === "optimized" ? "#00ff88" : "#4488ff";
+              const algoIcon = algo === "optimized" ? "⬡" : "◈";
 
               return (
-                <TableRow key={i} cells={[
-                  { value: row.ventana,   width: "70px",  color: "#4488ff", bold: true },
-                  { value: row.total_ops, width: "45px",  align: "center" },
-                  { value: row.wins,      width: "45px",  align: "center", color: "var(--green)" },
-                  { value: row.losses,    width: "55px",  align: "center", color: "var(--red)" },
+                <TableRow key={bet.id || i} highlight={i % 2 === 0} cells={[
+                  { value: fmtTs(bet.ts),  width: "110px", color: "#444" },
                   {
-                    value: row.win_rate_pct != null ? `${row.win_rate_pct}%` : "—",
-                    width: "78px", align: "right",
-                    color: wrColor(row.win_rate_pct), bold: true,
+                    value: bet.dir === "UP" ? "▲ UP" : "▼ DOWN",
+                    width: "50px",
+                    color: bet.dir === "UP" ? "var(--green)" : "var(--red)",
+                    bold: true,
+                  },
+                  { value: bet.window || "—",  width: "55px",  align: "center", color: "#4488ff" },
+                  {
+                    value: `${algoIcon} ${algo === "optimized" ? "OPT" : "STD"}`,
+                    width: "65px", align: "center", color: algoCol,
                   },
                   {
-                    value: row.pnl_total_usd != null
-                      ? `${pnlInconsistent ? "⚠ " : ""}${row.pnl_total_usd >= 0 ? "+" : ""}$${Math.abs(row.pnl_total_usd).toFixed(2)}`
+                    value: bet.entry
+                      ? `$${Number(bet.entry).toLocaleString("en-US", { maximumFractionDigits: 0 })}`
                       : "—",
-                    width: "95px", align: "right",
-                    color: pnlColor(row.pnl_total_usd),
+                    width: "100px", align: "right", color: "#888",
+                  },
+                  { value: fmtOdds(bet.odds),    width: "80px", align: "right", color: "#4488ff" },
+                  {
+                    value: fmtOdds(exitOdds),
+                    width: "80px", align: "right",
+                    color: exitOdds != null
+                      ? (exitOdds > (bet.odds ?? 0) ? "var(--green)" : "var(--red)")
+                      : "#333",
                   },
                   {
-                    value: row.pnl_medio_usd != null
-                      ? `${row.pnl_medio_usd >= 0 ? "+" : ""}$${Math.abs(row.pnl_medio_usd).toFixed(2)}`
+                    value: bet.result || "—",
+                    width: "78px", align: "center",
+                    color: resultColor(bet.result), bold: true,
+                  },
+                  {
+                    value: bet.pnl_usd != null
+                      ? `${bet.pnl_usd >= 0 ? "+" : ""}$${Math.abs(bet.pnl_usd).toFixed(2)}`
                       : "—",
-                    width: "90px", align: "right",
-                    color: pnlColor(row.pnl_medio_usd),
-                  },
-                  {
-                    value: row.avg_odds_entrada != null ? row.avg_odds_entrada.toFixed(4) : "—",
-                    width: "95px", align: "right", color: "#4488ff",
-                  },
-                  {
-                    value: row.avg_odds_salida != null ? row.avg_odds_salida.toFixed(4) : "—",
-                    width: "90px", align: "right",
-                    color: row.avg_odds_salida != null && row.avg_odds_entrada != null
-                      ? (row.avg_odds_salida > row.avg_odds_entrada ? "var(--green)" : "var(--red)")
-                      : "#444",
+                    width: "78px", align: "right", color: pnlC, bold: true,
                   },
                 ]} />
               );
             })}
           </div>
-        )
-      }
+
+          {totalPages > 1 && (
+            <div style={{ display: "flex", gap: 8, alignItems: "center", marginTop: 10, justifyContent: "flex-end" }}>
+              <span style={{ fontSize: 9, color: "#333" }}>
+                Pág. {betsPage + 1}/{totalPages} · {closedBets.length} ops.
+              </span>
+              <button disabled={betsPage === 0} onClick={() => setBetsPage(p => p - 1)} style={{
+                background: "transparent", border: "1px solid #1a1a2a",
+                color: betsPage === 0 ? "#222" : "#555",
+                padding: "3px 10px", borderRadius: 3, fontSize: 9,
+                cursor: betsPage === 0 ? "default" : "pointer", fontFamily: "inherit",
+              }}>← ANT</button>
+              <button disabled={betsPage >= totalPages - 1} onClick={() => setBetsPage(p => p + 1)} style={{
+                background: "transparent", border: "1px solid #1a1a2a",
+                color: betsPage >= totalPages - 1 ? "#222" : "#555",
+                padding: "3px 10px", borderRadius: 3, fontSize: 9,
+                cursor: betsPage >= totalPages - 1 ? "default" : "pointer", fontFamily: "inherit",
+              }}>SIG →</button>
+            </div>
+          )}
+        </>
+      )}
 
       {/* ══════════════════════════════════════════════════════════════════ */}
-      {/* 4. UP VS DOWN                                                     */}
+      {/* 3. RENDIMIENTO POR VENTANA                                         */}
+      {/* ══════════════════════════════════════════════════════════════════ */}
+      <SectionTitle>3 · RENDIMIENTO POR VENTANA DE ENTRADA</SectionTitle>
+
+      {byWindow.loading ? <Spinner /> : !byWindow.data?.rows?.length ? <Empty /> : (
+        <div style={{ border: "1px solid #0d0d1a", borderRadius: 3, overflow: "hidden" }}>
+          <TableRow header cells={[
+            { value: "VENTANA",      width: "70px" },
+            { value: "OPS",          width: "45px",  align: "center" },
+            { value: "WINS",         width: "45px",  align: "center" },
+            { value: "LOSSES",       width: "55px",  align: "center" },
+            { value: "WIN RATE",     width: "78px",  align: "right" },
+            { value: "P&L TOTAL",    width: "95px",  align: "right" },
+            { value: "P&L MEDIO",    width: "90px",  align: "right" },
+            { value: "COMPRA MEDIA", width: "95px",  align: "right" },
+            { value: "VENTA MEDIA",  width: "90px",  align: "right" },
+          ]} />
+          {byWindow.data.rows.map((row, i) => {
+            const pnlInconsistent = row.win_rate_pct > 50 && row.pnl_total_usd < 0;
+            return (
+              <TableRow key={i} cells={[
+                { value: row.ventana,    width: "70px",  color: "#4488ff", bold: true },
+                { value: row.total_ops,  width: "45px",  align: "center" },
+                { value: row.wins,       width: "45px",  align: "center", color: "var(--green)" },
+                { value: row.losses,     width: "55px",  align: "center", color: "var(--red)" },
+                {
+                  value: row.win_rate_pct != null ? `${row.win_rate_pct}%` : "—",
+                  width: "78px", align: "right", color: wrColor(row.win_rate_pct), bold: true,
+                },
+                {
+                  value: row.pnl_total_usd != null
+                    ? `${pnlInconsistent ? "⚠ " : ""}${row.pnl_total_usd >= 0 ? "+" : ""}$${Math.abs(row.pnl_total_usd).toFixed(2)}`
+                    : "—",
+                  width: "95px", align: "right", color: pnlColor(row.pnl_total_usd),
+                },
+                {
+                  value: row.pnl_medio_usd != null
+                    ? `${row.pnl_medio_usd >= 0 ? "+" : ""}$${Math.abs(row.pnl_medio_usd).toFixed(2)}`
+                    : "—",
+                  width: "90px", align: "right", color: pnlColor(row.pnl_medio_usd),
+                },
+                {
+                  value: row.avg_odds_entrada != null ? row.avg_odds_entrada.toFixed(4) : "—",
+                  width: "95px", align: "right", color: "#4488ff",
+                },
+                {
+                  value: row.avg_odds_salida != null ? row.avg_odds_salida.toFixed(4) : "—",
+                  width: "90px", align: "right",
+                  color: row.avg_odds_salida != null && row.avg_odds_entrada != null
+                    ? (row.avg_odds_salida > row.avg_odds_entrada ? "var(--green)" : "var(--red)")
+                    : "#444",
+                },
+              ]} />
+            );
+          })}
+        </div>
+      )}
+
+      {/* ══════════════════════════════════════════════════════════════════ */}
+      {/* 4. UP VS DOWN                                                      */}
       {/* ══════════════════════════════════════════════════════════════════ */}
       <SectionTitle>4 · UP VS DOWN</SectionTitle>
 
-      {byDir.loading
-        ? <Spinner />
-        : !byDir.data?.rows?.length
-        ? <Empty />
-        : (
-          <div style={{ display: "flex", gap: 20, flexWrap: "wrap" }}>
-            {byDir.data.rows.map((row, i) => (
-              <div key={i} style={{
-                background: "#02020c", border: "1px solid #0d0d1a",
-                borderRadius: 3, padding: "14px 20px", minWidth: 160,
+      {byDir.loading ? <Spinner /> : !byDir.data?.rows?.length ? <Empty /> : (
+        <div style={{ display: "flex", gap: 20, flexWrap: "wrap" }}>
+          {byDir.data.rows.map((row, i) => (
+            <div key={i} style={{
+              background: "#02020c", border: "1px solid #0d0d1a",
+              borderRadius: 3, padding: "14px 20px", minWidth: 160,
+            }}>
+              <div style={{
+                fontSize: 16, fontWeight: 700, marginBottom: 10,
+                color: row.direccion === "UP" ? "var(--green)" : "var(--red)",
+              }}>
+                {row.direccion === "UP" ? "▲ UP" : "▼ DOWN"}
+              </div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 10 }}>
+                {[
+                  ["Ops",      row.total_ops],
+                  ["Wins",     row.wins,      "var(--green)"],
+                  ["Losses",   row.losses,    "var(--red)"],
+                  ["Win Rate", row.win_rate_pct != null ? `${row.win_rate_pct}%` : "—", wrColor(row.win_rate_pct)],
+                  ["P&L",      row.pnl_total_usd != null
+                    ? `${row.pnl_total_usd >= 0 ? "+" : ""}$${Math.abs(row.pnl_total_usd).toFixed(2)}`
+                    : "—", pnlColor(row.pnl_total_usd)],
+                ].map(([label, val, c]) => (
+                  <div key={label} style={{ display: "flex", justifyContent: "space-between", gap: 16 }}>
+                    <span style={{ color: "#333" }}>{label}</span>
+                    <span style={{ color: c || "#777", fontWeight: 600 }}>{val}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* ══════════════════════════════════════════════════════════════════ */}
+      {/* 5. P&L DIARIO                                                      */}
+      {/* ══════════════════════════════════════════════════════════════════ */}
+      <SectionTitle>5 · P&L DIARIO — ÚLTIMOS {days} DÍAS</SectionTitle>
+
+      {byDay.loading ? <Spinner /> : !byDay.data?.rows?.length ? <Empty /> : (
+        <BarChart rows={byDay.data.rows} valueKey="pnl_usd" labelKey="fecha" />
+      )}
+
+      {/* ══════════════════════════════════════════════════════════════════ */}
+      {/* 6. WIN RATE POR HORA UTC                                           */}
+      {/* ══════════════════════════════════════════════════════════════════ */}
+      <SectionTitle>6 · WIN RATE POR HORA UTC</SectionTitle>
+
+      {byHour.loading ? <Spinner /> : !byHour.data?.rows?.length ? <Empty /> : (
+        <div style={{ border: "1px solid #0d0d1a", borderRadius: 3, overflow: "hidden" }}>
+          <TableRow header cells={[
+            { value: "HORA UTC", width: "80px" },
+            { value: "OPS",      width: "50px", align: "center" },
+            { value: "WINS",     width: "50px", align: "center" },
+            { value: "WIN RATE", width: "80px", align: "right" },
+            { value: "P&L",      width: "90px", align: "right" },
+          ]} />
+          {byHour.data.rows.map((row, i) => (
+            <TableRow key={i} cells={[
+              { value: `${String(row.hour_utc).padStart(2, "0")}:00`, width: "80px", color: "#888" },
+              { value: row.ops,   width: "50px", align: "center" },
+              { value: row.wins,  width: "50px", align: "center", color: "var(--green)" },
+              {
+                value: row.win_rate_pct != null ? `${row.win_rate_pct}%` : "—",
+                width: "80px", align: "right", color: wrColor(row.win_rate_pct), bold: true,
+              },
+              {
+                value: row.pnl_usd != null
+                  ? `${row.pnl_usd >= 0 ? "+" : ""}$${Math.abs(row.pnl_usd).toFixed(2)}`
+                  : "—",
+                width: "90px", align: "right", color: pnlColor(row.pnl_usd),
+              },
+            ]} />
+          ))}
+        </div>
+      )}
+
+      {/* ══════════════════════════════════════════════════════════════════ */}
+      {/* 7. SEÑALES ACCIONABLES — CALIBRACIÓN DE UMBRALES                  */}
+      {/* ══════════════════════════════════════════════════════════════════ */}
+      <SectionTitle>7 · SEÑALES ACCIONABLES — CALIBRACIÓN DE UMBRALES</SectionTitle>
+
+      {signals.loading ? <Spinner /> : !signals.data?.summary?.length ? <Empty /> : (
+        <>
+          <div style={{ fontSize: 10, color: "#333", marginBottom: 12 }}>
+            {signals.data.raw_count} señales analizadas en los últimos {days} días
+          </div>
+          <div style={{ border: "1px solid #0d0d1a", borderRadius: 3, overflow: "hidden" }}>
+            <TableRow header cells={[
+              { value: "VENTANA",    width: "80px" },
+              { value: "SEÑALES",    width: "70px", align: "center" },
+              { value: "DIST MEDIA", width: "90px", align: "right" },
+              { value: "▲ UP",       width: "60px", align: "center" },
+              { value: "▼ DOWN",     width: "60px", align: "center" },
+            ]} />
+            {signals.data.summary.map((row, i) => (
+              <TableRow key={i} cells={[
+                { value: row.ventana,                              width: "80px",  color: "#4488ff", bold: true },
+                { value: row.signals,                              width: "70px",  align: "center" },
+                { value: row.avg_dist ? `$${row.avg_dist}` : "—", width: "90px",  align: "right", color: "#888" },
+                { value: row.up_signals,                           width: "60px",  align: "center", color: "var(--green)" },
+                { value: row.down_signals,                         width: "60px",  align: "center", color: "var(--red)" },
+              ]} />
+            ))}
+          </div>
+        </>
+      )}
+
+      {/* ══════════════════════════════════════════════════════════════════ */}
+      {/* 8. COMPARATIVA ESTÁNDAR vs OPTIMIZADO                              */}
+      {/* ══════════════════════════════════════════════════════════════════ */}
+      <SectionTitle>8 · COMPARATIVA ESTÁNDAR vs OPTIMIZADO — ÚLTIMOS 90 DÍAS</SectionTitle>
+
+      {algoComp.loading ? <Spinner /> : !algoComp.data?.available ? (
+        <Empty msg={algoComp.data?.reason ?? algoComp.error ?? "Sin datos"} />
+      ) : (
+        <>
+          {/* Cards lado a lado */}
+          <div style={{ display: "flex", gap: 16, flexWrap: "wrap", marginBottom: 20 }}>
+            <AlgoCard
+              label="ESTÁNDAR"
+              data={algoComp.data.standard}
+              color="#4488ff"
+              icon="◈"
+            />
+            <AlgoCard
+              label="OPTIMIZADO"
+              data={algoComp.data.optimized}
+              color="#00ff88"
+              icon="⬡"
+              isNew={!algoComp.data.optimized || algoComp.data.optimized.total_ops === 0}
+            />
+          </div>
+
+          {/* Diferencial global (solo si ambos tienen ops) */}
+          {algoComp.data.standard?.total_ops > 0 && algoComp.data.optimized?.total_ops > 0 && (() => {
+            const s = algoComp.data.standard;
+            const o = algoComp.data.optimized;
+            const pnlDiff = (o.pnl_usd ?? 0) - (s.pnl_usd ?? 0);
+            const wrDiff  = (o.win_rate_pct ?? 0) - (s.win_rate_pct ?? 0);
+            const roiDiff = (o.roi_pct ?? 0) - (s.roi_pct ?? 0);
+            return (
+              <div style={{
+                marginBottom: 20, padding: "12px 16px", borderRadius: 3, fontSize: 10, lineHeight: 1.8,
+                background: pnlDiff >= 0 ? "#020e06" : "#0e0206",
+                border: `1px solid ${pnlDiff >= 0 ? "#003322" : "#330011"}`,
               }}>
                 <div style={{
-                  fontSize: 16, fontWeight: 700, marginBottom: 10,
-                  color: row.direccion === "UP" ? "var(--green)" : "var(--red)",
+                  fontSize: 8, letterSpacing: "0.14em", marginBottom: 6,
+                  color: pnlDiff >= 0 ? "#00cc66" : "#cc0033",
                 }}>
-                  {row.direccion === "UP" ? "▲ UP" : "▼ DOWN"}
+                  {pnlDiff >= 0 ? "⬡ OPTIMIZADO SUPERA AL ESTÁNDAR" : "◈ ESTÁNDAR SUPERA AL OPTIMIZADO"}
                 </div>
-                <div style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 10 }}>
+                <div style={{ display: "flex", gap: 28, flexWrap: "wrap" }}>
                   {[
-                    ["Ops",      row.total_ops],
-                    ["Wins",     row.wins,      "var(--green)"],
-                    ["Losses",   row.losses,    "var(--red)"],
-                    ["Win Rate", row.win_rate_pct != null ? `${row.win_rate_pct}%` : "—", wrColor(row.win_rate_pct)],
-                    ["P&L",      row.pnl_total_usd != null
-                                  ? `${row.pnl_total_usd >= 0 ? "+" : ""}$${Math.abs(row.pnl_total_usd).toFixed(2)}`
-                                  : "—", pnlColor(row.pnl_total_usd)],
-                  ].map(([label, val, c]) => (
-                    <div key={label} style={{ display: "flex", justifyContent: "space-between", gap: 16 }}>
-                      <span style={{ color: "#333" }}>{label}</span>
-                      <span style={{ color: c || "#777", fontWeight: 600 }}>{val}</span>
+                    ["ΔP&L",      fmtUSD(pnlDiff),                                        pnlColor(pnlDiff)],
+                    ["ΔWIN RATE", `${wrDiff >= 0 ? "+" : ""}${wrDiff.toFixed(1)}%`,        wrDiff >= 0 ? "var(--green)" : "var(--red)"],
+                    ["ΔROI",      `${roiDiff >= 0 ? "+" : ""}${roiDiff.toFixed(1)}%`,     pnlColor(roiDiff)],
+                  ].map(([lbl, val, col]) => (
+                    <div key={lbl}>
+                      <span style={{ color: "#444", marginRight: 8 }}>{lbl}</span>
+                      <span style={{ color: col, fontWeight: 700 }}>{val}</span>
                     </div>
                   ))}
                 </div>
               </div>
-            ))}
-          </div>
-        )
-      }
+            );
+          })()}
 
-      {/* ══════════════════════════════════════════════════════════════════ */}
-      {/* 5. P&L DIARIO                                                     */}
-      {/* ══════════════════════════════════════════════════════════════════ */}
-      <SectionTitle>5 · P&L DIARIO — ÚLTIMOS {days} DÍAS</SectionTitle>
-
-      {byDay.loading
-        ? <Spinner />
-        : !byDay.data?.rows?.length
-        ? <Empty />
-        : <BarChart rows={byDay.data.rows} valueKey="pnl_usd" labelKey="fecha" />
-      }
-
-      {/* ══════════════════════════════════════════════════════════════════ */}
-      {/* 6. WIN RATE POR HORA UTC                                          */}
-      {/* ══════════════════════════════════════════════════════════════════ */}
-      <SectionTitle>6 · WIN RATE POR HORA UTC</SectionTitle>
-
-      {byHour.loading
-        ? <Spinner />
-        : !byHour.data?.rows?.length
-        ? <Empty />
-        : (
-          <div style={{ border: "1px solid #0d0d1a", borderRadius: 3, overflow: "hidden" }}>
-            <TableRow header cells={[
-              { value: "HORA UTC", width: "80px" },
-              { value: "OPS",      width: "50px", align: "center" },
-              { value: "WINS",     width: "50px", align: "center" },
-              { value: "WIN RATE", width: "80px", align: "right" },
-              { value: "P&L",      width: "90px", align: "right" },
-            ]} />
-            {byHour.data.rows.map((row, i) => (
-              <TableRow key={i} cells={[
-                { value: `${String(row.hour_utc).padStart(2, "0")}:00`, width: "80px", color: "#888" },
-                { value: row.ops,  width: "50px", align: "center" },
-                { value: row.wins, width: "50px", align: "center", color: "var(--green)" },
-                {
-                  value: row.win_rate_pct != null ? `${row.win_rate_pct}%` : "—",
-                  width: "80px", align: "right",
-                  color: wrColor(row.win_rate_pct), bold: true,
-                },
-                {
-                  value: row.pnl_usd != null
-                    ? `${row.pnl_usd >= 0 ? "+" : ""}$${Math.abs(row.pnl_usd).toFixed(2)}`
-                    : "—",
-                  width: "90px", align: "right",
-                  color: pnlColor(row.pnl_usd),
-                },
-              ]} />
-            ))}
-          </div>
-        )
-      }
-
-      {/* ══════════════════════════════════════════════════════════════════ */}
-      {/* 7. CALIBRACIÓN DE UMBRALES (señales accionables)                  */}
-      {/* ══════════════════════════════════════════════════════════════════ */}
-      <SectionTitle>7 · SEÑALES ACCIONABLES — CALIBRACIÓN DE UMBRALES</SectionTitle>
-
-      {signals.loading
-        ? <Spinner />
-        : !signals.data?.summary?.length
-        ? <Empty />
-        : (
-          <>
-            <div style={{ fontSize: 10, color: "#333", marginBottom: 12 }}>
-              {signals.data.raw_count} señales analizadas en los últimos {days} días
-            </div>
-            <div style={{ border: "1px solid #0d0d1a", borderRadius: 3, overflow: "hidden" }}>
-              <TableRow header cells={[
-                { value: "VENTANA",    width: "80px" },
-                { value: "SEÑALES",    width: "70px", align: "center" },
-                { value: "DIST MEDIA", width: "90px", align: "right" },
-                { value: "▲ UP",       width: "60px", align: "center" },
-                { value: "▼ DOWN",     width: "60px", align: "center" },
-              ]} />
-              {signals.data.summary.map((row, i) => (
-                <TableRow key={i} cells={[
-                  { value: row.ventana,                              width: "80px",  color: "#4488ff", bold: true },
-                  { value: row.signals,                              width: "70px",  align: "center" },
-                  { value: row.avg_dist ? `$${row.avg_dist}` : "—", width: "90px",  align: "right", color: "#888" },
-                  { value: row.up_signals,                           width: "60px",  align: "center", color: "var(--green)" },
-                  { value: row.down_signals,                         width: "60px",  align: "center", color: "var(--red)" },
+          {/* Tabla por ventana */}
+          {algoComp.data.window_comparison?.length > 0 && (
+            <>
+              <div style={{ fontSize: 9, color: "#333", letterSpacing: "0.12em", marginBottom: 10 }}>
+                P&L Y WIN RATE POR VENTANA
+              </div>
+              <div style={{ border: "1px solid #0d0d1a", borderRadius: 3, overflow: "hidden" }}>
+                <TableRow header cells={[
+                  { value: "VENTANA",      width: "70px" },
+                  { value: "◈ OPS STD",    width: "78px",  align: "center" },
+                  { value: "◈ WR STD",     width: "78px",  align: "right" },
+                  { value: "◈ P&L STD",    width: "95px",  align: "right" },
+                  { value: "⬡ OPS OPT",    width: "78px",  align: "center" },
+                  { value: "⬡ WR OPT",     width: "78px",  align: "right" },
+                  { value: "⬡ P&L OPT",    width: "95px",  align: "right" },
+                  { value: "Δ P&L",        width: "88px",  align: "right" },
                 ]} />
-              ))}
-            </div>
-          </>
-        )
-      }
+                {algoComp.data.window_comparison.map((row, i) => {
+                  const diff      = (row.optimized_pnl ?? 0) - (row.standard_pnl ?? 0);
+                  const optBetter = row.optimized_pnl != null && row.standard_pnl != null
+                    ? row.optimized_pnl > row.standard_pnl : null;
+                  return (
+                    <TableRow key={i} highlight={i % 2 === 0} cells={[
+                      { value: row.ventana,                                                     width: "70px",  color: "#888",  bold: true },
+                      { value: row.standard_ops || 0,                                           width: "78px",  align: "center" },
+                      { value: row.standard_wr != null ? `${row.standard_wr}%` : "—",          width: "78px",  align: "right", color: wrColor(row.standard_wr) },
+                      { value: row.standard_pnl != null ? fmtUSD(row.standard_pnl) : "—",      width: "95px",  align: "right", color: pnlColor(row.standard_pnl) },
+                      { value: row.optimized_ops || 0,                                          width: "78px",  align: "center" },
+                      { value: row.optimized_wr != null ? `${row.optimized_wr}%` : "—",        width: "78px",  align: "right", color: wrColor(row.optimized_wr) },
+                      { value: row.optimized_pnl != null ? fmtUSD(row.optimized_pnl) : "—",    width: "95px",  align: "right", color: pnlColor(row.optimized_pnl) },
+                      {
+                        value: row.optimized_pnl != null && row.standard_pnl != null ? fmtUSD(diff) : "—",
+                        width: "88px", align: "right",
+                        color: optBetter === true ? "var(--green)" : optBetter === false ? "var(--red)" : "#444",
+                        bold: true,
+                      },
+                    ]} />
+                  );
+                })}
+              </div>
+              <div style={{ marginTop: 8, fontSize: 9, color: "#2a3a2a", lineHeight: 1.7 }}>
+                Las ops sin <span style={{ fontFamily: "monospace" }}>algorithm_version</span> (anteriores a v11.5)
+                se contabilizan como{" "}
+                <span style={{ color: "#4488ff" }}>◈ Standard</span>.
+              </div>
+            </>
+          )}
+        </>
+      )}
 
       <div style={{ height: 40 }} />
     </div>
