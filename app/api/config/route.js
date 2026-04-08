@@ -1,10 +1,12 @@
 /**
- * app/api/config/route.js — v1.1
+ * app/api/config/route.js — v1.2
  *
- * Endpoint de configuración compartida bot ↔ dashboard.
+ * v1.2 — Añade algorithm_version ('standard' | 'optimized') a la whitelist.
+ * v1.1 — Endpoint de configuración compartida bot ↔ dashboard.
+ *
  * Lee y escribe en la tabla bot_config de Supabase.
  *
- * El bot lee trading_mode cada 60s via db.get_config("trading_mode").
+ * El bot lee trading_mode / algorithm_version cada 60s via db.get_config().
  * El dashboard escribe aquí → el bot lo recoge en el siguiente ciclo.
  *
  * GET  /api/config?key=trading_mode   → { key, value, updated_at }
@@ -20,6 +22,7 @@ export const dynamic = "force-dynamic";
 const ALLOWED_KEYS = new Set([
   "trading_mode",
   "stake_usdc",
+  "algorithm_version",   // 'standard' | 'optimized'
   "bot_simulate_active",
   "bot_started_at",
   "funder_address",
@@ -43,7 +46,7 @@ export async function GET(req) {
   const sb = getSupabase();
   if (!sb) {
     // Sin Supabase: devolver defaults útiles en vez de error
-    const defaults = { trading_mode: "simulate", stake_usdc: "10" };
+    const defaults = { trading_mode: "simulate", stake_usdc: "10", algorithm_version: "standard" };
     return NextResponse.json(
       { key, value: defaults[key] ?? null, source: "default" },
       { headers: { "Cache-Control": "no-store" } }
@@ -114,6 +117,14 @@ export async function POST(req) {
     );
   }
 
+  // Validación específica para algorithm_version
+  if (key === "algorithm_version" && !["standard", "optimized"].includes(value)) {
+    return NextResponse.json(
+      { ok: false, error: "algorithm_version debe ser 'standard' u 'optimized'" },
+      { status: 400 }
+    );
+  }
+
   const sb = getSupabase();
   if (!sb) {
     return NextResponse.json(
@@ -137,11 +148,15 @@ export async function POST(req) {
     // Si es un cambio de modo, registrar también quién lo cambió y cuándo
     if (key === "trading_mode") {
       await sb.from("bot_config").upsert([
-        { key: "mode_changed_by",  value: "dashboard",  updated_at: now },
-        { key: "mode_changed_at",  value: now,          updated_at: now },
+        { key: "mode_changed_by", value: "dashboard", updated_at: now },
+        { key: "mode_changed_at", value: now,         updated_at: now },
       ], { onConflict: "key" });
 
       console.log(`[config/POST] trading_mode → ${value}`);
+    }
+
+    if (key === "algorithm_version") {
+      console.log(`[config/POST] algorithm_version → ${value}`);
     }
 
     return NextResponse.json(
