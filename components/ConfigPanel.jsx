@@ -1,14 +1,18 @@
 /**
- * components/ConfigPanel.jsx — v1.3
+ * components/ConfigPanel.jsx — v1.4
  *
- * v1.3 — Aviso "requiere editar config.yaml" en umbrales y capital
- *         (max_ops_dia, stop_loss_pct). Solo stake_usdc se persiste en Supabase.
- * v1.2 — Botón GUARDAR stake_usdc con feedback visual (✅ / ❌).
- * v1.1 — Grid original (umbrales / capital / env vars)
+ * v1.4 — AlgorithmSelector: toggle Standard / Optimizado.
+ *         Persiste en bot_config.algorithm_version via /api/config.
+ *         El bot carga el valor cada ~60s y aplica las reglas:
+ *           OPTIMIZADO → bloquea T-5 y horas 12–16 UTC.
+ *         Las operaciones se taggean con algorithm_version para comparativa.
+ * v1.3 — Aviso "requiere editar config.yaml" en umbrales y capital.
+ * v1.2 — Botón GUARDAR stake_usdc con feedback visual.
+ * v1.1 — Grid original (umbrales / capital / env vars).
  */
 
 "use client";
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { WINDOWS } from "../lib/constants";
 
 // ── Sub-componentes ──────────────────────────────────────────────────────────
@@ -53,6 +57,193 @@ function ConfigYamlNote() {
       Para cambiarlos edita{" "}
       <span style={{ color: "var(--yellow)" }}>config.yaml</span>{" "}
       en Railway y reinicia el bot.
+    </div>
+  );
+}
+
+// ── Algorithm Version Selector ───────────────────────────────────────────────
+
+function AlgorithmSelector() {
+  const [version,    setVersion]    = useState("standard");
+  const [saveStatus, setSaveStatus] = useState("idle"); // idle | saving | ok | error
+  const [saveMsg,    setSaveMsg]    = useState("");
+  const [loading,    setLoading]    = useState(true);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const res  = await fetch("/api/config?key=algorithm_version");
+        const data = await res.json();
+        if (data.value) setVersion(data.value);
+      } catch (e) {
+        console.warn("[AlgorithmSelector] load error:", e.message);
+      } finally {
+        setLoading(false);
+      }
+    })();
+  }, []);
+
+  const saveVersion = async (newVersion) => {
+    if (newVersion === version) return;
+    setSaveStatus("saving");
+    setSaveMsg("");
+    try {
+      const res  = await fetch("/api/config", {
+        method:  "POST",
+        headers: { "Content-Type": "application/json" },
+        body:    JSON.stringify({ key: "algorithm_version", value: newVersion }),
+      });
+      const data = await res.json();
+      if (data.ok !== false && !data.error) {
+        setVersion(newVersion);
+        setSaveStatus("ok");
+        setSaveMsg(
+          newVersion === "optimized"
+            ? "✅ Modo Optimizado activado — el bot lo cargará en ~60s"
+            : "✅ Modo Estándar activado — el bot lo cargará en ~60s"
+        );
+      } else {
+        setSaveStatus("error");
+        setSaveMsg(`❌ Error: ${data.error ?? "desconocido"}`);
+      }
+    } catch (e) {
+      setSaveStatus("error");
+      setSaveMsg(`❌ ${e.message}`);
+    }
+    setTimeout(() => { setSaveStatus("idle"); setSaveMsg(""); }, 5000);
+  };
+
+  const OPTIONS = [
+    {
+      id:    "standard",
+      label: "ESTÁNDAR",
+      desc:  "Opera en todas las ventanas (T-50 → T-5) y todas las horas. Comportamiento original del bot.",
+      color: "#4488ff",
+      icon:  "◈",
+    },
+    {
+      id:    "optimized",
+      label: "OPTIMIZADO",
+      desc:  "Bloquea T-5 y horas 12–16 UTC. Solo opera T-20/T-15/T-10 donde el edge histórico es mayor.",
+      color: "#00ff88",
+      icon:  "⬡",
+    },
+  ];
+
+  return (
+    <div>
+      <div style={{ fontSize: 9, color: "#444", letterSpacing: "0.15em", marginBottom: 16 }}>
+        VERSIÓN DE ALGORITMO
+      </div>
+
+      {loading ? (
+        <div style={{ fontSize: 10, color: "#333" }}>cargando…</div>
+      ) : (
+        <>
+          <div style={{ display: "flex", flexDirection: "column", gap: 10, marginBottom: 14 }}>
+            {OPTIONS.map(opt => {
+              const active = version === opt.id;
+              return (
+                <button
+                  key={opt.id}
+                  onClick={() => saveVersion(opt.id)}
+                  disabled={saveStatus === "saving" || active}
+                  style={{
+                    background:   active ? `${opt.color}10` : "#02020a",
+                    border:       `1px solid ${active ? opt.color : "#1a1a2e"}`,
+                    borderRadius: 4,
+                    padding:      "12px 16px",
+                    cursor:       active ? "default" : (saveStatus === "saving" ? "wait" : "pointer"),
+                    textAlign:    "left",
+                    fontFamily:   "inherit",
+                    transition:   "all 0.2s",
+                    opacity:      saveStatus === "saving" && !active ? 0.5 : 1,
+                  }}
+                >
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 5 }}>
+                    <span style={{ color: opt.color, fontSize: 14 }}>{opt.icon}</span>
+                    <span style={{ fontSize: 10, color: opt.color, letterSpacing: "0.12em" }}>
+                      {opt.label}
+                    </span>
+                    {active && (
+                      <span style={{
+                        fontSize: 8, letterSpacing: "0.1em",
+                        padding: "1px 6px", borderRadius: 2,
+                        background: `${opt.color}18`,
+                        border: `1px solid ${opt.color}44`,
+                        color: opt.color, marginLeft: "auto",
+                      }}>
+                        ACTIVO
+                      </span>
+                    )}
+                  </div>
+                  <div style={{ fontSize: 9, color: "#555", lineHeight: 1.6, textAlign: "left" }}>
+                    {opt.desc}
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+
+          {saveMsg && (
+            <div style={{
+              fontSize: 10, lineHeight: 1.6, padding: "8px 12px",
+              borderRadius: 3, marginBottom: 12,
+              background: saveStatus === "ok" ? "rgba(0,255,136,0.06)" : "rgba(255,68,102,0.08)",
+              border: `1px solid ${saveStatus === "ok" ? "rgba(0,255,136,0.3)" : "rgba(255,68,102,0.3)"}`,
+              color: saveStatus === "ok" ? "var(--green)" : "var(--red)",
+            }}>
+              {saveMsg}
+            </div>
+          )}
+
+          {/* Reglas activas en modo Optimizado */}
+          {version === "optimized" && (
+            <div style={{
+              padding: "10px 14px",
+              background: "#020e06",
+              border: "1px solid #003322",
+              borderRadius: 3,
+              fontSize: 9,
+              color: "#446655",
+              lineHeight: 1.9,
+            }}>
+              <div style={{ color: "#00cc66", marginBottom: 4, letterSpacing: "0.1em" }}>
+                ⬡ REGLAS ACTIVAS
+              </div>
+              <div>❌ T-5 bloqueada (alta volatilidad vs real)</div>
+              <div>❌ Horas 12–16 UTC bloqueadas (degradación detectada)</div>
+              <div>✅ T-20 · T-15 · T-10 activas</div>
+              <div style={{ marginTop: 4, color: "#336644" }}>
+                🏷 Ops tageadas:{" "}
+                <span style={{ color: "#00ff88", fontFamily: "monospace" }}>optimized</span>
+              </div>
+            </div>
+          )}
+
+          {version === "standard" && (
+            <div style={{
+              padding: "10px 14px",
+              background: "#020814",
+              border: "1px solid #001133",
+              borderRadius: 3,
+              fontSize: 9,
+              color: "#334466",
+              lineHeight: 1.9,
+            }}>
+              <div style={{ color: "#3366cc", marginBottom: 4, letterSpacing: "0.1em" }}>
+                ◈ REGLAS ACTIVAS
+              </div>
+              <div>✅ Todas las ventanas activas (T-50 → T-5)</div>
+              <div>✅ Todas las horas UTC sin restricción</div>
+              <div style={{ marginTop: 4, color: "#223344" }}>
+                🏷 Ops tageadas:{" "}
+                <span style={{ color: "#4488ff", fontFamily: "monospace" }}>standard</span>
+              </div>
+            </div>
+          )}
+        </>
+      )}
     </div>
   );
 }
@@ -191,36 +382,45 @@ export default function ConfigPanel({ config, onChange }) {
         <ConfigYamlNote />
       </div>
 
-      {/* ── ENV VARS (info) ─────────────────────────────────────────────── */}
-      <div>
-        <div style={{ fontSize: 9, color: "#444", letterSpacing: "0.15em", marginBottom: 20 }}>
-          VARIABLES DE ENTORNO (RAILWAY / VERCEL)
-        </div>
-        {[
-          ["ANTHROPIC_API_KEY",       "Requerida para análisis IA", "var(--blue)"],
-          ["POLYMARKET_PRIVATE_KEY",  "Wallet privada del bot",     "var(--red)"],
-          ["POLYMARKET_FUNDER",       "Dirección proxy Polymarket", "var(--red)"],
-          ["TELEGRAM_BOT_TOKEN",      "Bot de Telegram",            "var(--green)"],
-          ["TELEGRAM_CHAT_ID",        "Chat ID de alertas",         "var(--green)"],
-          ["STAKE_USDC",              "Override de stake",          "var(--yellow)"],
-        ].map(([k, desc, color]) => (
-          <div key={k} style={{ marginBottom: 10 }}>
-            <div style={{ fontSize: 10, color, fontWeight: 600 }}>{k}</div>
-            <div style={{ fontSize: 9, color: "#444" }}>{desc}</div>
+      {/* ── ALGORITMO + ENV VARS ────────────────────────────────────────── */}
+      <div style={{ display: "flex", flexDirection: "column", gap: 40 }}>
+
+        {/* Algoritmo — persiste en Supabase */}
+        <AlgorithmSelector />
+
+        {/* ENV VARS (informativo) */}
+        <div>
+          <div style={{ fontSize: 9, color: "#444", letterSpacing: "0.15em", marginBottom: 20 }}>
+            VARIABLES DE ENTORNO (RAILWAY / VERCEL)
           </div>
-        ))}
-        <div style={{
-          marginTop: 24, padding: 14,
-          background: "#02020a", border: "1px solid #0d0d1a",
-          borderRadius: 3, fontSize: 10, color: "#444", lineHeight: 1.8,
-        }}>
-          <div style={{ color: "#2a4a3a", marginBottom: 6 }}>⚠ SEGURIDAD</div>
-          Nunca expongas tu <span style={{ color: "var(--red)" }}>PRIVATE_KEY</span> en el código.
-          Usa variables de entorno en Railway y Vercel. El archivo{" "}
-          <span style={{ color: "var(--green)" }}>.env.local</span> está en{" "}
-          <span style={{ color: "var(--muted)" }}>.gitignore</span>.
+          {[
+            ["ANTHROPIC_API_KEY",       "Requerida para análisis IA",     "var(--blue)"],
+            ["POLYMARKET_PRIVATE_KEY",  "Wallet privada del bot",         "var(--red)"],
+            ["POLYMARKET_FUNDER",       "Dirección proxy Polymarket",     "var(--red)"],
+            ["TELEGRAM_BOT_TOKEN",      "Bot de Telegram",                "var(--green)"],
+            ["TELEGRAM_CHAT_ID",        "Chat ID de alertas",             "var(--green)"],
+            ["STAKE_USDC",              "Override de stake (env > yaml)", "var(--yellow)"],
+            ["STOP_LOSS_PCT",           "Stop loss % (env > yaml)",       "var(--yellow)"],
+          ].map(([k, desc, color]) => (
+            <div key={k} style={{ marginBottom: 10 }}>
+              <div style={{ fontSize: 10, color, fontWeight: 600 }}>{k}</div>
+              <div style={{ fontSize: 9, color: "#444" }}>{desc}</div>
+            </div>
+          ))}
+          <div style={{
+            marginTop: 24, padding: 14,
+            background: "#02020a", border: "1px solid #0d0d1a",
+            borderRadius: 3, fontSize: 10, color: "#444", lineHeight: 1.8,
+          }}>
+            <div style={{ color: "#2a4a3a", marginBottom: 6 }}>⚠ SEGURIDAD</div>
+            Nunca expongas tu <span style={{ color: "var(--red)" }}>PRIVATE_KEY</span> en el código.
+            Usa variables de entorno en Railway y Vercel. El archivo{" "}
+            <span style={{ color: "var(--green)" }}>.env.local</span> está en{" "}
+            <span style={{ color: "var(--muted)" }}>.gitignore</span>.
+          </div>
         </div>
       </div>
+
     </div>
   );
 }
