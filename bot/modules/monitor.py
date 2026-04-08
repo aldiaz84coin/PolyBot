@@ -1,6 +1,13 @@
 """
 monitor.py — Loop principal del bot: ventana horaria, stop loss, resolución
 
+v11.5 — ALGORITHM_VERSION: modo Optimizado desde BD
+  - Nueva función _read_algo_version_from_db() análoga a _read_simulate_mode_from_db().
+  - run() lee algo_version al arrancar y lo recarga cada 60s junto con trading_mode.
+  - Modo 'optimized': bloquea T-5 y horas 12–16 UTC antes de execute_order().
+  - active_bet y upsert_operation incluyen 'algorithm_version' para tracking.
+  - Seleccionable desde Config en el dashboard sin reiniciar el bot.
+
 v11.4 — DATALAB: inserción en token_price_log y btc_candle_data
   - Importa get_full_1h_candle() desde .market_scanner.
   - Nueva constante _TOKEN_LOG_EVERY_N_CYCLES = 6 (~30s con interval=5s).
@@ -384,6 +391,34 @@ def _read_simulate_mode_from_db(current_simulate: bool, cfg: dict = None) -> boo
         return current_simulate
 
 
+# ── Polling de versión de algoritmo desde BD ─────────────────────────────────
+
+def _read_algo_version_from_db(current_version: str) -> str:
+    """
+    Lee algorithm_version desde Supabase (bot_config key='algorithm_version').
+    Valores válidos: 'standard' | 'optimized'.  Default: 'standard'.
+    Si DB no disponible o valor inválido, devuelve current_version sin cambios.
+    """
+    try:
+        db_val = db.get_config("algorithm_version", None)
+        if db_val is None:
+            return current_version
+        if db_val not in ("standard", "optimized"):
+            logger.warning(
+                f"[MONITOR] algorithm_version inválido en BD: '{db_val}' — ignorado"
+            )
+            return current_version
+        if db_val != current_version:
+            logger.warning(
+                f"[MONITOR] 🔄 Algoritmo cambiado en BD: "
+                f"{current_version.upper()} → {db_val.upper()}"
+            )
+        return db_val
+    except Exception as e:
+        logger.debug(f"[MONITOR] _read_algo_version_from_db: {e}")
+        return current_version
+
+
 # ── Loop principal ────────────────────────────────────────────────────────────
 
 def run(cfg: dict):
@@ -428,6 +463,10 @@ def run(cfg: dict):
 
         db.set_config("stake_usdc", str(stake))
         db.set_config("funder_address", cfg.get("polymarket", {}).get("funder", ""))
+
+    # v11.5: leer versión de algoritmo desde BD al arrancar
+    algo_version = _read_algo_version_from_db("standard") if db_ok else "standard"
+    logger.info(f"[MONITOR] 🧠 Algoritmo activo: {algo_version.upper()}")
 
     last_config_check = time.time()
 
@@ -492,6 +531,8 @@ def run(cfg: dict):
                 simulate = _read_simulate_mode_from_db(simulate, cfg)
                 # v10.9 FIX: sincronizar cfg para que execute_order() lea el modo correcto
                 cfg.setdefault("strategy", {})["simulate_mode"] = simulate
+                # v11.5: recargar versión de algoritmo desde BD
+                algo_version = _read_algo_version_from_db(algo_version)
 
                 # v11.1: releer stake desde BD por si el dashboard lo cambió
                 _db_stake = db.get_config("stake_usdc", None)
@@ -987,6 +1028,19 @@ def run(cfg: dict):
                     except Exception:
                         pass
 
+            # ── Filtro modo Optimizado ─────────────────────────────────────
+            if signal and signal.is_actionable and algo_version == "optimized":
+                _hour_now = datetime.now(timezone.utc).hour
+                _blocked  = None
+                if signal.window == "T-5":
+                    _blocked = "T-5 bloqueada en modo Optimizado"
+                elif 12 <= _hour_now <= 16:
+                    _blocked = f"Hora {_hour_now}h UTC bloqueada en modo Optimizado (12–16h)"
+                if _blocked:
+                    logger.info(f"[MONITOR] 🔶 [OPTIMIZADO] Señal descartada — {_blocked}")
+                    fired_window = signal.window
+                    signal = None
+
             # ── Ejecutar orden ─────────────────────────────────────────────
             if (
                 signal
@@ -1012,20 +1066,21 @@ def run(cfg: dict):
                         pct_est      = round((pnl_est / stake) * 100, 2) if stake > 0 else 0.0
 
                         active_bet = {
-                            "id":          result_order.get("id", f"bet-{int(time.time())}"),
-                            "ts_entrada":  datetime.now(timezone.utc).isoformat(),
-                            "direction":   signal.direction.value,
-                            "window":      signal.window,
-                            "entry":       price,
-                            "target":      target,
-                            "distance":    signal.distance,
-                            "umbral":      signal.umbral,
-                            "odds":        entry_odds,
-                            "stake":       stake,
-                            "market":      market,
-                            "market_slug": slug or "",
-                            "simulated":   simulate,
-                            "boost_readings": dict(_boost_readings),
+                            "id":                result_order.get("id", f"bet-{int(time.time())}"),
+                            "ts_entrada":        datetime.now(timezone.utc).isoformat(),
+                            "direction":         signal.direction.value,
+                            "window":            signal.window,
+                            "entry":             price,
+                            "target":            target,
+                            "distance":          signal.distance,
+                            "umbral":            signal.umbral,
+                            "odds":              entry_odds,
+                            "stake":             stake,
+                            "market":            market,
+                            "market_slug":       slug or "",
+                            "simulated":         simulate,
+                            "boost_readings":    dict(_boost_readings),
+                            "algorithm_version": algo_version,   # v11.5
                         }
                         ops_hoy      += 1
                         fired_window  = signal.window
@@ -1065,7 +1120,8 @@ def run(cfg: dict):
                                 "boost_t20": active_bet["boost_readings"].get("T-20"),
                                 "boost_t15": active_bet["boost_readings"].get("T-15"),
                                 "boost_t10": active_bet["boost_readings"].get("T-10"),
-                                "boost_t5":  active_bet["boost_readings"].get("T-5"),
+                                "boost_t5":          active_bet["boost_readings"].get("T-5"),
+                                "algorithm_version": active_bet.get("algorithm_version", "standard"),
                                 })
                         except Exception as e:
                             logger.warning(f"[MONITOR] ⚠ upsert_operation: {e}")
