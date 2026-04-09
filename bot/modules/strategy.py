@@ -289,6 +289,17 @@ def execute_order(signal: Signal, market: dict, cfg: dict) -> dict | None:
 
         logger.info(f"[ORDER] 📤 Enviando orden FOK BUY al CLOB...")
 
+        logger.info(
+          f"[ORDER] 🔍 Pre-firma:\n"
+          f"         token_id  : {token_id}\n"
+          f"         token_len : {len(str(token_id))}\n"
+          f"         neg_risk  : {neg_risk}\n"
+          f"         price     : {entry_odds}\n"
+          f"         size      : {size}\n"
+          f"         sig_type  : {sig_type}\n"
+          f"         funder    : {funder}"
+                )
+
         resp = client.create_and_post_order(
             order_args,
             CreateOrderOptions(neg_risk=neg_risk, tick_size=None),
