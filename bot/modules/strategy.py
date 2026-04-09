@@ -1,6 +1,11 @@
 """
 strategy.py — Lógica de decisión UP/DOWN y ejecución de órdenes CLOB
 
+v8.3 — DIAGNÓSTICO invalid signature
+  - Log [ORDER PRE-FIRMA] justo antes de create_and_post_order en modo REAL.
+    Muestra: token_id completo, len, neg_risk, price, size, sig_type, funder.
+    Permite identificar si neg_risk, token_id o sig_type son incorrectos.
+
 v8.2 — SELL POSITION (fallback de claim)
   - Nueva función pública sell_position(token_id, tokens, sell_price, cfg, market).
   - Usada por claimer.py como fallback cuando el claim on-chain falla tras
@@ -41,10 +46,14 @@ class Direction(str, Enum):
 
 
 WINDOWS = [
-    {"key": "T-20", "min": 17, "max": 22, "config": "t20_umbral_usd"},
-    {"key": "T-15", "min": 12, "max": 17, "config": "t15_umbral_usd"},
-    {"key": "T-10", "min":  7, "max": 12, "config": "t10_umbral_usd"},
-    {"key": "T-5",  "min":  2, "max":  7, "config": "t5_umbral_usd" },
+    {"key": "T-50", "min": 47, "max": 55, "config": "t50_umbral"},
+    {"key": "T-40", "min": 37, "max": 47, "config": "t40_umbral"},
+    {"key": "T-30", "min": 27, "max": 37, "config": "t30_umbral"},
+    {"key": "T-25", "min": 22, "max": 27, "config": "t25_umbral"},
+    {"key": "T-20", "min": 17, "max": 22, "config": "t20_umbral"},
+    {"key": "T-15", "min": 12, "max": 17, "config": "t15_umbral"},
+    {"key": "T-10", "min":  7, "max": 12, "config": "t10_umbral"},
+    {"key": "T-5",  "min":  2, "max":  7, "config": "t5_umbral" },
 ]
 
 
@@ -148,14 +157,13 @@ def evaluate(price: float, target: float, mins_left: float, cfg: dict) -> "Signa
     return signal
 
 
-# ── Helper: construye ClobClient con Level 2 ─────────────────────────────────
+# ── Cliente CLOB (Level 2) ────────────────────────────────────────────────────
 
 def _build_clob_client(cfg: dict):
     """
     Construye y devuelve un ClobClient autenticado (Level 2).
     Lanza ImportError si py_clob_client no está disponible.
     Lanza ValueError si faltan credenciales.
-    Devuelve (client, neg_risk=False) — neg_risk se lee del market por el caller.
     """
     from py_clob_client.client import ClobClient
     from py_clob_client.clob_types import ApiCreds
@@ -280,12 +288,29 @@ def execute_order(signal: Signal, market: dict, cfg: dict) -> dict | None:
         neg_risk = bool(market.get("neg_risk", False))
         client   = _build_clob_client(cfg)
 
+        sig_type = cfg["polymarket"]["signature_type"]
+        funder   = cfg["polymarket"]["funder"]
+
         order_args = OrderArgs(
             token_id=token_id,
             price=entry_odds,
             size=size,
             side="BUY",
         )
+
+        # ── v8.3: LOG DE DIAGNÓSTICO PRE-FIRMA ───────────────────────────
+        logger.info(
+            f"[ORDER] 🔍 PRE-FIRMA:\n"
+            f"         token_id  : {token_id}\n"
+            f"         token_len : {len(str(token_id))}\n"
+            f"         neg_risk  : {neg_risk}\n"
+            f"         price     : {entry_odds}\n"
+            f"         size      : {size}\n"
+            f"         sig_type  : {sig_type}\n"
+            f"         funder    : {funder}\n"
+            f"         market_nr : {market.get('neg_risk', '(campo ausente)')}"
+        )
+        # ─────────────────────────────────────────────────────────────────
 
         logger.info(f"[ORDER] 📤 Enviando orden FOK BUY al CLOB...")
 
