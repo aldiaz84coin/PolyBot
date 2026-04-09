@@ -1,27 +1,17 @@
 """
 strategy.py — Lógica de decisión UP/DOWN y ejecución de órdenes CLOB
 
+v8.3 — CTF Exchange V2 (abril 2026) + feeRateBps (febrero 2026)
+  - fee_rate_bps=156 añadido a todos los OrderArgs (BUY y SELL).
+    Polymarket exige este campo desde feb 2026; sin él las órdenes son
+    rechazadas. 156 bps = 1.56% (máximo taker fee; el cargo real es menor
+    o cero para makers — el campo es solo un acknowledgment de aceptación).
+  - SDK mínimo: py-clob-client>=0.19.0 (requerido para CTF Exchange V2).
+
 v8.2 — SELL POSITION (fallback de claim)
-  - Nueva función pública sell_position(token_id, tokens, sell_price, cfg, market).
-  - Usada por claimer.py como fallback cuando el claim on-chain falla tras
-    agotar todos los reintentos: vende los tokens ganadores en el CLOB al
-    precio de mercado actual (~0.999) recuperando casi el 100% del valor.
-  - Comparte la misma infraestructura de credenciales y ClobClient que execute_order().
-  - side="SELL" con los tokens del lado ganador como size.
-
 v8.1 — FIX CRÍTICO: id único en execute_order
-  - Modo simulado (simulate_mode=True): genera uuid propio → cada operación
-    tiene id distinto → upsert_operation no sobrescribe filas anteriores.
-  - Modo simulado por ImportError: igual, uuid generado.
-  - Modo real (CLOB): normaliza id desde resp.get("orderID") o resp.get("id");
-    si ninguno presente, genera uuid para garantizar unicidad.
-
-v8.0 cambios:
-  - min_retorno_pct: retorno mínimo estimado para entrar en una apuesta.
-
-v3.0 cambios:
-  - Modo SIMULADO explícito vía cfg["strategy"]["simulate_mode"].
-  - execute_order siempre devuelve "odds" (precio real del token).
+v8.0 — min_retorno_pct
+v3.0 — Modo SIMULADO explícito
 
 Destino: bot/modules/strategy.py
 """
@@ -70,19 +60,14 @@ def get_active_window(mins_left: float, cfg: dict) -> dict | None:
     return None
 
 
-_last_window: str | None = None   # para detectar transiciones de ventana
+_last_window: str | None = None
 
 
 def evaluate(price: float, target: float, mins_left: float, cfg: dict) -> "Signal | None":
-    """
-    Evalúa si hay señal en la ventana activa.
-    Devuelve Signal o None si estamos fuera de ventana.
-    """
     global _last_window
 
     window = get_active_window(mins_left, cfg)
 
-    # ── Fuera de ventana ──────────────────────────────────────────────────
     if window is None:
         if _last_window is not None:
             logger.info(
@@ -94,7 +79,6 @@ def evaluate(price: float, target: float, mins_left: float, cfg: dict) -> "Signa
             logger.debug(f"[STRATEGY] Fuera de ventana — mins_left={mins_left:.1f}")
         return None
 
-    # ── Transición de ventana ─────────────────────────────────────────────
     if _last_window != window["key"]:
         prev = _last_window or "—"
         logger.info(
@@ -122,7 +106,6 @@ def evaluate(price: float, target: float, mins_left: float, cfg: dict) -> "Signa
         window=window["key"],
     )
 
-    # ── Log detallado de evaluación ───────────────────────────────────────
     dist_abs  = abs(distance)
     dist_sign = "+" if distance >= 0 else ""
     action    = "✅ ACCIONABLE" if signal.is_actionable else "⏳ WAIT"
@@ -151,12 +134,6 @@ def evaluate(price: float, target: float, mins_left: float, cfg: dict) -> "Signa
 # ── Helper: construye ClobClient con Level 2 ─────────────────────────────────
 
 def _build_clob_client(cfg: dict):
-    """
-    Construye y devuelve un ClobClient autenticado (Level 2).
-    Lanza ImportError si py_clob_client no está disponible.
-    Lanza ValueError si faltan credenciales.
-    Devuelve (client, neg_risk=False) — neg_risk se lee del market por el caller.
-    """
     from py_clob_client.client import ClobClient
     from py_clob_client.clob_types import ApiCreds
 
@@ -190,18 +167,9 @@ def _build_clob_client(cfg: dict):
 
 def execute_order(signal: Signal, market: dict, cfg: dict) -> dict | None:
     """
-    Ejecuta una orden Market FOK BUY en el CLOB de Polymarket.
+    Ejecuta una orden BUY en el CLOB de Polymarket.
 
-    Devuelve el resultado de la orden o None si falla.
-    Siempre incluye:
-      - "id"        : identificador único (uuid si simulado o CLOB no devuelve id)
-      - "odds"      : precio real del token en Polymarket
-      - "simulated" : bool
-
-    MODO SIMULADO (cfg["strategy"]["simulate_mode"] = True):
-      No se conecta al CLOB. Registra la operación como si fuera real,
-      con la misma estructura de respuesta, marcada con simulated=True.
-      Activar con env var SIMULATE_MODE=true en Railway.
+    v8.3: fee_rate_bps=156 incluido en OrderArgs — requerido desde feb 2026.
     """
     simulate_mode = cfg.get("strategy", {}).get("simulate_mode", False)
     stake         = cfg["capital"]["stake_usdc"]
@@ -210,9 +178,8 @@ def execute_order(signal: Signal, market: dict, cfg: dict) -> dict | None:
     if not isinstance(tokens_raw, list):
         tokens_raw = []
 
-    direction_val = signal.direction.value   # "UP" o "DOWN"
+    direction_val = signal.direction.value
 
-    # Localizar el token correcto (YES para UP, NO para DOWN)
     token_id   = None
     entry_odds = 0.5
     for t in tokens_raw:
@@ -235,7 +202,6 @@ def execute_order(signal: Signal, market: dict, cfg: dict) -> dict | None:
 
     size = round(stake / max(entry_odds, 0.001), 4)
 
-    # ── Filtro min_retorno_pct ────────────────────────────────────────────
     min_ret_pct = cfg.get("strategy", {}).get("min_retorno_pct", 0)
     if min_ret_pct > 0:
         ret_est_pct = ((1.0 / max(entry_odds, 0.001)) - 1.0) * 100
@@ -254,7 +220,6 @@ def execute_order(signal: Signal, market: dict, cfg: dict) -> dict | None:
         f"         Coste est.: ${entry_odds * size:.2f} USDC"
     )
 
-    # ── MODO SIMULADO ─────────────────────────────────────────────────────
     if simulate_mode:
         op_id = str(uuid.uuid4())
         logger.warning(
@@ -273,7 +238,6 @@ def execute_order(signal: Signal, market: dict, cfg: dict) -> dict | None:
             "odds":      entry_odds,
         }
 
-    # ── MODO REAL ─────────────────────────────────────────────────────────
     try:
         from py_clob_client.clob_types import OrderArgs, CreateOrderOptions
 
@@ -285,18 +249,10 @@ def execute_order(signal: Signal, market: dict, cfg: dict) -> dict | None:
             price=entry_odds,
             size=size,
             side="BUY",
+            fee_rate_bps=156,   # ← v8.3: obligatorio desde feb 2026 (CTF Exchange V2)
         )
 
-        logger.info(f"[ORDER] 📤 Enviando orden FOK BUY al CLOB...")
-
-        logger.info(
-          f"[ORDER] 🔍 Pre-firma:\n"
-          f"         token_id  : {token_id}\n"
-          f"         token_len : {len(str(token_id))}\n"
-          f"         neg_risk  : {neg_risk}\n"
-          f"         price     : {entry_odds}\n"
-          f"         size      : {size}\n"
-                     )
+        logger.info(f"[ORDER] 📤 Enviando orden FOK BUY al CLOB (fee_rate_bps=156)...")
 
         resp = client.create_and_post_order(
             order_args,
@@ -366,17 +322,7 @@ def sell_position(
     market:     dict,
 ) -> dict | None:
     """
-    v8.2: Vende tokens ganadores en el CLOB (fallback cuando el claim on-chain falla).
-
-    Parámetros:
-      token_id   : ID del token a vender (YES si UP, NO si DOWN)
-      tokens     : cantidad de tokens a vender
-      sell_price : precio de venta (ej. midpoint - margen, ~0.990)
-      cfg        : configuración del bot (mismas credenciales que execute_order)
-      market     : dict del mercado activo (para neg_risk)
-
-    Devuelve el dict de respuesta del CLOB o None si falla.
-    Llamada exclusivamente desde claimer._sell_fallback_clob().
+    v8.3: fee_rate_bps=0 en SELL — los makers no pagan fee en CTF Exchange V2.
     """
     logger.info(
         f"[SELL] Preparando orden SELL\n"
@@ -397,9 +343,10 @@ def sell_position(
             price=sell_price,
             size=tokens,
             side="SELL",
+            fee_rate_bps=0,     # ← v8.3: makers sin fee en CTF Exchange V2
         )
 
-        logger.info(f"[SELL] 📤 Enviando orden SELL al CLOB...")
+        logger.info(f"[SELL] 📤 Enviando orden SELL al CLOB (fee_rate_bps=0)...")
 
         resp = client.create_and_post_order(
             order_args,
