@@ -249,11 +249,11 @@ def execute_order(signal: Signal, market: dict, cfg: dict) -> dict | None:
             price=entry_odds,
             size=size,
             side="BUY",
-            fee_rate_bps=1000,
+            #fee_rate_bps=0,
         #fee_rate_bps=156,   # ← v8.3: obligatorio desde feb 2026 (CTF Exchange V2)
         )
 
-        logger.info(f"[ORDER] 📤 Enviando orden FOK BUY al CLOB (fee_rate_bps=1000)...")
+        logger.info(f"[ORDER] 📤 Enviando orden FOK BUY al CLOB (fee_rate_bps=0?, o no poner)...")
 
         resp = client.create_and_post_order(
             order_args,
