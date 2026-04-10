@@ -1,17 +1,18 @@
 """
 strategy.py — Lógica de decisión UP/DOWN y ejecución de órdenes CLOB
 
-v8.3 — CTF Exchange V2 (abril 2026) + feeRateBps (febrero 2026)
-  - fee_rate_bps=156 añadido a todos los OrderArgs (BUY y SELL).
-    Polymarket exige este campo desde feb 2026; sin él las órdenes son
-    rechazadas. 156 bps = 1.56% (máximo taker fee; el cargo real es menor
-    o cero para makers — el campo es solo un acknowledgment de aceptación).
-  - SDK mínimo: py-clob-client>=0.19.0 (requerido para CTF Exchange V2).
+v8.4 — FIX precio > 0.99 + fee_rate_bps dinámico
+  - _fetch_fee_rate(): consulta GET /fee-rate?token_id=... antes de cada orden.
+    El campo real en la respuesta es "base_fee" (no fee_rate_bps).
+    Fallback: 0 si el endpoint no responde.
+  - execute_order(): descarta órdenes con price > 0.99 o < 0.01.
+    El SDK rechaza "price (x), min: 0.01 - max: 0.99".
+    Un token a 0.99+ indica mercado casi resuelto — no tiene sentido entrar.
 
-v8.2 — SELL POSITION (fallback de claim)
-v8.1 — FIX CRÍTICO: id único en execute_order
-v8.0 — min_retorno_pct
-v3.0 — Modo SIMULADO explícito
+v8.3 — CTF Exchange V2 (abril 2026) + feeRateBps (febrero 2026)
+  - fee_rate_bps=156 añadido a todos los OrderArgs BUY.
+  - fee_rate_bps=0   añadido a todos los OrderArgs SELL.
+  - SDK mínimo: py-clob-client>=0.19.0
 
 Destino: bot/modules/strategy.py
 """
@@ -20,6 +21,8 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
+
+import requests
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +39,10 @@ WINDOWS = [
     {"key": "T-10", "min":  7, "max": 12, "config": "t10_umbral_usd"},
     {"key": "T-5",  "min":  2, "max":  7, "config": "t5_umbral_usd" },
 ]
+
+# Límites de precio que acepta el CLOB de Polymarket
+_CLOB_PRICE_MIN = 0.01
+_CLOB_PRICE_MAX = 0.99
 
 
 @dataclass
@@ -131,6 +138,48 @@ def evaluate(price: float, target: float, mins_left: float, cfg: dict) -> "Signa
     return signal
 
 
+# ── Helper: fee rate dinámico desde CLOB ─────────────────────────────────────
+
+def _fetch_fee_rate(token_id: str) -> int:
+    """
+    GET /fee-rate?token_id=... → feeRateBps real del mercado.
+
+    v8.4: campo real en la respuesta es "base_fee" (no fee_rate_bps ni feeRateBps,
+    aunque se comprueban todos por si el API cambia).
+    Docs: https://docs.polymarket.com/trading/fees
+    Fallback: 0 si el endpoint no responde (sin fee).
+    """
+    try:
+        r = requests.get(
+            "https://clob.polymarket.com/fee-rate",
+            params={"token_id": token_id},
+            timeout=8,
+        )
+        if not r.ok:
+            logger.warning(
+                f"[ORDER] /fee-rate respondió {r.status_code} para token "
+                f"{token_id[:16]}… — usando fee=0"
+            )
+            return 0
+        data = r.json()
+        # El campo oficial es "base_fee"; los demás son aliases defensivos
+        raw_rate = (
+            data.get("base_fee")
+            or data.get("fee_rate_bps")
+            or data.get("feeRateBps")
+            or 0
+        )
+        rate = int(raw_rate)
+        logger.info(
+            f"[ORDER] feeRateBps dinámico = {rate} "
+            f"para token {token_id[:16]}…  (raw: {data})"
+        )
+        return rate
+    except Exception as e:
+        logger.warning(f"[ORDER] No se pudo obtener fee-rate: {e} — usando fee=0")
+        return 0
+
+
 # ── Helper: construye ClobClient con Level 2 ─────────────────────────────────
 
 def _build_clob_client(cfg: dict):
@@ -152,7 +201,7 @@ def _build_clob_client(cfg: dict):
         )
 
     creds = ApiCreds(api_key=api_key, api_secret=api_secret, api_passphrase=api_pass)
-    client = ClobClient(
+    return ClobClient(
         host,
         key=private_key,
         chain_id=chain_id,
@@ -160,7 +209,6 @@ def _build_clob_client(cfg: dict):
         funder=funder,
         creds=creds,
     )
-    return client
 
 
 # ── Orden de compra (BUY) ─────────────────────────────────────────────────────
@@ -169,7 +217,12 @@ def execute_order(signal: Signal, market: dict, cfg: dict) -> dict | None:
     """
     Ejecuta una orden BUY en el CLOB de Polymarket.
 
-    v8.3: fee_rate_bps=156 incluido en OrderArgs — requerido desde feb 2026.
+    v8.4:
+      - Descarta órdenes con price fuera de [0.01, 0.99] (límites del CLOB).
+        Un token > 0.99 indica mercado casi resuelto — entrar no tiene sentido.
+      - fee_rate_bps consultado dinámicamente desde /fee-rate?token_id=...
+        El campo real es "base_fee". Fallback 0 si el endpoint no responde.
+        En modo simulado no se realiza la llamada (fee=0).
     """
     simulate_mode = cfg.get("strategy", {}).get("simulate_mode", False)
     stake         = cfg["capital"]["stake_usdc"]
@@ -200,8 +253,24 @@ def execute_order(signal: Signal, market: dict, cfg: dict) -> dict | None:
         )
         return None
 
+    # ── v8.4: Validación de precio — el CLOB rechaza fuera de [0.01, 0.99] ──
+    if entry_odds > _CLOB_PRICE_MAX:
+        logger.warning(
+            f"[ORDER] ⚠ Odds {entry_odds:.4f} > {_CLOB_PRICE_MAX} "
+            f"(mercado casi resuelto) — orden descartada para {direction_val}"
+        )
+        return None
+
+    if entry_odds < _CLOB_PRICE_MIN:
+        logger.warning(
+            f"[ORDER] ⚠ Odds {entry_odds:.4f} < {_CLOB_PRICE_MIN} "
+            f"— orden descartada para {direction_val}"
+        )
+        return None
+
     size = round(stake / max(entry_odds, 0.001), 4)
 
+    # ── Retorno mínimo estimado ───────────────────────────────────────────────
     min_ret_pct = cfg.get("strategy", {}).get("min_retorno_pct", 0)
     if min_ret_pct > 0:
         ret_est_pct = ((1.0 / max(entry_odds, 0.001)) - 1.0) * 100
@@ -215,7 +284,7 @@ def execute_order(signal: Signal, market: dict, cfg: dict) -> dict | None:
     logger.info(
         f"[ORDER] {'[SIMULADO] ' if simulate_mode else ''}Preparando orden {direction_val}\n"
         f"         Token ID  : {token_id[:16]}...\n"
-        f"         Odds impl.: {entry_odds:.4f}  ({entry_odds*100:.1f}%)\n"
+        f"         Odds impl.: {entry_odds:.4f}  ({entry_odds * 100:.1f}%)\n"
         f"         Size      : {size:.4f} tokens\n"
         f"         Coste est.: ${entry_odds * size:.2f} USDC"
     )
@@ -244,30 +313,31 @@ def execute_order(signal: Signal, market: dict, cfg: dict) -> dict | None:
         neg_risk = bool(market.get("neg_risk", False))
         client   = _build_clob_client(cfg)
 
+        # v8.4: fee_rate_bps dinámico — consulta /fee-rate?token_id=...
+        fee_rate_bps = _fetch_fee_rate(token_id)
+
         order_args = OrderArgs(
             token_id=token_id,
             price=entry_odds,
             size=size,
             side="BUY",
-            #fee_rate_bps=0,
-        #fee_rate_bps=156,   # ← v8.3: obligatorio desde feb 2026 (CTF Exchange V2)
+            fee_rate_bps=fee_rate_bps,   # ← dinámico, no hardcodeado
         )
 
-        logger.info(f"[ORDER] 📤 Enviando orden FOK BUY al CLOB (fee_rate_bps=0?, o no poner)...")
+        logger.info(
+            f"[ORDER] 📤 Enviando orden FOK BUY al CLOB "
+            f"(fee_rate_bps={fee_rate_bps})..."
+        )
 
         resp = client.create_and_post_order(
             order_args,
             CreateOrderOptions(neg_risk=neg_risk, tick_size=None),
         )
 
-        order_id = (
-            resp.get("orderID")
-            or resp.get("id")
-            or str(uuid.uuid4())
-        )
-        status     = resp.get("status", "—")
-        filled     = resp.get("sizeFilled", resp.get("size_filled", "—"))
-        fill_price = resp.get("avgPrice") or resp.get("price") or resp.get("avg_price")
+        order_id    = resp.get("orderID") or resp.get("id") or str(uuid.uuid4())
+        status      = resp.get("status", "—")
+        filled      = resp.get("sizeFilled", resp.get("size_filled", "—"))
+        fill_price  = resp.get("avgPrice") or resp.get("price") or resp.get("avg_price")
         actual_odds = float(fill_price) if fill_price else entry_odds
 
         logger.info(
@@ -323,7 +393,8 @@ def sell_position(
     market:     dict,
 ) -> dict | None:
     """
-    v8.3: fee_rate_bps=0 en SELL — los makers no pagan fee en CTF Exchange V2.
+    v8.4: fee_rate_bps=0 en SELL — makers sin fee en CTF Exchange V2.
+    (SELL de posiciones ganadoras: somos makers, fee = 0)
     """
     logger.info(
         f"[SELL] Preparando orden SELL\n"
@@ -344,47 +415,28 @@ def sell_position(
             price=sell_price,
             size=tokens,
             side="SELL",
-            fee_rate_bps=0,     # ← v8.3: makers sin fee en CTF Exchange V2
+            fee_rate_bps=0,   # makers sin fee en CTF Exchange V2
         )
 
         logger.info(f"[SELL] 📤 Enviando orden SELL al CLOB (fee_rate_bps=0)...")
 
-        resp = client.create_and_post_order(
+        resp     = client.create_and_post_order(
             order_args,
             CreateOrderOptions(neg_risk=neg_risk, tick_size=None),
         )
-
-        order_id = (
-            resp.get("orderID")
-            or resp.get("id")
-            or str(uuid.uuid4())
-        )
-        status = resp.get("status", "—")
-        filled = resp.get("sizeFilled", resp.get("size_filled", "—"))
+        order_id = resp.get("orderID") or resp.get("id") or str(uuid.uuid4())
 
         logger.info(
-            f"[SELL] ✅ Orden SELL ejecutada:\n"
-            f"       Order ID : {order_id}\n"
-            f"       Status   : {status}\n"
-            f"       Filled   : {filled}\n"
-            f"       Raw resp : {resp}"
+            f"[SELL] ✅ SELL ejecutado — id={order_id}  status={resp.get('status', '—')}"
         )
-
         return {**resp, "id": order_id, "price": sell_price, "tokens": tokens}
 
     except ImportError:
-        logger.error("[SELL] ❌ py-clob-client no disponible — SELL no ejecutado")
+        logger.error("[SELL] ❌ py-clob-client no disponible")
         return None
-
     except ValueError as e:
         logger.error(f"[SELL] ❌ Credenciales L2: {e}")
         return None
-
     except Exception as e:
-        logger.error(
-            f"[SELL] ❌ Error ejecutando SELL en CLOB:\n"
-            f"       Tipo  : {type(e).__name__}\n"
-            f"       Error : {e}",
-            exc_info=True,
-        )
+        logger.error(f"[SELL] ❌ Error SELL CLOB: {type(e).__name__}: {e}", exc_info=True)
         return None
