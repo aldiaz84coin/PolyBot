@@ -31,8 +31,12 @@ def setup_logging(cfg: dict):
             logging.FileHandler(log_file, encoding="utf-8"),
         ],
     )
-
-
+    
+# Silenciar librerías de bajo nivel HTTP/2
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.getLogger("hpack").setLevel(logging.WARNING)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    
 def main():
     print("=" * 60)
     print("  POLYMARKET BTC BOT")
