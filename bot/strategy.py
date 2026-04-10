@@ -23,7 +23,8 @@ class Direction(str, Enum):
     WAIT = "WAIT"
 
 
-WINDOWS = [
+WINDOWS = 
+    {"key": "T-25", "min": 22, "max": 27, "config": "t25_umbral_usd"},
     {"key": "T-20", "min": 17, "max": 22, "config": "t20_umbral_usd"},
     {"key": "T-15", "min": 12, "max": 17, "config": "t15_umbral_usd"},
     {"key": "T-10", "min":  7, "max": 12, "config": "t10_umbral_usd"},
