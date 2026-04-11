@@ -1,18 +1,31 @@
 """
 strategy.py — Lógica de decisión UP/DOWN y ejecución de órdenes CLOB
 
-v8.4 — FIX precio > 0.99 + fee_rate_bps dinámico
-  - _fetch_fee_rate(): consulta GET /fee-rate?token_id=... antes de cada orden.
-    El campo real en la respuesta es "base_fee" (no fee_rate_bps).
-    Fallback: 0 si el endpoint no responde.
-  - execute_order(): descarta órdenes con price > 0.99 o < 0.01.
-    El SDK rechaza "price (x), min: 0.01 - max: 0.99".
-    Un token a 0.99+ indica mercado casi resuelto — no tiene sentido entrar.
+v8.3 — DIAGNÓSTICO firma en _build_clob_client
+  - Log WARNING con signer, funder, sig_type, api_key en cada intento de orden.
+  - Eliminar el bloque DIAGNÓSTICO una vez confirmados los valores correctos.
 
-v8.3 — CTF Exchange V2 (abril 2026) + feeRateBps (febrero 2026)
-  - fee_rate_bps=156 añadido a todos los OrderArgs BUY.
-  - fee_rate_bps=0   añadido a todos los OrderArgs SELL.
-  - SDK mínimo: py-clob-client>=0.19.0
+v8.2 — SELL POSITION (fallback de claim)
+  - Nueva función pública sell_position(token_id, tokens, sell_price, cfg, market).
+  - Usada por claimer.py como fallback cuando el claim on-chain falla tras
+    agotar todos los reintentos: vende los tokens ganadores en el CLOB al
+    precio de mercado actual (~0.999) recuperando casi el 100% del valor.
+  - Comparte la misma infraestructura de credenciales y ClobClient que execute_order().
+  - side="SELL" con los tokens del lado ganador como size.
+
+v8.1 — FIX CRÍTICO: id único en execute_order
+  - Modo simulado (simulate_mode=True): genera uuid propio → cada operación
+    tiene id distinto → upsert_operation no sobrescribe filas anteriores.
+  - Modo simulado por ImportError: igual, uuid generado.
+  - Modo real (CLOB): normaliza id desde resp.get("orderID") o resp.get("id");
+    si ninguno presente, genera uuid para garantizar unicidad.
+
+v8.0 cambios:
+  - min_retorno_pct: retorno mínimo estimado para entrar en una apuesta.
+
+v3.0 cambios:
+  - Modo SIMULADO explícito vía cfg["strategy"]["simulate_mode"].
+  - execute_order siempre devuelve "odds" (precio real del token).
 
 Destino: bot/modules/strategy.py
 """
@@ -21,8 +34,6 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-
-import requests
 
 logger = logging.getLogger(__name__)
 
@@ -34,16 +45,11 @@ class Direction(str, Enum):
 
 
 WINDOWS = [
-   # {"key": "T-25", "min": 22, "max": 27, "config": "t25_umbral_usd"},
     {"key": "T-20", "min": 17, "max": 22, "config": "t20_umbral_usd"},
     {"key": "T-15", "min": 12, "max": 17, "config": "t15_umbral_usd"},
     {"key": "T-10", "min":  7, "max": 12, "config": "t10_umbral_usd"},
     {"key": "T-5",  "min":  2, "max":  7, "config": "t5_umbral_usd" },
 ]
-
-# Límites de precio que acepta el CLOB de Polymarket
-_CLOB_PRICE_MIN = 0.01
-_CLOB_PRICE_MAX = 0.99
 
 
 @dataclass
@@ -68,14 +74,19 @@ def get_active_window(mins_left: float, cfg: dict) -> dict | None:
     return None
 
 
-_last_window: str | None = None
+_last_window: str | None = None   # para detectar transiciones de ventana
 
 
 def evaluate(price: float, target: float, mins_left: float, cfg: dict) -> "Signal | None":
+    """
+    Evalúa si hay señal en la ventana activa.
+    Devuelve Signal o None si estamos fuera de ventana.
+    """
     global _last_window
 
     window = get_active_window(mins_left, cfg)
 
+    # ── Fuera de ventana ──────────────────────────────────────────────────
     if window is None:
         if _last_window is not None:
             logger.info(
@@ -87,6 +98,7 @@ def evaluate(price: float, target: float, mins_left: float, cfg: dict) -> "Signa
             logger.debug(f"[STRATEGY] Fuera de ventana — mins_left={mins_left:.1f}")
         return None
 
+    # ── Transición de ventana ─────────────────────────────────────────────
     if _last_window != window["key"]:
         prev = _last_window or "—"
         logger.info(
@@ -114,6 +126,7 @@ def evaluate(price: float, target: float, mins_left: float, cfg: dict) -> "Signa
         window=window["key"],
     )
 
+    # ── Log detallado de evaluación ───────────────────────────────────────
     dist_abs  = abs(distance)
     dist_sign = "+" if distance >= 0 else ""
     action    = "✅ ACCIONABLE" if signal.is_actionable else "⏳ WAIT"
@@ -139,51 +152,14 @@ def evaluate(price: float, target: float, mins_left: float, cfg: dict) -> "Signa
     return signal
 
 
-# ── Helper: fee rate dinámico desde CLOB ─────────────────────────────────────
-
-def _fetch_fee_rate(token_id: str) -> int:
-    """
-    GET /fee-rate?token_id=... → feeRateBps real del mercado.
-
-    v8.4: campo real en la respuesta es "base_fee" (no fee_rate_bps ni feeRateBps,
-    aunque se comprueban todos por si el API cambia).
-    Docs: https://docs.polymarket.com/trading/fees
-    Fallback: 0 si el endpoint no responde (sin fee).
-    """
-    try:
-        r = requests.get(
-            "https://clob.polymarket.com/fee-rate",
-            params={"token_id": token_id},
-            timeout=8,
-        )
-        if not r.ok:
-            logger.warning(
-                f"[ORDER] /fee-rate respondió {r.status_code} para token "
-                f"{token_id[:16]}… — usando fee=0"
-            )
-            return 0
-        data = r.json()
-        # El campo oficial es "base_fee"; los demás son aliases defensivos
-        raw_rate = (
-            data.get("base_fee")
-            or data.get("fee_rate_bps")
-            or data.get("feeRateBps")
-            or 0
-        )
-        rate = int(raw_rate)
-        logger.info(
-            f"[ORDER] feeRateBps dinámico = {rate} "
-            f"para token {token_id[:16]}…  (raw: {data})"
-        )
-        return rate
-    except Exception as e:
-        logger.warning(f"[ORDER] No se pudo obtener fee-rate: {e} — usando fee=0")
-        return 0
-
-
 # ── Helper: construye ClobClient con Level 2 ─────────────────────────────────
 
 def _build_clob_client(cfg: dict):
+    """
+    Construye y devuelve un ClobClient autenticado (Level 2).
+    Lanza ImportError si py_clob_client no está disponible.
+    Lanza ValueError si faltan credenciales.
+    """
     from py_clob_client.client import ClobClient
     from py_clob_client.clob_types import ApiCreds
 
@@ -201,8 +177,25 @@ def _build_clob_client(cfg: dict):
             "Faltan credenciales Level 2: polymarket.api_key / api_secret / api_passphrase"
         )
 
+    # ── DIAGNÓSTICO — eliminar tras confirmar funder y sig_type correctos ──
+    try:
+        from eth_account import Account
+        signer_address = Account.from_key(private_key).address
+    except Exception:
+        signer_address = "error-derivando-address"
+
+    logger.warning(
+        f"[ORDER] 🔑 Diagnóstico firma:\n"
+        f"         sig_type  = {sig_type}\n"
+        f"         signer    = {signer_address}\n"
+        f"         funder    = {funder}\n"
+        f"         api_key   = {api_key[:8]}…\n"
+        f"         chain_id  = {chain_id}"
+    )
+    # ── FIN DIAGNÓSTICO ────────────────────────────────────────────────────
+
     creds = ApiCreds(api_key=api_key, api_secret=api_secret, api_passphrase=api_pass)
-    return ClobClient(
+    client = ClobClient(
         host,
         key=private_key,
         chain_id=chain_id,
@@ -210,86 +203,120 @@ def _build_clob_client(cfg: dict):
         funder=funder,
         creds=creds,
     )
+    return client
 
 
 # ── Orden de compra (BUY) ─────────────────────────────────────────────────────
 
 def execute_order(signal: Signal, market: dict, cfg: dict) -> dict | None:
     """
-    Ejecuta una orden BUY en el CLOB de Polymarket.
+    Ejecuta una orden Market FOK BUY en el CLOB de Polymarket.
 
-    v8.4:
-      - Descarta órdenes con price fuera de [0.01, 0.99] (límites del CLOB).
-        Un token > 0.99 indica mercado casi resuelto — entrar no tiene sentido.
-      - fee_rate_bps consultado dinámicamente desde /fee-rate?token_id=...
-        El campo real es "base_fee". Fallback 0 si el endpoint no responde.
-        En modo simulado no se realiza la llamada (fee=0).
+    Devuelve el resultado de la orden o None si falla.
+    Siempre incluye:
+      - "id"        : identificador único (uuid si simulado o CLOB no devuelve id)
+      - "odds"      : precio real del token en Polymarket
+      - "simulated" : bool
+
+    MODO SIMULADO (cfg["strategy"]["simulate_mode"] = True):
+      No se conecta al CLOB. Registra la operación como si fuera real,
+      con la misma estructura de respuesta, marcada con simulated=True.
+      Activar con env var SIMULATE_MODE=true en Railway.
+
+    MARGEN MÍNIMO (cfg["strategy"]["min_retorno_pct"]):
+      Si el retorno estimado (1/odds - 1)*100 es inferior al mínimo,
+      la orden se descarta (devuelve None) antes de ejecutarse.
     """
-    simulate_mode = cfg.get("strategy", {}).get("simulate_mode", False)
-    stake         = cfg["capital"]["stake_usdc"]
+    simulate_mode  = cfg.get("strategy", {}).get("simulate_mode", False)
+    stake          = float(cfg.get("capital", {}).get("stake_usdc", 2.0))
+    min_retorno    = float(cfg.get("strategy", {}).get("min_retorno_pct", 0))
+    direction_val  = signal.direction.value
 
-    tokens_raw = market.get("tokens", [])
-    if not isinstance(tokens_raw, list):
-        tokens_raw = []
+    # ── Seleccionar token según dirección ─────────────────────────────────
+    # Prioridad: market["tokens"] (lista con outcome) → clobTokenIds (índice)
+    tokens_list = market.get("tokens", [])
+    token_id    = None
 
-    direction_val = signal.direction.value
-
-    token_id   = None
-    entry_odds = 0.5
-    for t in tokens_raw:
-        outcome = t.get("outcome", "").lower()
-        if direction_val == "UP" and outcome == "yes":
-            token_id   = t.get("token_id")
-            entry_odds = float(t.get("price", 0.5))
-            break
-        if direction_val == "DOWN" and outcome == "no":
-            token_id   = t.get("token_id")
-            entry_odds = float(t.get("price", 0.5))
-            break
+    if isinstance(tokens_list, list) and tokens_list:
+        target_outcome = "yes" if signal.direction == Direction.UP else "no"
+        for t in tokens_list:
+            if t.get("outcome", "").lower() == target_outcome:
+                token_id = t.get("token_id")
+                break
 
     if not token_id:
-        logger.error(
-            f"[ORDER] ❌ No se encontró token_id para {direction_val} — "
-            f"tokens en mercado: {[t.get('outcome') for t in tokens_raw]}"
-        )
+        # fallback: clobTokenIds[0]=YES/UP, [1]=NO/DOWN
+        clob_raw = market.get("clobTokenIds")
+        if clob_raw:
+            import json as _json
+            try:
+                clob_ids = _json.loads(clob_raw) if isinstance(clob_raw, str) else clob_raw
+                if isinstance(clob_ids, list) and len(clob_ids) >= 2:
+                    token_id = clob_ids[0] if signal.direction == Direction.UP else clob_ids[1]
+            except Exception:
+                pass
+
+    # Soporte para test_order (token_id inyectado directamente en el market dict)
+    token_id = market.get("_test_token_id") or token_id
+
+    if not token_id:
+        logger.error("[ORDER] ❌ No se pudo obtener token_id del mercado")
         return None
 
-    # ── v8.4: Validación de precio — el CLOB rechaza fuera de [0.01, 0.99] ──
-    if entry_odds > _CLOB_PRICE_MAX:
-        logger.warning(
-            f"[ORDER] ⚠ Odds {entry_odds:.4f} > {_CLOB_PRICE_MAX} "
-            f"(mercado casi resuelto) — orden descartada para {direction_val}"
+    # ── Precio CLOB real ──────────────────────────────────────────────────
+    try:
+        import requests as _req
+        r = _req.get(
+            f"https://clob.polymarket.com/midpoint?token_id={token_id}",
+            timeout=5,
         )
+        entry_odds = float(r.json().get("mid", 0))
+    except Exception as e:
+        logger.warning(f"[ORDER] No se pudo obtener midpoint CLOB: {e} — usando signal.distance como fallback")
+        entry_odds = 0.0
+
+    if entry_odds <= 0:
+        logger.error("[ORDER] ❌ Precio CLOB inválido (0) — orden cancelada")
         return None
 
-    if entry_odds < _CLOB_PRICE_MIN:
-        logger.warning(
-            f"[ORDER] ⚠ Odds {entry_odds:.4f} < {_CLOB_PRICE_MIN} "
-            f"— orden descartada para {direction_val}"
-        )
-        return None
-
-    size = round(stake / max(entry_odds, 0.001), 4)
-
-    # ── Retorno mínimo estimado ───────────────────────────────────────────────
-    min_ret_pct = cfg.get("strategy", {}).get("min_retorno_pct", 0)
-    if min_ret_pct > 0:
-        ret_est_pct = ((1.0 / max(entry_odds, 0.001)) - 1.0) * 100
-        if ret_est_pct < min_ret_pct:
-            logger.info(
-                f"[ORDER] ⏭ Retorno estimado {ret_est_pct:.1f}% < mínimo {min_ret_pct}% — "
-                f"orden no ejecutada (odds={entry_odds:.4f})"
+    # ── Retorno mínimo ────────────────────────────────────────────────────
+    if min_retorno > 0:
+        retorno_est = (1 / entry_odds - 1) * 100
+        if retorno_est < min_retorno:
+            logger.warning(
+                f"[ORDER] ⛔ Retorno estimado {retorno_est:.1f}% < mínimo {min_retorno}% — orden descartada\n"
+                f"         Odds: {entry_odds:.4f}  Token: {token_id[:16]}…"
             )
             return None
 
+    size = round(stake / entry_odds, 4)
+
     logger.info(
-        f"[ORDER] {'[SIMULADO] ' if simulate_mode else ''}Preparando orden {direction_val}\n"
+        f"[ORDER] Preparando orden {direction_val}\n"
         f"         Token ID  : {token_id[:16]}...\n"
-        f"         Odds impl.: {entry_odds:.4f}  ({entry_odds * 100:.1f}%)\n"
+        f"         Odds impl.: {entry_odds:.4f}  ({entry_odds*100:.1f}%)\n"
         f"         Size      : {size:.4f} tokens\n"
         f"         Coste est.: ${entry_odds * size:.2f} USDC"
     )
 
+    # ── Fee rate dinámico ─────────────────────────────────────────────────
+    try:
+        import requests as _req
+        r = _req.get(
+            f"https://clob.polymarket.com/fee-rate?token_id={token_id}",
+            timeout=5,
+        )
+        fee_data = r.json()
+        fee_rate_bps = int(fee_data.get("base_fee", 0))
+        logger.info(
+            f"[ORDER] feeRateBps dinámico = {fee_rate_bps} para token {token_id[:16]}…"
+            f"  (raw: {fee_data})"
+        )
+    except Exception as e:
+        fee_rate_bps = 0
+        logger.warning(f"[ORDER] No se pudo obtener fee-rate: {e} — usando 0")
+
+    # ── MODO SIMULADO ─────────────────────────────────────────────────────
     if simulate_mode:
         op_id = str(uuid.uuid4())
         logger.warning(
@@ -308,34 +335,32 @@ def execute_order(signal: Signal, market: dict, cfg: dict) -> dict | None:
             "odds":      entry_odds,
         }
 
+    # ── MODO REAL ─────────────────────────────────────────────────────────
     try:
         from py_clob_client.clob_types import OrderArgs, CreateOrderOptions
 
         neg_risk = bool(market.get("neg_risk", False))
         client   = _build_clob_client(cfg)
 
-        # v8.4: fee_rate_bps dinámico — consulta /fee-rate?token_id=...
-        fee_rate_bps = _fetch_fee_rate(token_id)
-
         order_args = OrderArgs(
             token_id=token_id,
             price=entry_odds,
             size=size,
             side="BUY",
-            fee_rate_bps=fee_rate_bps,   # ← dinámico, no hardcodeado
         )
 
-        logger.info(
-            f"[ORDER] 📤 Enviando orden FOK BUY al CLOB "
-            f"(fee_rate_bps={fee_rate_bps})..."
-        )
+        logger.info(f"[ORDER] 📤 Enviando orden FOK BUY al CLOB (fee_rate_bps={fee_rate_bps})...")
 
         resp = client.create_and_post_order(
             order_args,
             CreateOrderOptions(neg_risk=neg_risk, tick_size=None),
         )
 
-        order_id    = resp.get("orderID") or resp.get("id") or str(uuid.uuid4())
+        order_id = (
+            resp.get("orderID")
+            or resp.get("id")
+            or str(uuid.uuid4())
+        )
         status      = resp.get("status", "—")
         filled      = resp.get("sizeFilled", resp.get("size_filled", "—"))
         fill_price  = resp.get("avgPrice") or resp.get("price") or resp.get("avg_price")
@@ -394,8 +419,17 @@ def sell_position(
     market:     dict,
 ) -> dict | None:
     """
-    v8.4: fee_rate_bps=0 en SELL — makers sin fee en CTF Exchange V2.
-    (SELL de posiciones ganadoras: somos makers, fee = 0)
+    v8.2: Vende tokens ganadores en el CLOB (fallback cuando el claim on-chain falla).
+
+    Parámetros:
+      token_id   : ID del token a vender (YES si UP, NO si DOWN)
+      tokens     : cantidad de tokens a vender
+      sell_price : precio de venta (ej. midpoint - margen, ~0.990)
+      cfg        : configuración del bot (mismas credenciales que execute_order)
+      market     : dict del mercado activo (para neg_risk)
+
+    Devuelve el dict de respuesta del CLOB o None si falla.
+    Llamada exclusivamente desde claimer._sell_fallback_clob().
     """
     logger.info(
         f"[SELL] Preparando orden SELL\n"
@@ -416,28 +450,46 @@ def sell_position(
             price=sell_price,
             size=tokens,
             side="SELL",
-            fee_rate_bps=0,   # makers sin fee en CTF Exchange V2
         )
 
-        logger.info(f"[SELL] 📤 Enviando orden SELL al CLOB (fee_rate_bps=0)...")
+        logger.info(f"[SELL] 📤 Enviando orden SELL al CLOB...")
 
-        resp     = client.create_and_post_order(
+        resp = client.create_and_post_order(
             order_args,
             CreateOrderOptions(neg_risk=neg_risk, tick_size=None),
         )
-        order_id = resp.get("orderID") or resp.get("id") or str(uuid.uuid4())
+
+        order_id = (
+            resp.get("orderID")
+            or resp.get("id")
+            or str(uuid.uuid4())
+        )
+        status = resp.get("status", "—")
+        filled = resp.get("sizeFilled", resp.get("size_filled", "—"))
 
         logger.info(
-            f"[SELL] ✅ SELL ejecutado — id={order_id}  status={resp.get('status', '—')}"
+            f"[SELL] ✅ Orden SELL ejecutada:\n"
+            f"       Order ID : {order_id}\n"
+            f"       Status   : {status}\n"
+            f"       Filled   : {filled}\n"
+            f"       Raw resp : {resp}"
         )
+
         return {**resp, "id": order_id, "price": sell_price, "tokens": tokens}
 
     except ImportError:
-        logger.error("[SELL] ❌ py-clob-client no disponible")
+        logger.error("[SELL] ❌ py-clob-client no disponible — SELL no ejecutado")
         return None
+
     except ValueError as e:
         logger.error(f"[SELL] ❌ Credenciales L2: {e}")
         return None
+
     except Exception as e:
-        logger.error(f"[SELL] ❌ Error SELL CLOB: {type(e).__name__}: {e}", exc_info=True)
+        logger.error(
+            f"[SELL] ❌ Error ejecutando SELL en CLOB:\n"
+            f"       Tipo  : {type(e).__name__}\n"
+            f"       Error : {e}",
+            exc_info=True,
+        )
         return None
