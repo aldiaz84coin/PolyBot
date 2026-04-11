@@ -1,46 +1,84 @@
 """
-claimer.py — Redención automática de tokens ganadores on-chain (Polygon)
+claimer.py — Redención automática via Safe.execTransaction (Polygon)
+
+v4.0 — FIX CRÍTICO: SAFE.EXECTRANSACTION
+─────────────────────────────────────────
+Los tokens CTF están en el Safe (POLYMARKET_FUNDER), NO en la EOA.
+Versiones anteriores llamaban CTF.redeemPositions() directamente desde
+la EOA → la TX no tiene los tokens → siempre falla o no hace nada.
+
+Flujo correcto:
+  1. Leer nonce del Safe
+  2. Codificar callData = CTF.redeemPositions(USDC, 0x0, conditionId, [indexSet])
+  3. Computar Safe txHash via Safe.getTransactionHash()
+  4. Firmar el hash con la EOA (raw, sin prefijo Ethereum — igual que ethers signingKey.sign)
+  5. Ejecutar Safe.execTransaction() enviado por la EOA
+  6. Verificar ExecutionSuccess en los logs del receipt
+  7. Verificar delta USDC en el Safe como confirmación
+
+Para mercados BTC UP/DOWN (binarios estándar, no NegRisk):
+  - parentCollectionId = bytes32(0)
+  - indexSets = [1] para UP (YES), [2] para DOWN (NO)
+  - Contrato destino: CTF ConditionalTokens
 
 v3.1 — SELL FALLBACK DESHABILITADO
-  - SELL_FALLBACK_ENABLED = False: deshabilitado hasta verificar que 0.99
-    tiene contrapartida en el mercado resuelto. Si el claim falla → aviso manual.
-  - SELL_FALLBACK_PRICE = 0.99: precio límite correcto para cuando se reactive.
-    Vender a menos de ~0.99 en una posición WIN implica pérdida real.
-
-v3.0 — TIMING FIX + GAMMA CHECK + FALLBACK MEJORADO
-  - RETRY_SCHEDULE: [7200, 1800] — primer intento a las 2h post-WIN, segundo
-    a las 2h30min. Solo 2 intentos on-chain bien temporizados.
-  - _check_gamma_resolved(): consulta Gamma API antes de cada intento on-chain.
-  - _redimir_once_no_estimate(): workaround con gas fijo (150k), activo solo
-    si Gamma confirma resolución pero estimate_gas sigue fallando.
-  - Notificaciones enriquecidas con slug, conditionId, stake, tokens.
-  - notify_claim_attempt(): nueva, enviada antes de cada TX con diagnóstico Gamma.
-
-v2.1 — SELL FALLBACK + RETRY MEJORADO
-  - RETRY_SCHEDULE: primer intento con 3 min de espera.
-  - Ventana total ~2h 8 min (8 intentos).
-  - sell_fallback_clob(): intenta vender en CLOB al fallar claim on-chain.
-
-v2.0 — RETRY + FALLBACK + NOTIFICACIONES
+v3.0 — RETRY SCHEDULE + GAMMA CHECK
 
 Destino: bot/modules/claimer.py
 """
+
 import json as _json
 import logging
+import os
+import threading
 import time
+from typing import Optional
 
 import requests
+from eth_keys import keys as _eth_keys
 from web3 import Web3
 
 logger = logging.getLogger(__name__)
 
-# ── Contrato CTF Polymarket (Polygon) ─────────────────────────────────────────
-CTF_ADDRESS  = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
-USDC_POLYGON = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+# ── Contratos Polygon mainnet ─────────────────────────────────────────────────
+
+CTF_ADDRESS  = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"  # ConditionalTokens
+USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"  # USDC.e (bridged)
+ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 CHAIN_ID     = 137
-GAS_MARGIN   = 1.25       # +25% sobre el estimado
-GAS_FIXED    = 150_000    # gas fijo para workaround sin estimate_gas
-CONFIRM_TIMEOUT = 90      # segundos esperando recibo on-chain
+
+GAS_LIMIT       = 400_000   # gas para execTransaction
+CONFIRM_TIMEOUT = 90        # segundos esperando recibo on-chain
+
+# Topics del evento Safe (ExecutionSuccess / ExecutionFailure)
+EXECUTION_SUCCESS_TOPIC = "0x442e715f626346e8c54381002da614f62bee8d27386535b2521ec8540898556e"
+EXECUTION_FAILURE_TOPIC = "0x23428b18acfb3ea64b08dc0c1d296ea9c09702c09083ca5272bbec61743f0301"
+
+SELL_FALLBACK_ENABLED = False
+SELL_FALLBACK_PRICE   = 0.99
+
+# ── Retry schedule ────────────────────────────────────────────────────────────
+# Mercados BTC/USD en Polymarket se resuelven entre 1h y 3h tras el cierre.
+# Intento 1 → +2h 00min desde WIN  (7200s)
+# Intento 2 → +2h 30min desde WIN  (+1800s)
+RETRY_SCHEDULE = [7200, 1800]
+
+# ── RPCs Polygon con fallback ─────────────────────────────────────────────────
+POLYGON_RPCS = [
+    os.environ.get("POLYGON_RPC_URL", ""),
+    "https://polygon.llamarpc.com",
+    "https://polygon.drpc.org",
+    "https://polygon-rpc.com",
+    "https://rpc.ankr.com/polygon",
+    "https://1rpc.io/matic",
+    "https://polygon-bor-rpc.publicnode.com",
+]
+
+# ── API endpoints ─────────────────────────────────────────────────────────────
+CLOB_MIDPOINT = "https://clob.polymarket.com/midpoint"
+GAMMA_API     = "https://gamma-api.polymarket.com/markets"
+
+# ── ABIs (mínimos necesarios) ─────────────────────────────────────────────────
 
 CTF_ABI = [
     {
@@ -54,66 +92,129 @@ CTF_ABI = [
         ],
         "outputs": [],
         "stateMutability": "nonpayable",
+    },
+    {
+        "name": "balanceOf",
+        "type": "function",
+        "inputs": [
+            {"name": "account", "type": "address"},
+            {"name": "id",      "type": "uint256"},
+        ],
+        "outputs": [{"name": "", "type": "uint256"}],
+        "stateMutability": "view",
+    },
+]
+
+SAFE_ABI = [
+    {
+        "name": "nonce",
+        "type": "function",
+        "inputs": [],
+        "outputs": [{"name": "", "type": "uint256"}],
+        "stateMutability": "view",
+    },
+    {
+        "name": "getTransactionHash",
+        "type": "function",
+        "inputs": [
+            {"name": "to",             "type": "address"},
+            {"name": "value",          "type": "uint256"},
+            {"name": "data",           "type": "bytes"},
+            {"name": "operation",      "type": "uint8"},
+            {"name": "safeTxGas",      "type": "uint256"},
+            {"name": "baseGas",        "type": "uint256"},
+            {"name": "gasPrice",       "type": "uint256"},
+            {"name": "gasToken",       "type": "address"},
+            {"name": "refundReceiver", "type": "address"},
+            {"name": "_nonce",         "type": "uint256"},
+        ],
+        "outputs": [{"name": "", "type": "bytes32"}],
+        "stateMutability": "view",
+    },
+    {
+        "name": "execTransaction",
+        "type": "function",
+        "inputs": [
+            {"name": "to",             "type": "address"},
+            {"name": "value",          "type": "uint256"},
+            {"name": "data",           "type": "bytes"},
+            {"name": "operation",      "type": "uint8"},
+            {"name": "safeTxGas",      "type": "uint256"},
+            {"name": "baseGas",        "type": "uint256"},
+            {"name": "gasPrice",       "type": "uint256"},
+            {"name": "gasToken",       "type": "address"},
+            {"name": "refundReceiver", "type": "address"},
+            {"name": "signatures",     "type": "bytes"},
+        ],
+        "outputs": [{"name": "success", "type": "bool"}],
+        "stateMutability": "payable",
+    },
+]
+
+USDC_ABI = [
+    {
+        "name": "balanceOf",
+        "type": "function",
+        "inputs": [{"name": "account", "type": "address"}],
+        "outputs": [{"name": "", "type": "uint256"}],
+        "stateMutability": "view",
     }
 ]
 
-# ── RPCs de Polygon (se prueban en orden; el primero que responde se usa) ─────
-POLYGON_RPCS = [
-    "https://polygon-rpc.com",
-    "https://rpc.ankr.com/polygon",
-    "https://polygon-bor-rpc.publicnode.com",
-    "https://rpc-mainnet.matic.quiknode.pro",
-]
 
-# ── Endpoints ─────────────────────────────────────────────────────────────────
-CLOB_MIDPOINT = "https://clob.polymarket.com/midpoint"
-GAMMA_API     = "https://gamma-api.polymarket.com/markets"
-
-# ── Calendario de reintentos ──────────────────────────────────────────────────
-# v3.0: Solo 2 intentos, bien temporizados.
-# Los mercados BTC/USD en Polymarket se resuelven on-chain entre 1h y 3h
-# después del cierre de la vela. Intentar antes siempre falla (error:
-# "result for condition not received yet").
-#
-# Intento 1 → +2h 00min desde WIN  (7200s)
-# Intento 2 → +2h 30min desde WIN  (+1800s)
-# ──────────────────────────────────────────────────────────────────────────────
-# Si ambos fallan → SELL FALLBACK en CLOB
-RETRY_SCHEDULE = [7200, 1800]
-
-
-# ── Helpers internos ──────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# HELPERS INTERNOS
+# ══════════════════════════════════════════════════════════════════════════════
 
 def _connect_polygon() -> Web3:
-    """
-    Prueba los RPCs de POLYGON_RPCS en orden y devuelve el primero que conecta.
-    Lanza ConnectionError si todos fallan.
-    """
+    """Prueba RPCs en orden, devuelve el primero que conecta."""
     for rpc in POLYGON_RPCS:
+        if not rpc:
+            continue
         try:
             w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 15}))
             if w3.is_connected():
-                logger.info(f"[CLAIMER] ✅ Conectado a Polygon via {rpc}")
+                logger.info(f"[CLAIMER] ✅ RPC Polygon OK: {rpc}")
                 return w3
-            else:
-                logger.warning(f"[CLAIMER] ⚠ RPC sin respuesta: {rpc}")
         except Exception as e:
-            logger.warning(f"[CLAIMER] ⚠ Error en RPC {rpc}: {e}")
-    raise ConnectionError(
-        f"Todos los RPCs de Polygon fallaron: {POLYGON_RPCS}"
+            logger.warning(f"[CLAIMER] ⚠ RPC {rpc}: {e}")
+    raise ConnectionError(f"[CLAIMER] Ningún RPC disponible — define POLYGON_RPC_URL en Railway")
+
+
+def _to_bytes32(hex_str: str) -> bytes:
+    """Convierte conditionId hex (con o sin 0x) a bytes32."""
+    return bytes.fromhex(hex_str.removeprefix("0x").zfill(64))
+
+
+def _sign_safe_hash(private_key_hex: str, hash_bytes: bytes) -> bytes:
+    """
+    Firma raw hash SIN prefijo Ethereum (requerido por Gnosis Safe).
+    Equivalente a ethers.js: wallet.signingKey.sign(txHash)
+
+    Devuelve: r (32 bytes) + s (32 bytes) + v (1 byte, valor 27 o 28).
+    """
+    pk_bytes = bytes.fromhex(private_key_hex.removeprefix("0x"))
+    pk       = _eth_keys.PrivateKey(pk_bytes)
+    sig      = pk.sign_msg_hash(hash_bytes)
+    v        = sig.v + 27   # eth_keys devuelve 0/1 → Safe necesita 27/28
+    return bytes(sig.r) + bytes(sig.s) + bytes([v])
+
+
+def _condition_id_from_bet(bet: dict) -> str:
+    """Extrae conditionId del bet dict (varios formatos posibles)."""
+    market = bet.get("market", {})
+    return (
+        market.get("conditionId")
+        or market.get("condition_id")
+        or bet.get("condition_id")
+        or ""
     )
 
 
-def _condition_id_to_bytes(condition_id: str) -> bytes:
-    """Convierte condition_id (hex str con o sin '0x') a bytes32."""
-    hex_str = condition_id.removeprefix("0x").zfill(64)
-    return bytes.fromhex(hex_str)
-
-
-def _get_winning_token_id(bet: dict) -> str | None:
+def _get_winning_token_id(bet: dict) -> Optional[str]:
     """
-    Extrae el token_id del lado ganador (YES si UP, NO si DOWN).
-    Busca primero en market["tokens"] (lista con outcome), luego en clobTokenIds.
+    Extrae token_id del lado ganador.
+    Busca en market["tokens"] primero, luego en clobTokenIds.
     """
     market    = bet.get("market", {})
     direction = bet.get("direction", "UP")
@@ -127,7 +228,6 @@ def _get_winning_token_id(bet: dict) -> str | None:
             if direction == "DOWN" and outcome == "no":
                 return t.get("token_id")
 
-    # Fallback: clobTokenIds (índice 0=YES/UP, 1=NO/DOWN)
     clob_raw = market.get("clobTokenIds")
     if clob_raw:
         try:
@@ -137,34 +237,14 @@ def _get_winning_token_id(bet: dict) -> str | None:
         except Exception:
             pass
 
-    logger.warning("[CLAIMER] ⚠ No se pudo extraer token_id ganador del mercado")
+    logger.warning("[CLAIMER] ⚠ No se pudo extraer token_id ganador del bet")
     return None
-
-
-def _fetch_clob_midpoint(token_id: str) -> float | None:
-    """Consulta el precio live del token en el CLOB."""
-    try:
-        r = requests.get(CLOB_MIDPOINT, params={"token_id": token_id}, timeout=8)
-        r.raise_for_status()
-        mid = r.json().get("mid")
-        return float(mid) if mid is not None else None
-    except Exception as e:
-        logger.warning(f"[CLAIMER] ⚠ No se pudo obtener midpoint CLOB: {e}")
-        return None
 
 
 def _check_gamma_resolved(condition_id: str) -> dict:
     """
-    v3.0 — Workaround: consulta la Gamma API para verificar si el mercado
-    ha sido resuelto antes de intentar el claim on-chain.
-
-    Retorna un dict con:
-      resolved    (bool)   — True si el mercado está marcado como resuelto
-      closed      (bool)   — True si el mercado está cerrado para trading
-      outcome     (str)    — "Yes" / "No" / "" según Gamma
-      question    (str)    — título del mercado
-      end_date    (str)    — fecha de cierre programada (ISO)
-      error       (str)    — razón si la consulta falló
+    Consulta Gamma API para saber si el mercado está resuelto on-chain.
+    Retorna dict con: resolved, closed, outcome, question, end_date, error.
     """
     result = {
         "resolved": False,
@@ -177,472 +257,491 @@ def _check_gamma_resolved(condition_id: str) -> dict:
     if not condition_id:
         result["error"] = "conditionId vacío"
         return result
-
     try:
-        r = requests.get(
-            GAMMA_API,
-            params={"conditionId": condition_id},
-            timeout=10,
-        )
+        r = requests.get(GAMMA_API, params={"conditionId": condition_id}, timeout=10)
         r.raise_for_status()
         data = r.json()
         if not data or not isinstance(data, list):
             result["error"] = "Gamma API devolvió respuesta vacía o inesperada"
             return result
-
         mkt = data[0]
         result["resolved"] = bool(mkt.get("resolved") or mkt.get("resolutionSource"))
         result["closed"]   = bool(mkt.get("closed") or mkt.get("active") is False)
         result["outcome"]  = str(mkt.get("outcome", "") or mkt.get("resolution", ""))
         result["question"] = str(mkt.get("question", "—"))[:80]
         result["end_date"] = str(mkt.get("endDate", "—"))
-
     except Exception as e:
         result["error"] = str(e)
         logger.warning(f"[CLAIMER] ⚠ Error consultando Gamma API: {e}")
-
     return result
 
 
-# ── Núcleo: un intento de redención (con estimate_gas) ────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# CORE: SAFE.EXECTRANSACTION
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _execute_via_safe(
+    w3:           Web3,
+    safe_address: str,
+    private_key:  str,
+    to:           str,
+    call_data:    bytes,
+    gas_limit:    int = GAS_LIMIT,
+) -> str:
+    """
+    Ejecuta una llamada desde el Gnosis Safe firmada por la EOA como único owner.
+
+    Equivalente Python del executeViaSafe() del TypeScript de referencia.
+
+    Devuelve tx_hash (hex str). Lanza RuntimeError si la TX falla.
+    """
+    safe_cs = w3.to_checksum_address(safe_address)
+    to_cs   = w3.to_checksum_address(to)
+    zero    = w3.to_checksum_address(ZERO_ADDRESS)
+    account = w3.eth.account.from_key(private_key)
+
+    safe  = w3.eth.contract(address=safe_cs, abi=SAFE_ABI)
+    nonce = safe.functions.nonce().call()
+
+    # ── 1. Computar Safe tx hash ───────────────────────────────────────────────
+    safe_tx_hash = safe.functions.getTransactionHash(
+        to_cs,      # to
+        0,          # value
+        call_data,  # data (bytes)
+        0,          # operation  (0 = CALL)
+        0,          # safeTxGas
+        0,          # baseGas
+        0,          # gasPrice
+        zero,       # gasToken
+        zero,       # refundReceiver
+        nonce,      # _nonce
+    ).call()
+
+    # ── 2. Firmar el hash con la EOA (raw, sin prefijo Ethereum) ──────────────
+    signature = _sign_safe_hash(private_key, bytes(safe_tx_hash))
+
+    logger.info(
+        f"[CLAIMER] Safe.execTransaction → nonce={nonce} | "
+        f"to={to_cs[:14]}… | EOA={account.address[:12]}…"
+    )
+
+    # ── 3. Construir y enviar la TX desde la EOA ──────────────────────────────
+    gas_price = int(w3.eth.gas_price * 1.2)   # +20% para asegurar inclusión
+    eoa_nonce = w3.eth.get_transaction_count(account.address, "pending")
+
+    built_tx = safe.functions.execTransaction(
+        to_cs,      # to
+        0,          # value
+        call_data,  # data
+        0,          # operation
+        0,          # safeTxGas
+        0,          # baseGas
+        0,          # gasPrice
+        zero,       # gasToken
+        zero,       # refundReceiver
+        signature,  # signatures
+    ).build_transaction({
+        "from":     account.address,
+        "gas":      gas_limit,
+        "gasPrice": gas_price,
+        "nonce":    eoa_nonce,
+        "chainId":  CHAIN_ID,
+    })
+
+    signed      = w3.eth.account.sign_transaction(built_tx, private_key)
+    raw_tx      = signed.raw_transaction          # web3.py >= 6
+    tx_hash_hex = w3.eth.send_raw_transaction(raw_tx).hex()
+
+    logger.info(f"[CLAIMER] TX enviada: {tx_hash_hex} — esperando recibo…")
+    receipt = w3.eth.wait_for_transaction_receipt(tx_hash_hex, timeout=CONFIRM_TIMEOUT)
+
+    # ── 4. Verificar status y logs del Safe ───────────────────────────────────
+    if receipt.status == 0:
+        raise RuntimeError(f"[CLAIMER] TX revertida on-chain: {tx_hash_hex}")
+
+    for log in receipt.logs:
+        if not log.topics:
+            continue
+        topic = log.topics[0].hex()
+        if topic == EXECUTION_SUCCESS_TOPIC:
+            logger.info(f"[CLAIMER] ✅ ExecutionSuccess confirmado: {tx_hash_hex}")
+            return tx_hash_hex
+        if topic == EXECUTION_FAILURE_TOPIC:
+            raise RuntimeError(f"[CLAIMER] Safe ExecutionFailure — tx: {tx_hash_hex}")
+
+    # Sin topic explícito pero status=1 → asumimos OK
+    logger.warning(
+        f"[CLAIMER] ExecutionSuccess topic no encontrado (status=1) — "
+        f"asumiendo OK: {tx_hash_hex}"
+    )
+    return tx_hash_hex
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CORE: INTENTO DE REDENCIÓN
+# ══════════════════════════════════════════════════════════════════════════════
 
 def _redimir_once(
     condition_id: str,
-    direction: str,
-    private_key: str,
+    direction:    str,
+    private_key:  str,
+    safe_address: str,
+    token_id:     Optional[str] = None,
 ) -> str:
     """
-    Intento único de redeemPositions() con fallback de RPCs.
-    Devuelve tx_hash (hex string). Lanza excepción si falla.
+    Intento único de CTF.redeemPositions() via Safe.execTransaction.
+
+    v4.0: ejecuta DESDE el Safe (donde están los tokens), no desde la EOA.
+
+    Parámetros:
+      condition_id  — hex str con o sin 0x
+      direction     — "UP" | "DOWN"
+      private_key   — EOA private key (owner del Safe)
+      safe_address  — Gnosis Safe address (donde están los tokens CTF)
+      token_id      — str numérico para verificar balance previo (opcional)
+
+    Devuelve tx_hash (hex str). Lanza excepción si falla.
     """
-    index_set = [1] if direction == "UP" else [2]
+    w3       = _connect_polygon()
+    safe_cs  = w3.to_checksum_address(safe_address)
+    ctf_cs   = w3.to_checksum_address(CTF_ADDRESS)
+    usdc_cs  = w3.to_checksum_address(USDC_ADDRESS)
+
+    cond_bytes  = _to_bytes32(condition_id)
+    parent_zero = bytes(32)                          # 0x00…00 para mercados binarios
+    index_sets  = [1] if direction == "UP" else [2]  # 1=YES/UP, 2=NO/DOWN
+
+    # ── 1. Verificar balance de tokens YES/NO en el Safe ──────────────────────
+    ctf  = w3.eth.contract(address=ctf_cs, abi=CTF_ABI)
+    usdc = w3.eth.contract(address=usdc_cs, abi=USDC_ABI)
+
+    if token_id:
+        try:
+            balance = ctf.functions.balanceOf(safe_cs, int(token_id)).call()
+            if balance == 0:
+                logger.warning(
+                    f"[CLAIMER] ⚠ Balance tokens en Safe = 0 "
+                    f"(token={token_id[:16]}…) — ¿ya redimido?"
+                )
+                raise RuntimeError("balance_zero_safe: tokens no encontrados en Safe")
+            logger.info(
+                f"[CLAIMER] 💰 Balance tokens en Safe: "
+                f"{balance / 1_000_000:.4f} (token={token_id[:16]}…)"
+            )
+        except RuntimeError:
+            raise
+        except Exception as e:
+            logger.warning(f"[CLAIMER] ⚠ No se pudo leer balance CTF: {e}")
+
+    # ── 2. USDC en Safe antes de la TX ────────────────────────────────────────
+    usdc_before = 0
+    try:
+        usdc_before = usdc.functions.balanceOf(safe_cs).call()
+    except Exception:
+        pass
+
+    # ── 3. Codificar callData para CTF.redeemPositions ────────────────────────
+    call_data_hex   = ctf.encodeABI(
+        fn_name="redeemPositions",
+        args=[usdc_cs, parent_zero, cond_bytes, index_sets],
+    )
+    call_data_bytes = bytes.fromhex(call_data_hex.removeprefix("0x"))
 
     logger.info(
-        f"[CLAIMER] Iniciando redención (estimate_gas)\n"
-        f"          Direction    : {direction}  →  index_set={index_set}\n"
-        f"          Condition ID : {condition_id}"
+        f"[CLAIMER] Redimiendo — direction={direction} | "
+        f"indexSets={index_sets} | conditionId={condition_id[:16]}…"
     )
 
-    w3      = _connect_polygon()
-    account = w3.eth.account.from_key(private_key)
-    logger.info(f"[CLAIMER] Wallet: {account.address}")
+    # ── 4. Ejecutar via Safe ───────────────────────────────────────────────────
+    tx_hash = _execute_via_safe(
+        w3=w3,
+        safe_address=safe_address,
+        private_key=private_key,
+        to=CTF_ADDRESS,
+        call_data=call_data_bytes,
+    )
 
-    # Verificar balance POL (gas)
+    # ── 5. Verificar delta USDC en el Safe ────────────────────────────────────
     try:
-        bal_pol = float(w3.from_wei(w3.eth.get_balance(account.address), "ether"))
-        logger.info(f"[CLAIMER] Balance POL: {bal_pol:.6f}")
-        if bal_pol < 0.001:
-            logger.warning(
-                f"[CLAIMER] ⚠ Balance POL muy bajo ({bal_pol:.6f}) — "
-                "puede no alcanzar para gas"
+        time.sleep(3)
+        usdc_after = usdc.functions.balanceOf(safe_cs).call()
+        delta = (usdc_after - usdc_before) / 1_000_000
+        if delta > 0:
+            logger.info(
+                f"[CLAIMER] 💵 USDC recibidos en Safe: +{delta:.4f} "
+                f"(total: {usdc_after / 1_000_000:.4f})"
             )
-    except Exception as e:
-        logger.warning(f"[CLAIMER] ⚠ No se pudo consultar balance POL: {e}")
+        else:
+            logger.warning(
+                f"[CLAIMER] ⚠ Delta USDC = 0 tras ExecutionSuccess — "
+                f"¿UMA aún no reportó? tx={tx_hash}"
+            )
+    except Exception:
+        pass
 
-    ctf = w3.eth.contract(
-        address=w3.to_checksum_address(CTF_ADDRESS),
-        abi=CTF_ABI,
-    )
-    cond_bytes = _condition_id_to_bytes(condition_id)
-    fn = ctf.functions.redeemPositions(
-        w3.to_checksum_address(USDC_POLYGON),
-        b"\x00" * 32,
-        cond_bytes,
-        index_set,
-    )
-
-    # estimate_gas falla si el mercado no está resuelto on-chain todavía
-    try:
-        gas_estimate = fn.estimate_gas({"from": account.address})
-        gas = int(gas_estimate * GAS_MARGIN)
-    except Exception as e:
-        raise RuntimeError(
-            f"estimate_gas falló (mercado no resuelto aún, o ya reclamado): {e}"
-        ) from e
-
-    return _send_redeem_tx(w3, fn, account, private_key, gas)
+    return tx_hash
 
 
 def _redimir_once_no_estimate(
     condition_id: str,
-    direction: str,
-    private_key: str,
+    direction:    str,
+    private_key:  str,
+    safe_address: str,
 ) -> str:
     """
-    v3.0 — Workaround adicional: intenta redeemPositions() con gas_limit FIJO
-    (GAS_FIXED = 150 000) sin llamar a estimate_gas.
+    Workaround: igual que _redimir_once() pero sin verificar balance previo.
+    Usar cuando Gamma confirma resolución pero el check de balance falla.
 
-    Usar SOLO cuando Gamma API confirma que el mercado está resuelto pero
-    estimate_gas sigue fallando — puede indicar un delay en el nodo RPC o
-    un problema transitorio de la cadena.
-
-    AVISO: si el mercado no está resuelto, esta TX fallará on-chain y consumirá
-    gas de todas formas. Por eso solo se activa cuando Gamma confirma resolución.
+    AVISO: si el mercado no está resuelto, la TX fallará en el Safe
+    (ExecutionFailure) — usar SOLO cuando Gamma lo confirma.
     """
-    index_set = [1] if direction == "UP" else [2]
-
-    logger.info(
-        f"[CLAIMER] Iniciando redención SIN estimate_gas (gas fijo={GAS_FIXED})\n"
-        f"          Direction    : {direction}  →  index_set={index_set}\n"
-        f"          Condition ID : {condition_id}"
+    return _redimir_once(
+        condition_id=condition_id,
+        direction=direction,
+        private_key=private_key,
+        safe_address=safe_address,
+        token_id=None,   # omitir verificación de balance
     )
 
-    w3      = _connect_polygon()
-    account = w3.eth.account.from_key(private_key)
 
-    ctf        = w3.eth.contract(
-        address=w3.to_checksum_address(CTF_ADDRESS),
-        abi=CTF_ABI,
-    )
-    cond_bytes = _condition_id_to_bytes(condition_id)
-    fn         = ctf.functions.redeemPositions(
-        w3.to_checksum_address(USDC_POLYGON),
-        b"\x00" * 32,
-        cond_bytes,
-        index_set,
-    )
-
-    return _send_redeem_tx(w3, fn, account, private_key, GAS_FIXED)
-
-
-def _send_redeem_tx(w3, fn, account, private_key: str, gas: int) -> str:
-    """
-    Construye, firma y envía la TX de redeemPositions. Espera recibo.
-    Devuelve tx_hash. Lanza RuntimeError si la TX es rechazada on-chain.
-    """
-    gas_price    = w3.eth.gas_price
-    pol_cost_est = w3.from_wei(gas * gas_price, "ether")
-    logger.info(
-        f"[CLAIMER] Gas: {gas} units  "
-        f"@ {w3.from_wei(gas_price, 'gwei'):.2f} Gwei  "
-        f"≈ {pol_cost_est:.6f} POL"
-    )
-
-    nonce = w3.eth.get_transaction_count(account.address)
-    tx = fn.build_transaction({
-        "from":     account.address,
-        "gas":      gas,
-        "gasPrice": gas_price,
-        "nonce":    nonce,
-        "chainId":  CHAIN_ID,
-    })
-
-    logger.info("[CLAIMER] 📤 Firmando y enviando transacción...")
-    signed  = w3.eth.account.sign_transaction(tx, private_key)
-    # web3.py v6+: raw_transaction  |  v5: rawTransaction
-    raw_tx  = getattr(signed, "raw_transaction", None) or getattr(signed, "rawTransaction", None)
-    tx_hash = w3.eth.send_raw_transaction(raw_tx)
-    tx_hex  = tx_hash.hex()
-
-    logger.info(
-        f"[CLAIMER] TX enviada: {tx_hex}\n"
-        f"          Esperando confirmación (timeout={CONFIRM_TIMEOUT}s)..."
-    )
-
-    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=CONFIRM_TIMEOUT)
-
-    if receipt.get("status") != 1:
-        raise RuntimeError(f"TX fallida on-chain (status=0): {tx_hex}")
-
-    gas_used = receipt.get("gasUsed", 0)
-    pol_real = w3.from_wei(gas_used * gas_price, "ether")
-    logger.info(
-        f"[CLAIMER] 🏆 Claim confirmado\n"
-        f"          Block  : {receipt.get('blockNumber')}\n"
-        f"          Gas    : {gas_used}  ({pol_real:.6f} POL)\n"
-        f"          TX     : https://polygonscan.com/tx/{tx_hex}"
-    )
-    return tx_hex
-
-
-# ── Fallback: vender posición en el CLOB ─────────────────────────────────────
-
-# v3.1: SELL FALLBACK DESHABILITADO temporalmente.
-# Razón: vender a cualquier precio por debajo de ~0.99 implica pérdidas en una
-# posición ganadora. El precio correcto es 0.99, pero el CLOB no cotiza el token
-# resuelto (devuelve mid=None) — la orden no se llenaría de todas formas.
-# Cuando se reactive: usar SELL_FALLBACK_PRICE = 0.99 y verificar que el token
-# siga activo en el CLOB antes de enviar la orden.
-# Para reactivar: cambiar SELL_FALLBACK_ENABLED = True.
-SELL_FALLBACK_ENABLED = False
-SELL_FALLBACK_PRICE   = 0.99   # precio límite cuando se reactive
-
-
-def _sell_fallback_clob(bet: dict, cfg: dict) -> None:
-    """
-    v3.1: DESHABILITADO. Cuando SELL_FALLBACK_ENABLED=True, vende los tokens
-    ganadores en el CLOB a SELL_FALLBACK_PRICE (0.99) para recuperar valor
-    sin necesidad de resolución on-chain.
-
-    Precio fijado a 0.99 (no mid - descuento) porque:
-    - Los tokens ganadores valen exactamente 1.00 USDC tras resolución.
-    - Vender a menos de ~0.99 implica pérdida real en una posición WIN.
-    - Si no hay contrapartida al 0.99, la orden queda pendiente hasta que
-      alguien compre (o se cancela manualmente).
-    """
-    from .notifier import notify_sell_fallback_failed
-
-    slug      = bet.get("market", {}).get("slug", "—")
-    direction = bet.get("direction", "UP")
-
-    if not SELL_FALLBACK_ENABLED:
-        msg = (
-            f"SELL FALLBACK deshabilitado (SELL_FALLBACK_ENABLED=False). "
-            f"Reclamar manualmente en polymarket.com — mercado: {slug}"
-        )
-        logger.warning(f"[CLAIMER] ⚠ {msg}")
-        notify_sell_fallback_failed(cfg, bet, msg)
-        return
-
-    # ── Código activo cuando SELL_FALLBACK_ENABLED = True ────────────────────
-    from .notifier import notify_sell_fallback_ok
-
-    entry_odds  = bet.get("odds", 0.5)
-    stake       = bet.get("stake", 0.0)
-    tokens_held = round(stake / max(entry_odds, 0.001), 4)
-
-    token_id = _get_winning_token_id(bet)
-    if not token_id:
-        msg = "No se pudo extraer token_id del bet — SELL no ejecutado"
-        logger.error(f"[CLAIMER] ❌ {msg}")
-        notify_sell_fallback_failed(cfg, bet, msg)
-        return
-
-    mid = _fetch_clob_midpoint(token_id)
-    sell_price = SELL_FALLBACK_PRICE
-
-    logger.info(
-        f"[CLAIMER] 💰 SELL FALLBACK\n"
-        f"          Token    : {token_id[:16]}...\n"
-        f"          Tokens   : {tokens_held}\n"
-        f"          Midpoint : {mid!r}  →  Sell @ {sell_price:.4f}\n"
-        f"          USDC est.: ~{tokens_held * sell_price:.2f}\n"
-        f"          Slug     : {slug}"
-    )
-
-    from .strategy import sell_position
-    market = bet.get("market", {})
-    resp = sell_position(token_id, tokens_held, sell_price, cfg, market)
-
-    if resp:
-        usdc_received = round(tokens_held * sell_price, 4)
-        logger.info(
-            f"[CLAIMER] ✅ SELL ejecutado — ~{usdc_received:.4f} USDC recuperados"
-        )
-        notify_sell_fallback_ok(cfg, bet, resp, sell_price, usdc_received)
-    else:
-        msg = f"sell_position() devolvió None (mid={mid!r}, sell_price={sell_price:.4f})"
-        logger.error(f"[CLAIMER] ❌ {msg}")
-        notify_sell_fallback_failed(cfg, bet, msg)
-
-
-# ── API pública: intento único (compatibilidad) ───────────────────────────────
-
-def redimir_posicion(market: dict, direction: str, cfg: dict) -> str:
-    """
-    Intento único con fallback de RPCs.
-    Interfaz compatible con llamadas antiguas desde monitor.py.
-    Devuelve tx_hash o lanza excepción.
-    """
-    condition_id = (
-        market.get("conditionId")
-        or market.get("condition_id", "")
-    )
-    if not condition_id:
-        raise ValueError("conditionId no encontrado en el mercado")
-
-    private_key = cfg["polymarket"]["private_key"]
-    return _redimir_once(condition_id, direction, private_key)
-
-
-# ── API pública: wrappers para command_handler (importación externa) ─────────
-
-def execute_claim_once(condition_id: str, direction: str, private_key: str) -> str:
-    """
-    Wrapper público de _redimir_once().
-    Usar desde command_handler.py para evitar importar funciones privadas.
-    Devuelve tx_hash o lanza excepción.
-    """
-    return _redimir_once(condition_id, direction, private_key)
-
-
-def execute_claim_no_estimate(condition_id: str, direction: str, private_key: str) -> str:
-    """
-    Wrapper público de _redimir_once_no_estimate().
-    Usar desde command_handler.py cuando Gamma confirma resolución
-    pero estimate_gas sigue fallando.
-    Devuelve tx_hash o lanza excepción.
-    """
-    return _redimir_once_no_estimate(condition_id, direction, private_key)
-
-
-# ── API pública: retry con notificaciones (usar desde monitor.py) ─────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# API PÚBLICA: RETRY CON NOTIFICACIONES (llamado desde monitor.py)
+# ══════════════════════════════════════════════════════════════════════════════
 
 def claim_with_retry(bet: dict, cfg: dict) -> None:
     """
     Reintenta el claim siguiendo RETRY_SCHEDULE.
     Diseñado para ejecutarse en un hilo daemon (no bloquea el loop del bot).
 
-    v3.0:
-      - RETRY_SCHEDULE = [7200, 1800] — 2 intentos: a las 2h y a las 2h30min.
-      - Antes de cada intento consulta Gamma API (_check_gamma_resolved) para
-        diagnosticar si el mercado ya está resuelto on-chain.
-      - Si Gamma dice "resuelto" pero estimate_gas falla → activa el workaround
-        _redimir_once_no_estimate() con gas fijo (150k).
-      - Si ambos intentos (y workarounds) fallan → SELL FALLBACK en CLOB.
-      - Todas las notificaciones incluyen: slug, conditionId, stake, tokens.
-
-    Notificaciones Telegram:
-      · notify_claim_scheduled   — al lanzar el hilo
-      · notify_claim_attempt     — justo antes de cada intento (NEW v3.0)
-      · notify_claim_retrying    — antes del 2º intento
-      · notify_claim_ok          — en cuanto confirma on-chain
-      · notify_claim_failed      — si se agotan todos los intentos
-      · notify_sell_fallback_ok  — si el SELL FALLBACK tuvo éxito
-      · notify_sell_fallback_failed — si el SELL FALLBACK también falló
-
-    Uso en monitor.py:
-        import threading
-        threading.Thread(
-            target=claim_with_retry,
-            args=(active_bet, cfg),
-            daemon=True,
-            name=f"claim-{active_bet.get('id', 'x')}",
-        ).start()
+    v4.0: usa Safe.execTransaction, lee safe_address de cfg["polymarket"]["funder"].
     """
     from .notifier import (
+        notify_claim_attempt,
         notify_claim_ok,
         notify_claim_retrying,
-        notify_claim_failed,
-        notify_claim_scheduled,
-        notify_claim_attempt,
     )
 
-    market       = bet.get("market", {})
+    condition_id = _condition_id_from_bet(bet)
     direction    = bet.get("direction", "UP")
-    tokens       = bet.get("tokens", 0.0)
-    stake        = bet.get("stake", 0.0)
-    slug         = market.get("slug", "—")
+    slug         = bet.get("market", {}).get("slug", "—")
+    stake        = float(bet.get("stake", 0.0))
+    tokens       = float(bet.get("tokens_comprados", bet.get("tokens", 0.0)))
+    token_id     = _get_winning_token_id(bet)
 
-    condition_id = (
-        market.get("conditionId")
-        or market.get("condition_id", "")
-    )
-    private_key = cfg["polymarket"]["private_key"]
+    private_key  = cfg.get("polymarket", {}).get("private_key", "").strip()
+    safe_address = cfg.get("polymarket", {}).get("funder", "").strip()
 
-    # Validación temprana
+    # ── Validar credenciales ───────────────────────────────────────────────────
     if not condition_id:
-        logger.error(
-            "[CLAIMER] ❌ claim_with_retry: conditionId ausente en active_bet — "
-            "no se puede reclamar on-chain"
-        )
-        notify_claim_failed(cfg, bet, "conditionId no disponible en el mercado", attempts=0)
-        _sell_fallback_clob(bet, cfg)
+        logger.error("[CLAIMER] ❌ conditionId no encontrado en bet — claim abortado")
+        return
+    if not private_key:
+        logger.error("[CLAIMER] ❌ private_key no configurada — claim abortado")
+        return
+    if not safe_address:
+        # Fallback a env var
+        safe_address = os.environ.get("POLYMARKET_FUNDER", "").strip()
+    if not safe_address:
+        logger.error("[CLAIMER] ❌ funder (Safe address) no configurado — claim abortado")
         return
 
     max_attempts = len(RETRY_SCHEDULE)
-    last_error   = "desconocido"
+    last_error   = ""
 
-    # Notificación inicial
-    first_wait = RETRY_SCHEDULE[0]
-    notify_claim_scheduled(cfg, bet, first_wait_secs=first_wait, max_attempts=max_attempts)
     logger.info(
         f"[CLAIMER] ⏳ Claim programado — slug={slug}\n"
         f"          conditionId : {condition_id}\n"
+        f"          Direction   : {direction}  |  "
+        f"token_id: {(token_id or '—')[:20]}…\n"
         f"          Stake       : ${stake:.2f}  Tokens: {tokens:.4f}\n"
-        f"          Primer intento en {first_wait}s ({first_wait // 60}m)"
+        f"          Safe        : {safe_address[:12]}…\n"
+        f"          Primer intento en {RETRY_SCHEDULE[0]}s "
+        f"({RETRY_SCHEDULE[0] // 60}m)"
     )
 
     for attempt_idx, wait_secs in enumerate(RETRY_SCHEDULE):
         attempt_num = attempt_idx + 1
 
-        # Esperar antes del intento
+        # ── Esperar antes del intento ─────────────────────────────────────────
         if wait_secs > 0:
             logger.info(
                 f"[CLAIMER] ⏳ Esperando {wait_secs}s antes del intento "
-                f"{attempt_num}/{max_attempts} ..."
+                f"{attempt_num}/{max_attempts}…"
             )
             if attempt_num > 1:
-                notify_claim_retrying(
-                    cfg, bet,
-                    attempt=attempt_num,
-                    max_attempts=max_attempts,
-                    reason=last_error,
-                    wait_secs=wait_secs,
-                )
+                try:
+                    notify_claim_retrying(
+                        cfg, bet,
+                        attempt=attempt_num,
+                        max_attempts=max_attempts,
+                        reason=last_error,
+                        wait_secs=wait_secs,
+                    )
+                except Exception:
+                    pass
             time.sleep(wait_secs)
 
-        logger.info(f"[CLAIMER] 🔄 Intento {attempt_num}/{max_attempts} ...")
+        logger.info(f"[CLAIMER] 🔄 Intento {attempt_num}/{max_attempts}…")
 
-        # ── Workaround: consultar Gamma API antes del intento on-chain ──────
+        # ── Gamma check antes del intento on-chain ────────────────────────────
         gamma = _check_gamma_resolved(condition_id)
         logger.info(
-            f"[CLAIMER] 📡 Gamma status — "
-            f"resolved={gamma['resolved']}  closed={gamma['closed']}  "
-            f"outcome='{gamma['outcome']}'  error='{gamma['error']}'"
+            f"[CLAIMER] 📡 Gamma — resolved={gamma['resolved']}  "
+            f"closed={gamma['closed']}  outcome='{gamma['outcome']}'  "
+            f"error='{gamma['error']}'"
         )
 
-        # Notificar intento con contexto completo
-        notify_claim_attempt(
-            cfg, bet,
-            attempt=attempt_num,
-            max_attempts=max_attempts,
-            gamma=gamma,
-        )
-
-        # ── Intento estándar (con estimate_gas) ─────────────────────────────
         try:
-            tx_hash  = _redimir_once(condition_id, direction, private_key)
+            notify_claim_attempt(
+                cfg, bet,
+                attempt=attempt_num,
+                max_attempts=max_attempts,
+                gamma=gamma,
+            )
+        except Exception:
+            pass
+
+        # ── Intento estándar (con balance check) ──────────────────────────────
+        try:
+            tx_hash = _redimir_once(
+                condition_id=condition_id,
+                direction=direction,
+                private_key=private_key,
+                safe_address=safe_address,
+                token_id=token_id,
+            )
             usdc_est = round(tokens, 4)
-            notify_claim_ok(cfg, bet, tx_hash, attempt=attempt_num, usdc_est=usdc_est)
-            logger.info(f"[CLAIMER] ✅ Claim exitoso en intento {attempt_num}")
-            return  # éxito
+            try:
+                notify_claim_ok(cfg, bet, tx_hash, attempt=attempt_num)
+            except Exception:
+                pass
+            logger.info(
+                f"[CLAIMER] ✅ Claim exitoso — tx={tx_hash}  ~${usdc_est:.2f} USDC"
+            )
+            return
 
         except Exception as e:
-            last_error = str(e)
+            last_error = str(e)[:300]
             logger.warning(
-                f"[CLAIMER] ⚠ Intento {attempt_num}/{max_attempts} estándar falló: {last_error}"
+                f"[CLAIMER] ⚠ Intento {attempt_num} falló: {last_error}"
             )
 
-        # ── Workaround adicional: si Gamma dice resuelto, intenta sin estimate_gas
-        if gamma.get("resolved"):
-            logger.info(
-                "[CLAIMER] 🔁 Gamma dice RESUELTO — intentando redención "
-                "con gas fijo (sin estimate_gas)..."
-            )
-            try:
-                tx_hash  = _redimir_once_no_estimate(condition_id, direction, private_key)
-                usdc_est = round(tokens, 4)
-                notify_claim_ok(
-                    cfg, bet, tx_hash,
-                    attempt=attempt_num,
-                    usdc_est=usdc_est,
-                    extra_note="(workaround: gas fijo sin estimate_gas)",
-                )
+            # Workaround en el último intento si Gamma confirma resolución
+            gamma_ok = gamma["resolved"] or (gamma["closed"] and gamma["outcome"])
+            if gamma_ok and attempt_num == max_attempts:
                 logger.info(
-                    f"[CLAIMER] ✅ Claim exitoso (workaround gas fijo) "
-                    f"en intento {attempt_num}"
+                    "[CLAIMER] 🔧 Gamma confirma resolución — "
+                    "reintentando sin balance check (gas fijo)…"
                 )
-                return  # éxito por workaround
+                try:
+                    tx_hash = _redimir_once_no_estimate(
+                        condition_id=condition_id,
+                        direction=direction,
+                        private_key=private_key,
+                        safe_address=safe_address,
+                    )
+                    try:
+                        notify_claim_ok(cfg, bet, tx_hash, attempt=attempt_num)
+                    except Exception:
+                        pass
+                    logger.info(
+                        f"[CLAIMER] ✅ Claim workaround exitoso — tx={tx_hash}"
+                    )
+                    return
+                except Exception as e2:
+                    last_error = str(e2)[:300]
+                    logger.error(
+                        f"[CLAIMER] ❌ Workaround también falló: {last_error}"
+                    )
 
-            except Exception as e2:
-                we_error = str(e2)
-                logger.warning(
-                    f"[CLAIMER] ⚠ Workaround gas fijo también falló: {we_error}"
-                )
-                last_error = f"{last_error} | gas_fijo: {we_error}"
-        else:
-            logger.info(
-                "[CLAIMER] ℹ Gamma NO confirma resolución todavía — "
-                "workaround gas fijo omitido"
-            )
-
-    # ── Se agotaron todos los intentos → intentar SELL FALLBACK ──────────────
+    # ── Todos los intentos fallaron ────────────────────────────────────────────
     logger.error(
-        f"[CLAIMER] ❌ Claim fallido tras {max_attempts} intentos. "
-        f"Último error: {last_error}"
+        f"[CLAIMER] ❌ Todos los intentos agotados — slug={slug}\n"
+        f"          Último error: {last_error}\n"
+        f"          Reclamar manualmente en polymarket.com"
     )
-    notify_claim_failed(cfg, bet, reason=last_error, attempts=max_attempts)
+    _sell_fallback(bet, cfg)
 
-    logger.info("[CLAIMER] 🔄 Intentando SELL FALLBACK en CLOB...")
-    _sell_fallback_clob(bet, cfg)
+
+def _sell_fallback(bet: dict, cfg: dict) -> None:
+    """Fallback cuando el claim on-chain falla. Actualmente deshabilitado."""
+    try:
+        from .notifier import notify_sell_fallback_failed
+        msg = (
+            f"SELL FALLBACK deshabilitado. "
+            f"Reclamar manualmente — "
+            f"mercado: {bet.get('market', {}).get('slug', '—')}"
+        )
+        logger.warning(f"[CLAIMER] ⚠ {msg}")
+        notify_sell_fallback_failed(cfg, bet, msg)
+    except Exception:
+        pass
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# API PÚBLICA: wrappers para command_handler (importación externa)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def execute_claim_once(
+    condition_id: str,
+    direction:    str,
+    private_key:  str,
+    safe_address: str = "",
+    token_id:     Optional[str] = None,
+) -> str:
+    """
+    Wrapper público de _redimir_once().
+    Usar desde command_handler.py — intento único con balance check.
+    Devuelve tx_hash o lanza excepción.
+    """
+    if not safe_address:
+        safe_address = os.environ.get("POLYMARKET_FUNDER", "").strip()
+    if not safe_address:
+        raise ValueError("safe_address (POLYMARKET_FUNDER) no configurado")
+    return _redimir_once(condition_id, direction, private_key, safe_address, token_id)
+
+
+def execute_claim_no_estimate(
+    condition_id: str,
+    direction:    str,
+    private_key:  str,
+    safe_address: str = "",
+) -> str:
+    """
+    Wrapper público de _redimir_once_no_estimate().
+    Usar desde command_handler.py cuando Gamma confirma resolución
+    pero balance check falla. Devuelve tx_hash o lanza excepción.
+    """
+    if not safe_address:
+        safe_address = os.environ.get("POLYMARKET_FUNDER", "").strip()
+    if not safe_address:
+        raise ValueError("safe_address (POLYMARKET_FUNDER) no configurado")
+    return _redimir_once_no_estimate(condition_id, direction, private_key, safe_address)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# API PÚBLICA: interfaz con monitor.py
+# ══════════════════════════════════════════════════════════════════════════════
+
+def redimir_posicion(cfg: dict, bet: dict) -> None:
+    """
+    Punto de entrada desde monitor.py al detectar WIN.
+
+    Lanza claim_with_retry() en un hilo daemon para no bloquear el loop.
+    El hilo espera RETRY_SCHEDULE[0] segundos antes del primer intento.
+
+    Llamada en monitor.py:
+        redimir_posicion(cfg, active_bet)
+    """
+    t = threading.Thread(
+        target=claim_with_retry,
+        args=(bet, cfg),
+        daemon=True,
+        name="claimer-retry",
+    )
+    t.start()
+    logger.info(
+        f"[CLAIMER] 🚀 Hilo de claim lanzado (daemon) — "
+        f"primer intento en {RETRY_SCHEDULE[0] // 60}m. "
+        f"El loop del bot continúa normalmente."
+    )
