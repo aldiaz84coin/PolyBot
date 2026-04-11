@@ -36,6 +36,9 @@ def setup_logging(cfg: dict):
     logging.getLogger("httpcore").setLevel(logging.WARNING)
     logging.getLogger("hpack").setLevel(logging.WARNING)
     logging.getLogger("httpx").setLevel(logging.WARNING)
+     # ── Silenciar librerías verbosas ──────────────────────────────────────
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+    
     
 def main():
     print("=" * 60)
