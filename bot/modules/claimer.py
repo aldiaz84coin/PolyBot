@@ -162,14 +162,23 @@ def _to_bytes32(hex_str: str) -> bytes:
 
 def _sign_safe_hash(private_key_hex: str, hash_bytes: bytes) -> bytes:
     """
-    Firma raw SIN prefijo Ethereum — igual que ethers.js signingKey.sign().
-    Safe necesita r + s + v (v = 27 o 28).
+    Firma raw SIN prefijo Ethereum — idéntico a ethers.js signingKey.sign().
+    Safe necesita r + s + v (v = 27 o 28), cada uno como bytes fijos.
+
+    FIX CRÍTICO: sig.r y sig.s son enteros Python, NO bytes.
+      ❌ bytes(sig.r)              → crea sig.r bytes cero (INCORRECTO)
+      ✅ sig._signature_bytes[0:32] → 32 bytes raw de r directamente (CORRECTO)
+
+    Equivalente TS exacto:
+      const sigObj = wallet.signingKey.sign(txHash)
+      ethers.concat([sigObj.r, sigObj.s, ethers.toBeHex(sigObj.v, 1)])
     """
     from eth_keys import keys as _eth_keys
     pk  = _eth_keys.PrivateKey(bytes.fromhex(private_key_hex.removeprefix("0x")))
     sig = pk.sign_msg_hash(hash_bytes)
     v   = sig.v + 27
-    return bytes(sig.r) + bytes(sig.s) + bytes([v])
+    # sig._signature_bytes es 64 bytes: r[0:32] + s[32:64]
+    return sig._signature_bytes[0:32] + sig._signature_bytes[32:64] + bytes([v])
 
 
 def _parse_market_info(mkt: dict) -> dict:
