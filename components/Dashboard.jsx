@@ -29,6 +29,7 @@ import ModeSelector  from "./ModeSelector";
 import BoostLive     from "./BoostLive";
 import DataLab from "./DataLab";
 import ClaimPanel from "./ClaimPanel";
+import RedeemButton from "./RedeemButton";
 
 const LS_KEY         = "polymarket_bets_v2";
 const BETS_POLL_MS   = 10_000;
@@ -501,6 +502,9 @@ export default function Dashboard() {
       {tab === "datalab" && <DataLab />}
       {tab === "config" && (
         <>
+           <div style={{ padding: "16px 24px", borderBottom: "1px solid var(--border)" }}>
+          <RedeemButton />
+          </div>
           <ClaimPanel />
           <ConfigPanel config={config} onChange={setConfig} />
         </>
