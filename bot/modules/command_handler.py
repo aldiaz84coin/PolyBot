@@ -374,6 +374,8 @@ def process_pending_commands(cfg: dict):
                 success, result = _handle_test_order(cfg, params)
             elif command == "manual_claim":
                 success, result = _handle_manual_claim(cfg, params)
+            elif command == "trigger_redeem":
+                success, result = _handle_trigger_redeem(cfg)
             else:
                 success, result = False, {"error": f"Comando desconocido: {command}"}
         except Exception as e:
@@ -386,3 +388,15 @@ def process_pending_commands(cfg: dict):
 
     except Exception as e:
         logger.warning(f"[CMD] ⚠ process_pending_commands: {e}")
+
+
+# ── trigger_redeem ────────────────────────────────────────────────────────────
+
+def _handle_trigger_redeem(cfg: dict) -> tuple[bool, dict]:
+    try:
+        from .claimer import scan_and_redeem
+        result = scan_and_redeem(cfg)
+        return True, result
+    except Exception as e:
+        logger.error(f"[CMD] trigger_redeem error: {e}", exc_info=True)
+        return False, {"error": str(e)}
