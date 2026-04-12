@@ -1,27 +1,29 @@
 """
 claimer.py — Redención automática via Safe.execTransaction
 
-v5.0 — REESCRITURA TOTAL: SCAN HORARIO SIMPLIFICADO
-─────────────────────────────────────────────────────
-FIX CRÍTICO: en web3.py >= 6.x el método es `encode_abi()` (con guión bajo),
-NO `encodeABI()`. Ese era el único bug que bloqueaba todas las redenciones.
+v6.0 — NEGSRISK ADAPTER (FIX CRÍTICO)
+─────────────────────────────────────────────────────────────────────────────
+CAMBIO CRÍTICO:
+  ❌ CTF.redeemPositions(USDC, parentCollectionId, conditionId, indexSets)
+     NO funciona para mercados NegRisk BTC (firma interna incorrecta para CTF
+     NegRisk, produce revert silencioso o ExecutionFailure en el Safe).
 
-Arquitectura nueva (simple):
-  - scan_and_redeem(cfg): lee operaciones WIN sin claim_tx de Supabase
-    y las intenta redimir una a una.
-  - Llamado desde monitor.py cada nueva hora (cur_hour != last_hour).
-  - Llamado inmediatamente ante comando trigger_redeem.
-  - redimir_posicion(cfg, bet): interfaz legacy monitor.py → solo loguea,
-    el scan horario recoge la operación automáticamente.
+  ✅ NegRiskAdapter.redeemPositions(conditionId, [yesBalance, noBalance])
+     CORRECTO para NegRisk. Solo necesita el conditionId del mercado y el
+     balance real de tokens on-chain en el Safe.
 
-Safe.execTransaction:
-  Los tokens CTF están en el Safe (POLYMARKET_FUNDER), no en la EOA.
-  La EOA firma el Safe tx hash y lo envía como execTransaction.
-  Portado del TypeScript de referencia funcional.
+TAMBIÉN:
+  - _gamma_get_market_info() prueba ?closed=true y ?active=false como
+    fallback para mercados ya resueltos que no devuelve el query por defecto.
+  - Extrae token_id (YES/NO) de clobTokenIds[0/1] desde Gamma.
+  - CTF.balanceOf(safeAddress, token_id) → balance real on-chain.
+  - execute_claim_once / execute_claim_no_estimate: aceptan market_slug
+    opcional para auto-lookup del token_id desde Gamma.
 
 Destino: bot/modules/claimer.py
 """
 
+import json
 import logging
 import os
 import time
@@ -33,11 +35,12 @@ from web3 import Web3
 logger = logging.getLogger(__name__)
 
 # ── Contratos Polygon mainnet ──────────────────────────────────────────────────
-CTF_ADDRESS  = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
-USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
-ZERO_ADDR    = "0x0000000000000000000000000000000000000000"
-CHAIN_ID     = 137
-GAS_LIMIT    = 400_000
+CTF_ADDRESS      = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"  # ConditionalTokens CTF
+NEG_RISK_ADAPTER = "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296"  # NegRisk Adapter
+USDC_ADDRESS     = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"  # USDC.e
+ZERO_ADDR        = "0x0000000000000000000000000000000000000000"
+CHAIN_ID         = 137
+GAS_LIMIT        = 400_000
 
 EXECUTION_SUCCESS_TOPIC = "0x442e715f626346e8c54381002da614f62bee8d27386535b2521ec8540898556e"
 EXECUTION_FAILURE_TOPIC = "0x23428b18acfb3ea64b08dc0c1d296ea9c09702c09083ca5272bbec61743f0301"
@@ -56,17 +59,9 @@ POLYGON_RPCS = [
 ]
 
 # ── ABIs mínimos ───────────────────────────────────────────────────────────────
+
+# CTF: solo balanceOf — para leer balance de tokens YES/NO en el Safe
 CTF_ABI = [
-    {
-        "name": "redeemPositions", "type": "function",
-        "inputs": [
-            {"name": "collateralToken",    "type": "address"},
-            {"name": "parentCollectionId", "type": "bytes32"},
-            {"name": "conditionId",        "type": "bytes32"},
-            {"name": "indexSets",          "type": "uint256[]"},
-        ],
-        "outputs": [], "stateMutability": "nonpayable",
-    },
     {
         "name": "balanceOf", "type": "function",
         "inputs": [
@@ -78,11 +73,23 @@ CTF_ABI = [
     },
 ]
 
+# NegRiskAdapter.redeemPositions(bytes32 conditionId, uint256[] amounts)
+# amounts = [yesTokenBalance, noTokenBalance]
+NEG_RISK_ADAPTER_ABI = [
+    {
+        "name": "redeemPositions", "type": "function",
+        "inputs": [
+            {"name": "conditionId", "type": "bytes32"},
+            {"name": "amounts",     "type": "uint256[]"},
+        ],
+        "outputs": [], "stateMutability": "nonpayable",
+    },
+]
+
 SAFE_ABI = [
     {
         "name": "nonce", "type": "function",
-        "inputs": [],
-        "outputs": [{"name": "", "type": "uint256"}],
+        "inputs": [], "outputs": [{"name": "", "type": "uint256"}],
         "stateMutability": "view",
     },
     {
@@ -165,22 +172,82 @@ def _sign_safe_hash(private_key_hex: str, hash_bytes: bytes) -> bytes:
     return bytes(sig.r) + bytes(sig.s) + bytes([v])
 
 
-def _gamma_get_condition_id(slug: str) -> Optional[str]:
-    """Obtiene conditionId de Gamma API dado el market slug."""
+def _parse_market_info(mkt: dict) -> dict:
+    """Extrae conditionId y token IDs de un objeto market de Gamma."""
+    raw_cond = mkt.get("conditionId") or mkt.get("condition_id") or ""
+    if raw_cond and not raw_cond.startswith("0x"):
+        raw_cond = f"0x{raw_cond}"
+
+    # clobTokenIds: puede ser string JSON o lista
     try:
-        r = requests.get(GAMMA_API, params={"slug": slug}, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        mkt  = data[0] if isinstance(data, list) and data else data
-        if not mkt:
-            return None
-        raw = mkt.get("conditionId") or mkt.get("condition_id") or ""
-        if not raw:
-            return None
-        return raw if raw.startswith("0x") else f"0x{raw}"
-    except Exception as e:
-        logger.warning(f"[CLAIMER] ⚠ Gamma error ({slug}): {e}")
-        return None
+        raw_ids  = mkt.get("clobTokenIds") or "[]"
+        clob_ids = raw_ids if isinstance(raw_ids, list) else json.loads(raw_ids)
+    except Exception:
+        clob_ids = []
+
+    yes_token_id = str(clob_ids[0]) if len(clob_ids) > 0 else ""
+    no_token_id  = str(clob_ids[1]) if len(clob_ids) > 1 else ""
+
+    # Fallback: buscar en tokens[]
+    if not yes_token_id or not no_token_id:
+        for tok in (mkt.get("tokens") or []):
+            out = (tok.get("outcome") or "").lower()
+            tid = str(tok.get("token_id") or tok.get("tokenId") or "")
+            if out in ("yes", "up")  and not yes_token_id:
+                yes_token_id = tid
+            if out in ("no", "down") and not no_token_id:
+                no_token_id  = tid
+
+    return {
+        "condition_id":  raw_cond or None,
+        "yes_token_id":  yes_token_id or None,
+        "no_token_id":   no_token_id  or None,
+    }
+
+
+def _gamma_get_market_info(slug: str) -> dict:
+    """
+    Obtiene conditionId + token IDs de Gamma API dado el market slug.
+
+    Prueba 3 queries en orden hasta encontrar conditionId:
+      1. ?slug={slug}              (mercados activos)
+      2. ?slug={slug}&closed=true  (mercados resueltos — FIX para claims históricos)
+      3. ?slug={slug}&active=false (alias alternativo)
+
+    Devuelve: {"condition_id": str|None, "yes_token_id": str|None, "no_token_id": str|None}
+    """
+    queries = [
+        {"slug": slug},
+        {"slug": slug, "closed": "true"},
+        {"slug": slug, "active": "false"},
+    ]
+    for params in queries:
+        try:
+            r = requests.get(GAMMA_API, params=params, timeout=10)
+            r.raise_for_status()
+            data = r.json()
+            mkt  = data[0] if isinstance(data, list) and data else (data or None)
+            if not mkt:
+                continue
+            info = _parse_market_info(mkt)
+            if info["condition_id"]:
+                logger.debug(
+                    f"[CLAIMER] Gamma OK (params={params}) — "
+                    f"condId={info['condition_id'][:16]}… "
+                    f"yes={str(info['yes_token_id'] or '')[:20]}… "
+                    f"no={str(info['no_token_id'] or '')[:20]}…"
+                )
+                return info
+        except Exception as e:
+            logger.warning(f"[CLAIMER] ⚠ Gamma error (params={params}): {e}")
+
+    logger.warning(f"[CLAIMER] ⚠ Gamma: no se encontró conditionId para slug={slug}")
+    return {"condition_id": None, "yes_token_id": None, "no_token_id": None}
+
+
+# Legacy wrapper — usado por _check_gamma_resolved y command_handler
+def _gamma_get_condition_id(slug: str) -> Optional[str]:
+    return _gamma_get_market_info(slug)["condition_id"]
 
 
 def _now_iso() -> str:
@@ -189,7 +256,7 @@ def _now_iso() -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CORE: CTF.redeemPositions via Safe.execTransaction
+# CORE: NegRiskAdapter.redeemPositions via Safe.execTransaction
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _redeem_via_safe(
@@ -197,70 +264,96 @@ def _redeem_via_safe(
     direction:    str,
     private_key:  str,
     safe_address: str,
+    token_id:     str = "",
 ) -> str:
     """
-    Ejecuta CTF.redeemPositions() DESDE el Safe via execTransaction.
+    v6.0: NegRiskAdapter.redeemPositions() via Safe.execTransaction.
 
-    FIX v5.0: usa encode_abi() (web3.py >= 6.x) en lugar del roto encodeABI().
+    Flujo:
+      1. CTF.balanceOf(safeAddress, token_id) → balance real on-chain.
+      2. Codificar NegRiskAdapter.redeemPositions(conditionId, [yesAmt, noAmt]).
+      3. Ejecutar vía Safe.execTransaction.
 
-    direction: "UP" → indexSets=[1] (YES token)
-               "DOWN" → indexSets=[2] (NO token)
-
-    Devuelve tx_hash. Lanza excepción si falla.
+    direction: "UP"   → redime tokens YES → amounts = [balance, 0]
+               "DOWN" → redime tokens NO  → amounts = [0, balance]
     """
     w3 = _connect_polygon()
 
     safe_cs = w3.to_checksum_address(safe_address)
     ctf_cs  = w3.to_checksum_address(CTF_ADDRESS)
+    nra_cs  = w3.to_checksum_address(NEG_RISK_ADAPTER)
     usdc_cs = w3.to_checksum_address(USDC_ADDRESS)
     zero_cs = w3.to_checksum_address(ZERO_ADDR)
 
-    cond_bytes  = _to_bytes32(condition_id)
-    parent_zero = bytes(32)
-    index_sets  = [1] if direction == "UP" else [2]
+    cond_bytes = _to_bytes32(condition_id)
 
-    ctf  = w3.eth.contract(address=ctf_cs, abi=CTF_ABI)
+    ctf  = w3.eth.contract(address=ctf_cs,  abi=CTF_ABI)
+    nra  = w3.eth.contract(address=nra_cs,  abi=NEG_RISK_ADAPTER_ABI)
     safe = w3.eth.contract(address=safe_cs, abi=SAFE_ABI)
-    usdc = w3.eth.contract(address=w3.to_checksum_address(USDC_ADDRESS), abi=USDC_ABI)
+    usdc = w3.eth.contract(address=usdc_cs, abi=USDC_ABI)
 
-    # USDC antes
+    # ── USDC antes ─────────────────────────────────────────────────────────────
     usdc_before = 0
     try:
         usdc_before = usdc.functions.balanceOf(safe_cs).call()
     except Exception:
         pass
 
-    # ── FIX: encode_abi (web3.py >= 6) ───────────────────────────────────────
-    # ❌ ROTO en v6:  ctf.encodeABI("redeemPositions", args=[...])
-    # ✅ CORRECTO v6: ctf.encode_abi("redeemPositions", args=[...])
-    call_data_hex   = ctf.encode_abi(
-        "redeemPositions",
-        args=[usdc_cs, parent_zero, cond_bytes, index_sets],
+    # ── Balance on-chain del token ganador ─────────────────────────────────────
+    if not token_id or not str(token_id).strip().lstrip("-").isdigit():
+        raise ValueError(
+            f"[CLAIMER] token_id inválido o ausente: {token_id!r} — "
+            "requerido para NegRiskAdapter.redeemPositions"
+        )
+
+    token_balance = ctf.functions.balanceOf(safe_cs, int(token_id)).call()
+    logger.info(
+        f"[CLAIMER] 💰 Balance on-chain — "
+        f"token_id={str(token_id)[:22]}… "
+        f"dir={direction} "
+        f"balance={token_balance / 1_000_000:.6f}"
     )
+
+    if token_balance == 0:
+        raise ValueError(
+            f"[CLAIMER] Balance de tokens = 0 en Safe {safe_address[:12]}… — "
+            "¿ya redimido? ¿token_id incorrecto?"
+        )
+
+    # amounts[0] = YES balance, amounts[1] = NO balance
+    amounts = [token_balance, 0] if direction == "UP" else [0, token_balance]
+
+    # ── Codificar NegRiskAdapter.redeemPositions ────────────────────────────────
+    call_data_hex   = nra.encode_abi("redeemPositions", args=[cond_bytes, amounts])
     call_data_bytes = bytes.fromhex(call_data_hex.removeprefix("0x"))
 
-    # ── Safe tx hash ──────────────────────────────────────────────────────────
+    logger.info(
+        f"[CLAIMER] 📤 NegRiskAdapter.redeemPositions — "
+        f"dir={direction} | amounts={amounts} | condId={condition_id[:16]}… | "
+        f"Safe nonce pending…"
+    )
+
+    # ── Safe tx hash ────────────────────────────────────────────────────────────
     nonce = safe.functions.nonce().call()
     safe_tx_hash = safe.functions.getTransactionHash(
-        ctf_cs, 0, call_data_bytes, 0, 0, 0, 0, zero_cs, zero_cs, nonce,
+        nra_cs, 0, call_data_bytes, 0, 0, 0, 0, zero_cs, zero_cs, nonce,
     ).call()
 
-    # ── Firma EOA raw (sin prefijo Ethereum) ──────────────────────────────────
+    # ── Firma EOA raw (sin prefijo Ethereum) ────────────────────────────────────
     signature = _sign_safe_hash(private_key, bytes(safe_tx_hash))
 
-    # ── Enviar execTransaction ────────────────────────────────────────────────
+    # ── execTransaction ─────────────────────────────────────────────────────────
     account   = w3.eth.account.from_key(private_key)
     gas_price = int(w3.eth.gas_price * 1.2)
     eoa_nonce = w3.eth.get_transaction_count(account.address, "pending")
 
     logger.info(
-        f"[CLAIMER] 📤 execTransaction — "
-        f"dir={direction} | indexSets={index_sets} | "
-        f"condId={condition_id[:14]}… | Safe nonce={nonce}"
+        f"[CLAIMER] 🔏 Safe nonce={nonce} | EOA nonce={eoa_nonce} | "
+        f"gasPrice={gas_price // 10**9:.1f} gwei"
     )
 
     built = safe.functions.execTransaction(
-        ctf_cs, 0, call_data_bytes, 0, 0, 0, 0, zero_cs, zero_cs, signature,
+        nra_cs, 0, call_data_bytes, 0, 0, 0, 0, zero_cs, zero_cs, signature,
     ).build_transaction({
         "from":     account.address,
         "gas":      GAS_LIMIT,
@@ -278,7 +371,7 @@ def _redeem_via_safe(
     if receipt.status == 0:
         raise RuntimeError(f"TX revertida on-chain: {tx_hash_hex}")
 
-    # Verificar logs del Safe
+    # ── Verificar logs del Safe ─────────────────────────────────────────────────
     success_confirmed = False
     for log in receipt.logs:
         if not log.topics:
@@ -292,11 +385,13 @@ def _redeem_via_safe(
 
     if not success_confirmed:
         # status=1 sin topic explícito → asumir OK (algunos nodos omiten el log)
-        logger.warning(f"[CLAIMER] ⚠ ExecutionSuccess topic no encontrado (status=1) — asumiendo OK")
+        logger.warning(
+            f"[CLAIMER] ⚠ ExecutionSuccess topic no encontrado (status=1) — asumiendo OK"
+        )
 
     logger.info(f"[CLAIMER] ✅ ExecutionSuccess — tx: {tx_hash_hex}")
 
-    # USDC delta
+    # ── USDC delta ──────────────────────────────────────────────────────────────
     try:
         time.sleep(3)
         usdc_after = usdc.functions.balanceOf(safe_cs).call()
@@ -378,15 +473,32 @@ def scan_and_redeem(cfg: dict) -> dict:
             skip += 1
             continue
 
-        # Obtener conditionId desde Gamma
-        condition_id = _gamma_get_condition_id(slug)
+        # Obtener conditionId + token IDs desde Gamma (con fallback closed=true)
+        market_info  = _gamma_get_market_info(slug)
+        condition_id = market_info["condition_id"]
+
         if not condition_id:
             logger.warning(f"[CLAIMER] ⚠ {op_id}: conditionId no encontrado en Gamma — skip")
             _mark_claim_error(db, op_id, "gamma_condition_not_found")
             skip += 1
             continue
 
-        logger.info(f"[CLAIMER] conditionId={condition_id[:16]}…")
+        # Token ganador: UP → YES (índice 0), DOWN → NO (índice 1)
+        token_id = (
+            market_info["yes_token_id"] if direction == "UP"
+            else market_info["no_token_id"]
+        )
+
+        if not token_id:
+            logger.warning(f"[CLAIMER] ⚠ {op_id}: token_id no encontrado en Gamma — skip")
+            _mark_claim_error(db, op_id, "gamma_token_id_not_found")
+            skip += 1
+            continue
+
+        logger.info(
+            f"[CLAIMER] conditionId={condition_id[:16]}… | "
+            f"token_id={str(token_id)[:22]}… | dir={direction}"
+        )
 
         # Intentar redención
         try:
@@ -395,14 +507,17 @@ def scan_and_redeem(cfg: dict) -> dict:
                 direction=direction,
                 private_key=private_key,
                 safe_address=safe_address,
+                token_id=token_id,
             )
             _mark_claim_ok(db, op_id, tx_hash)
-            logger.info(f"[CLAIMER] ✅ Redimido {op_id} — ~{tokens:.4f} tokens | tx: {tx_hash}")
+            logger.info(
+                f"[CLAIMER] ✅ Redimido {op_id} — ~{tokens:.4f} tokens | tx: {tx_hash}"
+            )
             ok += 1
 
         except Exception as e:
             err_msg = str(e)[:400]
-            logger.error(f"[CLAIMER] ❌ {op_id}: {err_msg}")
+            logger.error(f"[CLAIMER] ❌ {op_id}: {err_msg}", exc_info=True)
             _mark_claim_error(db, op_id, err_msg)
             errors += 1
 
@@ -441,7 +556,7 @@ def _mark_claim_error(db, op_id: str, error: str):
 def redimir_posicion(cfg: dict, bet: dict) -> None:
     """
     Llamado desde monitor.py al detectar WIN.
-    v5.0: solo loguea — el scan horario recoge la operación automáticamente.
+    v5.0+: solo loguea — el scan horario recoge la operación automáticamente.
     """
     slug = bet.get("market", {}).get("slug") or bet.get("market_slug", "—")
     logger.info(
@@ -455,10 +570,91 @@ def execute_claim_once(
     direction:    str,
     private_key:  str,
     safe_address: str = "",
+    market_slug:  str = "",
+    token_id:     str = "",
 ) -> str:
-    """Wrapper público para command_handler.py."""
+    """
+    Wrapper público para command_handler.py (manual_claim desde dashboard).
+
+    Si token_id no se proporciona, lo obtiene de Gamma via market_slug.
+    Si market_slug tampoco se proporciona, lanza ValueError.
+    """
     if not safe_address:
         safe_address = os.environ.get("POLYMARKET_FUNDER", "").strip()
     if not safe_address:
         raise ValueError("safe_address (POLYMARKET_FUNDER) no configurado")
-    return _redeem_via_safe(condition_id, direction, private_key, safe_address)
+
+    # Auto-lookup token_id desde Gamma si no se pasa directamente
+    if not token_id and market_slug:
+        info = _gamma_get_market_info(market_slug)
+        token_id = (
+            info["yes_token_id"] if direction == "UP"
+            else info["no_token_id"]
+        ) or ""
+        if not token_id:
+            raise ValueError(
+                f"No se pudo obtener token_id de Gamma para slug={market_slug} dir={direction}"
+            )
+
+    if not token_id:
+        raise ValueError(
+            "token_id requerido — pasa market_slug para auto-lookup o token_id directamente"
+        )
+
+    return _redeem_via_safe(
+        condition_id=condition_id,
+        direction=direction,
+        private_key=private_key,
+        safe_address=safe_address,
+        token_id=token_id,
+    )
+
+
+def execute_claim_no_estimate(
+    condition_id: str,
+    direction:    str,
+    private_key:  str,
+    safe_address: str = "",
+    market_slug:  str = "",
+    token_id:     str = "",
+) -> str:
+    """
+    Workaround sin estimate_gas — en NegRiskAdapter el gas fijo siempre aplica.
+    Misma implementación que execute_claim_once.
+    """
+    return execute_claim_once(
+        condition_id=condition_id,
+        direction=direction,
+        private_key=private_key,
+        safe_address=safe_address,
+        market_slug=market_slug,
+        token_id=token_id,
+    )
+
+
+def _check_gamma_resolved(condition_id: str) -> dict:
+    """Comprueba si un mercado está resuelto en Gamma por conditionId."""
+    try:
+        r = requests.get(
+            GAMMA_API,
+            params={"conditionId": condition_id},
+            timeout=10,
+        )
+        r.raise_for_status()
+        data = r.json()
+        mkt  = data[0] if isinstance(data, list) and data else (data or {})
+        if not mkt:
+            return {"resolved": False, "closed": False, "outcome": None, "error": "no_market"}
+        return {
+            "resolved": bool(mkt.get("resolved")),
+            "closed":   bool(mkt.get("closed") or mkt.get("active") is False),
+            "outcome":  mkt.get("outcome") or mkt.get("resolution") or None,
+            "error":    None,
+        }
+    except Exception as e:
+        return {
+            "resolved": False,
+            "closed":   False,
+            "outcome":  None,
+            "error":    str(e)[:100],
+        }
