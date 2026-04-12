@@ -260,7 +260,8 @@ def _handle_manual_claim(cfg: dict, params: dict) -> tuple[bool, dict]:
 
     # ── Intento 1: con estimate_gas ──────────────────────────────────────────
     try:
-        tx_hash = execute_claim_once(condition_id, direction, private_key)
+        tx_hash = execute_claim_once(condition_id, direction, private_key,
+                                     market_slug=market_slug)
         logger.info(f"[CMD] ✅ manual_claim OK (estimate_gas) — tx={tx_hash[:16]}…")
         return True, {
             "tx_hash":  tx_hash,
@@ -299,7 +300,8 @@ def _handle_manual_claim(cfg: dict, params: dict) -> tuple[bool, dict]:
             "intentando redención con gas fijo (sin estimate_gas)…"
         )
         try:
-            tx_hash = execute_claim_no_estimate(condition_id, direction, private_key)
+            tx_hash = execute_claim_no_estimate(condition_id, direction, private_key,
+                                                market_slug=market_slug)
             logger.info(f"[CMD] ✅ manual_claim OK (gas fijo) — tx={tx_hash[:16]}…")
             return True, {
                 "tx_hash":  tx_hash,
