@@ -61,7 +61,7 @@ import requests
 from .price_feed      import get_btc_price
 from .market_scanner  import get_active_market, get_open_1h_binance, get_full_1h_candle
 from .strategy        import evaluate, execute_order, sell_position, Direction, WINDOWS
-from .claimer         import claim_with_retry
+from .claimer         import redimir_posicion, scan_and_redeem
 from .notifier        import (
     notify_start, notify_stop,
     notify_bet, notify_win, notify_loss, notify_stop_loss,
@@ -614,6 +614,12 @@ def run(cfg: dict):
                     except Exception as _e:
                         logger.debug(f"[MONITOR] log_btc_candle: {_e}")
 
+                # v12.0: scan horario de redenciones pendientes
+                try:
+                    scan_and_redeem(cfg)
+                except Exception as _e:
+                    logger.warning(f"[MONITOR] ⚠ scan_and_redeem: {_e}")
+
                 # Reset de hora
                 hour_ops      = []
                 hour_wins     = 0
@@ -872,18 +878,9 @@ def run(cfg: dict):
                         f"P&L: ${pnl_usd:.2f} ({pnl_pct:.1f}%)"
                     )
 
-                    # v11.0: claim automático en modo LIVE
-                    # v11.5 FIX: orden de args corregido (era cfg, active_bet, token_id)
-                    if not sim_ and real_exit_token_id:
-                        _bet_for_claim = active_bet
-                        def _do_claim():
-                            try:
-                                claim_with_retry(_bet_for_claim, cfg)
-                            except TypeError as _te:
-                                logger.error(f"[MONITOR] ❌ claim TypeError (firma incorrecta): {_te}", exc_info=True)
-                            except Exception as _ce:
-                                logger.error(f"[MONITOR] ❌ claim error: {_ce}", exc_info=True)
-                        threading.Thread(target=_do_claim, daemon=True, name=f"claim-{active_bet.get('id','x')}").start()
+                    # v12.0: claim automático — el scan horario recoge la op de Supabase
+                    if not sim_:
+                        redimir_posicion(cfg, active_bet)
 
                 else:
                     exit_odds         = real_exit_price
