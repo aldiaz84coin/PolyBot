@@ -267,17 +267,21 @@ def _redeem_via_safe(
     token_id:     str = "",
 ) -> str:
     """
-    v6.0: NegRiskAdapter.redeemPositions() via Safe.execTransaction.
+    v6.1: NegRiskAdapter.redeemPositions() — dos modos según dónde estén los tokens.
 
     Flujo:
-      1. CTF.balanceOf(safeAddress, token_id) → balance real on-chain.
-      2. Codificar NegRiskAdapter.redeemPositions(conditionId, [yesAmt, noAmt]).
-      3. Ejecutar vía Safe.execTransaction.
+      1. Verificar balance en Safe (POLYMARKET_FUNDER).
+      2. Si balance=0, verificar balance en EOA (derivada de private_key).
+      3a. Tokens en Safe → NegRiskAdapter vía Safe.execTransaction.
+      3b. Tokens en EOA  → NegRiskAdapter llamada directa desde EOA (más simple).
 
     direction: "UP"   → redime tokens YES → amounts = [balance, 0]
                "DOWN" → redime tokens NO  → amounts = [0, balance]
     """
     w3 = _connect_polygon()
+
+    account = w3.eth.account.from_key(private_key)
+    eoa_cs  = account.address
 
     safe_cs = w3.to_checksum_address(safe_address)
     ctf_cs  = w3.to_checksum_address(CTF_ADDRESS)
@@ -292,78 +296,106 @@ def _redeem_via_safe(
     safe = w3.eth.contract(address=safe_cs, abi=SAFE_ABI)
     usdc = w3.eth.contract(address=usdc_cs, abi=USDC_ABI)
 
-    # ── USDC antes ─────────────────────────────────────────────────────────────
-    usdc_before = 0
-    try:
-        usdc_before = usdc.functions.balanceOf(safe_cs).call()
-    except Exception:
-        pass
-
-    # ── Balance on-chain del token ganador ─────────────────────────────────────
+    # ── Validar token_id ───────────────────────────────────────────────────────
     if not token_id or not str(token_id).strip().lstrip("-").isdigit():
         raise ValueError(
             f"[CLAIMER] token_id inválido o ausente: {token_id!r} — "
             "requerido para NegRiskAdapter.redeemPositions"
         )
+    token_id_int = int(token_id)
 
-    token_balance = ctf.functions.balanceOf(safe_cs, int(token_id)).call()
+    # ── Buscar balance: Safe primero, luego EOA ────────────────────────────────
+    balance_safe = 0
+    balance_eoa  = 0
+    try:
+        balance_safe = ctf.functions.balanceOf(safe_cs, token_id_int).call()
+    except Exception as e:
+        logger.warning(f"[CLAIMER] ⚠ balanceOf(Safe) error: {e}")
+    try:
+        balance_eoa = ctf.functions.balanceOf(eoa_cs, token_id_int).call()
+    except Exception as e:
+        logger.warning(f"[CLAIMER] ⚠ balanceOf(EOA) error: {e}")
+
     logger.info(
         f"[CLAIMER] 💰 Balance on-chain — "
-        f"token_id={str(token_id)[:22]}… "
-        f"dir={direction} "
-        f"balance={token_balance / 1_000_000:.6f}"
+        f"token_id={str(token_id)[:22]}… dir={direction} | "
+        f"Safe={balance_safe / 1_000_000:.6f} | EOA={balance_eoa / 1_000_000:.6f}"
     )
 
-    if token_balance == 0:
+    if balance_safe == 0 and balance_eoa == 0:
         raise ValueError(
-            f"[CLAIMER] Balance de tokens = 0 en Safe {safe_address[:12]}… — "
+            f"[CLAIMER] Balance = 0 en Safe {safe_address[:12]}… Y EOA {eoa_cs[:12]}… — "
             "¿ya redimido? ¿token_id incorrecto?"
         )
 
-    # amounts[0] = YES balance, amounts[1] = NO balance
-    amounts = [token_balance, 0] if direction == "UP" else [0, token_balance]
+    # Elegir wallet con balance y construir amounts
+    use_safe      = balance_safe > 0
+    token_balance = balance_safe if use_safe else balance_eoa
+    holder_cs     = safe_cs if use_safe else eoa_cs
+    amounts       = [token_balance, 0] if direction == "UP" else [0, token_balance]
 
-    # ── Codificar NegRiskAdapter.redeemPositions ────────────────────────────────
+    logger.info(
+        f"[CLAIMER] 📍 Tokens en {'Safe' if use_safe else 'EOA'} ({holder_cs[:12]}…) | "
+        f"balance={token_balance / 1_000_000:.6f} | amounts={amounts}"
+    )
+
+    # ── USDC antes ─────────────────────────────────────────────────────────────
+    usdc_before = 0
+    try:
+        usdc_before = usdc.functions.balanceOf(holder_cs).call()
+    except Exception:
+        pass
+
+    # ── Codificar NegRiskAdapter.redeemPositions ───────────────────────────────
     call_data_hex   = nra.encode_abi("redeemPositions", args=[cond_bytes, amounts])
     call_data_bytes = bytes.fromhex(call_data_hex.removeprefix("0x"))
 
+    gas_price = int(w3.eth.gas_price * 1.2)
+    eoa_nonce = w3.eth.get_transaction_count(eoa_cs, "pending")
+
     logger.info(
         f"[CLAIMER] 📤 NegRiskAdapter.redeemPositions — "
-        f"dir={direction} | amounts={amounts} | condId={condition_id[:16]}… | "
-        f"Safe nonce pending…"
+        f"via={'Safe.execTx' if use_safe else 'EOA directo'} | "
+        f"condId={condition_id[:16]}… | gasPrice={gas_price // 10**9:.1f} gwei"
     )
 
-    # ── Safe tx hash ────────────────────────────────────────────────────────────
-    nonce = safe.functions.nonce().call()
-    safe_tx_hash = safe.functions.getTransactionHash(
-        nra_cs, 0, call_data_bytes, 0, 0, 0, 0, zero_cs, zero_cs, nonce,
-    ).call()
+    if use_safe:
+        # ── Ruta A: tokens en Safe → Safe.execTransaction ──────────────────────
+        nonce = safe.functions.nonce().call()
+        safe_tx_hash = safe.functions.getTransactionHash(
+            nra_cs, 0, call_data_bytes, 0, 0, 0, 0, zero_cs, zero_cs, nonce,
+        ).call()
+        signature = _sign_safe_hash(private_key, bytes(safe_tx_hash))
 
-    # ── Firma EOA raw (sin prefijo Ethereum) ────────────────────────────────────
-    signature = _sign_safe_hash(private_key, bytes(safe_tx_hash))
+        logger.info(f"[CLAIMER] 🔏 Safe nonce={nonce} | EOA nonce={eoa_nonce}")
 
-    # ── execTransaction ─────────────────────────────────────────────────────────
-    account   = w3.eth.account.from_key(private_key)
-    gas_price = int(w3.eth.gas_price * 1.2)
-    eoa_nonce = w3.eth.get_transaction_count(account.address, "pending")
+        built = safe.functions.execTransaction(
+            nra_cs, 0, call_data_bytes, 0, 0, 0, 0, zero_cs, zero_cs, signature,
+        ).build_transaction({
+            "from":     eoa_cs,
+            "gas":      GAS_LIMIT,
+            "gasPrice": gas_price,
+            "nonce":    eoa_nonce,
+            "chainId":  CHAIN_ID,
+        })
+        signed      = w3.eth.account.sign_transaction(built, private_key)
+        tx_hash_hex = w3.eth.send_raw_transaction(signed.raw_transaction).hex()
 
-    logger.info(
-        f"[CLAIMER] 🔏 Safe nonce={nonce} | EOA nonce={eoa_nonce} | "
-        f"gasPrice={gas_price // 10**9:.1f} gwei"
-    )
+    else:
+        # ── Ruta B: tokens en EOA → llamada directa a NegRiskAdapter ──────────
+        logger.info(f"[CLAIMER] 🔏 EOA nonce={eoa_nonce}")
 
-    built = safe.functions.execTransaction(
-        nra_cs, 0, call_data_bytes, 0, 0, 0, 0, zero_cs, zero_cs, signature,
-    ).build_transaction({
-        "from":     account.address,
-        "gas":      GAS_LIMIT,
-        "gasPrice": gas_price,
-        "nonce":    eoa_nonce,
-        "chainId":  CHAIN_ID,
-    })
-
-    signed      = w3.eth.account.sign_transaction(built, private_key)
-    tx_hash_hex = w3.eth.send_raw_transaction(signed.raw_transaction).hex()
+        built = nra.functions.redeemPositions(
+            cond_bytes, amounts,
+        ).build_transaction({
+            "from":     eoa_cs,
+            "gas":      GAS_LIMIT,
+            "gasPrice": gas_price,
+            "nonce":    eoa_nonce,
+            "chainId":  CHAIN_ID,
+        })
+        signed      = w3.eth.account.sign_transaction(built, private_key)
+        tx_hash_hex = w3.eth.send_raw_transaction(signed.raw_transaction).hex()
 
     logger.info(f"[CLAIMER] ⏳ TX enviada: {tx_hash_hex} — esperando recibo…")
     receipt = w3.eth.wait_for_transaction_receipt(tx_hash_hex, timeout=90)
@@ -371,34 +403,33 @@ def _redeem_via_safe(
     if receipt.status == 0:
         raise RuntimeError(f"TX revertida on-chain: {tx_hash_hex}")
 
-    # ── Verificar logs del Safe ─────────────────────────────────────────────────
-    success_confirmed = False
-    for log in receipt.logs:
-        if not log.topics:
-            continue
-        topic = log.topics[0].hex()
-        if topic == EXECUTION_SUCCESS_TOPIC:
-            success_confirmed = True
-            break
-        if topic == EXECUTION_FAILURE_TOPIC:
-            raise RuntimeError(f"Safe ExecutionFailure — tx: {tx_hash_hex}")
+    # ── Verificar logs del Safe (solo ruta A) ──────────────────────────────────
+    if use_safe:
+        success_confirmed = False
+        for log in receipt.logs:
+            if not log.topics:
+                continue
+            topic = log.topics[0].hex()
+            if topic == EXECUTION_SUCCESS_TOPIC:
+                success_confirmed = True
+                break
+            if topic == EXECUTION_FAILURE_TOPIC:
+                raise RuntimeError(f"Safe ExecutionFailure — tx: {tx_hash_hex}")
+        if not success_confirmed:
+            logger.warning(
+                f"[CLAIMER] ⚠ ExecutionSuccess topic no encontrado (status=1) — asumiendo OK"
+            )
 
-    if not success_confirmed:
-        # status=1 sin topic explícito → asumir OK (algunos nodos omiten el log)
-        logger.warning(
-            f"[CLAIMER] ⚠ ExecutionSuccess topic no encontrado (status=1) — asumiendo OK"
-        )
+    logger.info(f"[CLAIMER] ✅ TX confirmada — tx: {tx_hash_hex}")
 
-    logger.info(f"[CLAIMER] ✅ ExecutionSuccess — tx: {tx_hash_hex}")
-
-    # ── USDC delta ──────────────────────────────────────────────────────────────
+    # ── USDC delta ─────────────────────────────────────────────────────────────
     try:
         time.sleep(3)
-        usdc_after = usdc.functions.balanceOf(safe_cs).call()
+        usdc_after = usdc.functions.balanceOf(holder_cs).call()
         delta = (usdc_after - usdc_before) / 1_000_000
         logger.info(
             f"[CLAIMER] 💵 USDC delta: {'+'if delta>=0 else ''}{delta:.4f} "
-            f"(Safe total: {usdc_after / 1_000_000:.4f})"
+            f"(wallet total: {usdc_after / 1_000_000:.4f})"
         )
     except Exception:
         pass
